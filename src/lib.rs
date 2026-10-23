@@ -80,6 +80,10 @@
 //! assert_eq!(game.load_scene("yard").unwrap().instances.len(), 2);
 //! ```
 //!
+//! Whether a provider's output follows these conventions, beyond what `validate` can say (units,
+//! orientation, winding, bind poses, clip units), is answered by [`conformance`]: a provider crate
+//! can run it from a `check-conformance` subcommand in a few lines.
+//!
 //! With the `link` feature, the `link` module adds a passthrough channel: two processes on
 //! 127.0.0.1 exchange camera, poses, collision and frames as described in `docs/CONTRACT.md`.
 
@@ -88,6 +92,7 @@ use std::fmt;
 
 pub mod animated;
 pub mod animation;
+pub mod conformance;
 pub mod scene;
 pub mod transform;
 

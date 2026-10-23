@@ -19,7 +19,8 @@ jobs:
           components: clippy
       - run: cargo test
       - run: cargo test --features link
-      - run: cargo clippy --features link -- -D warnings
+      - run: cargo run --example conformance -- --id right
+      - run: cargo clippy --all-targets --features link -- -D warnings
 
   # The Bevy plugin has its own, much larger, dependency tree, so it gets its own job and cache. It asks
   # Bevy for no audio and no gamepad support, so Linux needs no extra system packages (libasound2-dev and

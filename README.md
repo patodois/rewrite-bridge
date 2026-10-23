@@ -16,7 +16,9 @@ glTF 2.0's conventions, so a renderer never needs to know which game a model cam
 
 `Model::validate` checks indices, attribute counts, skins and joint weights, so a provider can catch
 its own mistakes before a renderer does. Animation, scenes and attachment points are described
-[below](#animation-scenes-and-attachment-points).
+[below](#animation-scenes-and-attachment-points). Whether the output also *means* the right thing
+(metres, not centimetres; Y up; feet on the ground; faces wound the way the normals say; a clip that
+does not spin a limb) is what the [conformance checker](#checking-your-provider) finds out.
 
 The crate has no dependencies and reads no game files. Providers read the player's own
 installation, and no game data is ever part of this project. Renderers get their own crates: the
@@ -130,6 +132,74 @@ impl Provider for MyGame {
     }
 }
 ```
+
+## Checking your provider
+
+`validate` says a model is consistent; it cannot say that a tank is 100 times too large, that its
+triangles wind the wrong way, or that a clip flips a quaternion's sign and spins an arm. The
+`conformance` module goes beyond `validate` (it calls it first) and reports findings, each with a
+severity (`error`, `warning`, `info`), a stable code such as `scale.too_large`, a message and a
+location (mesh, node, material, clip, instance). It has no dependencies. The module docs list every
+code and why it matters to a consumer.
+
+```rust
+use rewrite_bridge::conformance::{check_animated, check_model, check_provider, check_scene, Expect};
+
+// One value. `Expect` is what you know about it; the default is generic.
+let report = check_model(&model, &Expect::human());      // a person: 1.4 to 2.5 m tall, a character
+let report = check_animated(&animated, &Expect::tank()); // 2 to 4 m tall, 4 to 10 m long
+let report = check_scene(&scene, &Expect::default());
+println!("{report}");                                    // findings, worst first
+assert!(report.passed());                                // no errors (warnings are allowed)
+
+// Everything a provider lists, one asset in memory at a time.
+for (id, report) in check_provider(&my_game, &[] as &[&str], &[]) {
+    assert!(report.passed(), "{id}: {report}");
+}
+```
+
+What it checks: units and scale (the world bounding box of the default pose; `Expect` adds height
+and length ranges), orientation of characters (Y up, feet near y = 0), geometry (NaN, unit normals,
+triangle winding against the normals, degenerate triangles), skins (weights, joints, invertible and
+consistent inverse bind matrices), materials and images (factor ranges, alpha mode against the
+texture's alpha, normal-map sanity), clips (quaternion hemispheres, zero scales, root-motion speed in
+m/s, a skeleton that stretches because the clip uses other units) and scenes (extent, instance scales,
+asset references). The front is only judged where an asset names it (a node or socket called `muzzle`,
+`eye`, `front`, `exhaust`); otherwise the facing is reported as unknown, never guessed. The colour
+space of images is not checked because `Image` does not carry one: the contract fixes it.
+
+Some findings are conventions, not bugs. Drop a code your game knowingly differs on with
+`Expect::default().allowing("skin.bind_pose_mismatch")`, or `--allow` on the command line.
+
+### A `check-conformance` subcommand
+
+A provider crate that has a command line adds this in a few lines, and its users can then check their
+own installation:
+
+```rust
+fn main() {
+    let provider = MyGame::open(/* the player's install */);
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("check-conformance") {
+        std::process::exit(rewrite_bridge::conformance::cli::run(&provider, args));
+    }
+    // ... the crate's other subcommands
+}
+```
+
+```sh
+my-game-tool check-conformance                      # every listed asset
+my-game-tool check-conformance --id tiger --id t34  # these assets
+my-game-tool check-conformance --kind character -v  # one kind, with info findings
+my-game-tool check-conformance --filter tank --limit 20 --strict
+```
+
+Assets of kind `Level` are loaded as scenes and the rest with `load_animated`, one at a time. It
+prints one block per asset, then a table of finding codes with counts and example ids, and exits 1
+if any asset has an error (`--strict`: or a warning). `--compare-load` also requires `load(id)` to
+equal `load_animated(id)?.model`, as the trait asks. A failed load or a panic in the provider is a
+finding on that asset, not the end of the run. `cargo run --example conformance` shows the output on
+a toy provider.
 
 ## Using it in Bevy
 
