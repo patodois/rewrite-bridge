@@ -610,16 +610,16 @@ fn a_guest_rejecting_a_host_sends_bye_then_a_clean_end() {
 }
 
 /// A peer that resets the connection right after its bye (a careless implementation, or Windows
-/// closing a socket with unread data): the bye still decides how the session ended.
+/// closing a socket with unread data): once the bye has been read, it decides how the session
+/// ended. Before it is read, Windows discards it with the rest of the unread data, which is why
+/// careful peers half-close and drain instead.
 #[test]
 fn a_reset_after_a_received_bye_is_a_clean_end() {
     let mut guest = Link::guest(cfg("unused", 1)).unwrap();
     let tcp = raw_host_accepting(&mut guest);
-    // Let the guest's hello arrive and leave it unread; then bye and drop, which sends a reset.
+    // Leave the guest's hello unread, so dropping the socket sends a reset
     sleep(Duration::from_millis(50));
     writeln!(&tcp, r#"{{"type":"bye","reason":"go away"}}"#).unwrap();
-    sleep(Duration::from_millis(20));
-    drop(tcp);
     let events = poll_guest_until(&mut guest, |e| !e.is_empty());
     assert_eq!(
         events,
@@ -627,4 +627,7 @@ fn a_reset_after_a_received_bye_is_a_clean_end() {
             reason: "peer said bye: go away".into()
         }]
     );
+    drop(tcp);
+    sleep(Duration::from_millis(50));
+    assert_eq!(guest.poll(), []);
 }
