@@ -184,10 +184,13 @@ side freezes or dies.
 
 - Control: JSON lines over TCP on `127.0.0.1` (default port 47800).
 - State: little-endian binary UDP datagrams on `127.0.0.1`, at most 8192 bytes each.
-- Frames: a memory-mapped file in the temp directory, guarded by a seqlock.
+- Frames: a memory-mapped file in the temp directory, guarded by a seqlock. A frame is RGBA and
+  can carry linear depth in metres, so the host can reproject it to its newest camera and let the
+  nearer of its own pixel and the guest's win (`link::compose`, a CPU reference for testing and
+  small images; engines do the same on the GPU).
 - Coordinates: the same glTF conventions as `Model`; each side converts its own.
 
-[`docs/CONTRACT.md`](docs/CONTRACT.md) is the versioned protocol (v1), with every byte offset and C
+[`docs/CONTRACT.md`](docs/CONTRACT.md) is the versioned protocol (v1, revision 3), with every byte offset and C
 structs, so plugins in other languages can implement it without this crate. In Rust:
 
 ```rust
@@ -202,11 +205,13 @@ for event in link.poll() {            // never blocks
 }
 ```
 
-Try it with two terminals:
+Try it with two terminals. The guest renders a lit cube on the CPU with the host's camera and
+sends colour and depth; the host draws a pillar and a floor, reprojects the cube to its newest camera
+and composites it, so the pillar cuts the cube. `--dump DIR` on the host writes a few frames as PPM:
 
 ```sh
-cargo run --features link --example fake_host
-cargo run --features link --example fake_guest -- --frames
+cargo run --release --features link --example fake_host -- --dump /tmp/frames
+cargo run --release --features link --example fake_guest -- --frames
 ```
 
 Without the feature the crate still has no dependencies; with it, it uses `memmap2` and
