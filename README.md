@@ -284,6 +284,9 @@ cargo run --release --features link --example fake_host -- --dump /tmp/frames
 cargo run --release --features link --example fake_guest -- --frames
 ```
 
+Against a real game, add `--in-front`: the cube then stands 4 m ahead of the player, on the ground
+the host sends as collision, instead of at the world origin.
+
 Without the feature the crate still has no dependencies; with it, it uses `memmap2` and
 `serde_json`. The link only exchanges what each process publishes about itself: it never reads
 another process's memory or injects code.

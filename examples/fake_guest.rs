@@ -4,8 +4,13 @@
 //! the camera's `seq`, as the contract describes. `--latency` holds each frame back before it is
 //! sent, to imitate a slow renderer, so the host has something to reproject.
 //!
+//! By default the cube stands at the world origin (what `fake_host` expects). With `--in-front`
+//! it is placed 4 m ahead of the first camera the host sends, and stands on the host's collision
+//! surface below that point once a `Collision` snapshot covers it (until then it floats at eye
+//! height). Use that with a real game, whose player is rarely near the origin.
+//!
 //! cargo run --release --features link --example fake_guest -- [--port 47800] [--seconds 10]
-//!     [--frames [--no-depth] [--latency 40]]     (latency in milliseconds)
+//!     [--frames [--no-depth] [--latency 40]] [--in-front]     (latency in milliseconds)
 
 #[path = "common/raster.rs"]
 mod raster;
@@ -23,9 +28,11 @@ fn arg<T: std::str::FromStr>(name: &str) -> Option<T> {
     args.get(i + 1)?.parse().ok()
 }
 
-/// Where the cube stands, in the host's world: on the ground, 1.6 m tall.
+/// Where the cube stands by default, in the host's world: on the ground at the origin, 1.6 m tall.
 const CUBE_CENTER: [f32; 3] = [0.0, 0.8, 0.0];
 const CUBE_HALF: f32 = 0.8;
+/// How far ahead of the first camera `--in-front` puts the cube, in metres.
+const IN_FRONT: f32 = 4.0;
 const SIZE: (u32, u32) = (320, 240);
 
 /// A frame rendered and waiting for its (imitated) render latency to pass.
@@ -38,30 +45,57 @@ struct Pending {
 }
 
 /// Renders the cube as seen by `camera`: opaque where it is, alpha 0 and depth +inf elsewhere.
-fn render(camera: &Camera, yaw: f32) -> Target {
+fn render(camera: &Camera, center: [f32; 3], yaw: f32) -> Target {
     let mut target = Target::new(SIZE.0 as usize, SIZE.1 as usize);
-    target.draw(
-        camera,
-        &cuboid(CUBE_CENTER, [CUBE_HALF; 3], yaw),
-        &|_, n| {
-            // One colour per face direction, lit by a fixed light.
-            let base = [
-                [235.0, 80.0, 70.0],
-                [70.0, 200.0, 110.0],
-                [80.0, 130.0, 240.0],
-            ];
-            let (axis, sign) = (0..3)
-                .map(|a| (a, n[a]))
-                .max_by(|x, y| x.1.abs().total_cmp(&y.1.abs()))
-                .unwrap();
-            let mut c = base[axis];
-            if sign < 0.0 {
-                c = c.map(|v| v * 0.7 + 60.0);
-            }
-            lit(c, n)
-        },
-    );
+    target.draw(camera, &cuboid(center, [CUBE_HALF; 3], yaw), &|_, n| {
+        // One colour per face direction, lit by a fixed light.
+        let base = [
+            [235.0, 80.0, 70.0],
+            [70.0, 200.0, 110.0],
+            [80.0, 130.0, 240.0],
+        ];
+        let (axis, sign) = (0..3)
+            .map(|a| (a, n[a]))
+            .max_by(|x, y| x.1.abs().total_cmp(&y.1.abs()))
+            .unwrap();
+        let mut c = base[axis];
+        if sign < 0.0 {
+            c = c.map(|v| v * 0.7 + 60.0);
+        }
+        lit(c, n)
+    });
     target
+}
+
+/// The point `IN_FRONT` metres ahead of the camera along its horizontal heading, at eye height.
+fn ahead_of(camera: &Camera) -> [f32; 3] {
+    let (eye, f) = (camera.eye(), camera.forward());
+    let len = (f[0] * f[0] + f[2] * f[2]).sqrt();
+    let (dx, dz) = if len > 1e-3 {
+        (f[0] / len, f[2] / len)
+    } else {
+        (0.0, -1.0)
+    };
+    [eye[0] + dx * IN_FRONT, eye[1], eye[2] + dz * IN_FRONT]
+}
+
+/// The height of the highest collision triangle under `(x, z)` that is not above `max_y`.
+fn ground_under(triangles: &[Triangle], x: f32, z: f32, max_y: f32) -> Option<f32> {
+    triangles
+        .iter()
+        .filter_map(|[a, b, c]| {
+            // Barycentric coordinates of (x, z) in the triangle projected onto the ground plane
+            let det = (b[2] - c[2]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[2] - c[2]);
+            if det.abs() < 1e-9 {
+                return None;
+            }
+            let u = ((b[2] - c[2]) * (x - c[0]) + (c[0] - b[0]) * (z - c[2])) / det;
+            let v = ((c[2] - a[2]) * (x - c[0]) + (a[0] - c[0]) * (z - c[2])) / det;
+            let w = 1.0 - u - v;
+            (u >= 0.0 && v >= 0.0 && w >= 0.0).then(|| u * a[1] + v * b[1] + w * c[1])
+        })
+        .filter(|&y| y <= max_y)
+        .max_by(f32::total_cmp)
 }
 
 fn main() -> std::io::Result<()> {
@@ -70,6 +104,11 @@ fn main() -> std::io::Result<()> {
     let frames = std::env::args().any(|a| a == "--frames");
     let with_depth = !std::env::args().any(|a| a == "--no-depth");
     let latency = Duration::from_millis(arg("--latency").unwrap_or(40));
+    let in_front = std::env::args().any(|a| a == "--in-front");
+    // With --in-front: chosen from the first camera, then set on the ground once collision is known
+    let mut center = (!in_front).then_some(CUBE_CENTER);
+    let mut grounded = !in_front;
+    let mut last_collision: Vec<Triangle> = Vec::new();
     let start = Instant::now();
     let log = |msg: String| println!("[guest {:6.2}s] {msg}", start.elapsed().as_secs_f32());
 
@@ -132,6 +171,9 @@ fn main() -> std::io::Result<()> {
                 }
                 Event::Lost { reason } => {
                     log(format!("LOST the host: {reason}"));
+                    if in_front {
+                        (center, grounded) = (None, false);
+                    }
                     writer = None;
                     pending.clear();
                 }
@@ -140,13 +182,16 @@ fn main() -> std::io::Result<()> {
                     cameras += 1;
                     newest = Some((header.seq, camera));
                 }
-                Event::Collision(c) => log(format!(
-                    "collision query {}: {} triangles within {} m of {:?}",
-                    c.query,
-                    c.triangles.len(),
-                    c.radius,
-                    c.center
-                )),
+                Event::Collision(c) => {
+                    log(format!(
+                        "collision query {}: {} triangles within {} m of {:?}",
+                        c.query,
+                        c.triangles.len(),
+                        c.radius,
+                        c.center
+                    ));
+                    last_collision = c.triangles;
+                }
                 Event::Focus { focus, .. } => log(format!(
                     "host says input focus is now with the {}",
                     focus.as_str()
@@ -155,18 +200,35 @@ fn main() -> std::io::Result<()> {
             }
         }
 
-        if let Some((seq, camera)) = newest {
+        if let Some((_, camera)) = &newest {
+            if center.is_none() {
+                let at = ahead_of(camera);
+                log(format!(
+                    "cube placed {IN_FRONT} m ahead of the camera at {:?}",
+                    at.map(|v| (v * 100.0).round() / 100.0)
+                ));
+                center = Some(at);
+            }
+        }
+        if let (Some(at), false) = (center, grounded) {
+            if let Some(y) = ground_under(&last_collision, at[0], at[2], at[1] + 0.5) {
+                center = Some([at[0], y + CUBE_HALF, at[2]]);
+                grounded = true;
+                log(format!("cube stands on the host's ground at y {y:.2}"));
+            }
+        }
+        if let (Some((seq, camera)), Some(center)) = (newest, center) {
             let now = now_us();
             let yaw = 0.6 * t;
             let mut pose = Pose::new(CUBE, now);
-            pose.translation = CUBE_CENTER;
+            pose.translation = center;
             pose.rotation = [0.0, (yaw * 0.5).sin(), 0.0, (yaw * 0.5).cos()];
             if link.send_poses(&[pose]).is_ok() {
                 poses_sent += 1;
             }
             if writer.is_some() {
                 let began = Instant::now();
-                let target = render(&camera, yaw);
+                let target = render(&camera, center, yaw);
                 render_ms += began.elapsed().as_secs_f32() * 1000.0;
                 pending.push_back(Pending {
                     due: Instant::now() + latency,
