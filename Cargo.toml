@@ -19,6 +19,11 @@ serde_json = { version = "1", optional = true }
 # The passthrough link (docs/CONTRACT.md): UDP + TCP on 127.0.0.1 and a memory-mapped pixel file.
 link = ["dep:memmap2", "dep:serde_json"]
 
+# The worked example of docs/WRITING_A_PROVIDER.md; `test = true` makes `cargo test` run its tests.
+[[example]]
+name = "cube_provider"
+test = true
+
 [[example]]
 name = "fake_host"
 required-features = ["link"]

@@ -19,6 +19,9 @@ jobs:
           components: clippy
       - run: cargo test
       - run: cargo test --features link
+      # `cargo test` also runs the tests of the cube provider (the guide's example) and tests/docs.rs
+      # (the guide shows the example as it is; the links in the docs lead somewhere)
+      - run: cargo run --example cube_provider
       - run: cargo run --example conformance -- --id right
       - run: cargo clippy --all-targets --features link -- -D warnings
 
