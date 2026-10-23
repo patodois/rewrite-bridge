@@ -148,12 +148,19 @@ fn characters_stand_upright_on_the_ground() {
     assert!(r.findings.is_empty(), "{r}");
 
     // Lying on its back: Z-up data read as Y-up.
-    let lying = box_model([0.3, 0.2, 0.9]);
+    let lying = box_model([0.3, 0.12, 0.9]);
     let r = check_model(&lying, &Expect::default().with_character(true));
     assert!(r.has("orientation.not_upright"), "{r}");
 
     // Wider than tall but not lying: only info.
     let t_pose = box_model([0.9, 0.7, 0.2]);
+    // A long low creature is wider than tall, which is only info.
+    let rat = box_model([0.3, 0.4, 1.1]);
+    let r = check_model(&rat, &Expect::default().with_character(true));
+    assert!(
+        r.has("orientation.wide") && !r.has("orientation.not_upright"),
+        "{r}"
+    );
     let r = check_model(&t_pose, &Expect::default().with_character(true));
     assert!(
         r.has("orientation.wide") && !r.has("orientation.not_upright"),
@@ -216,13 +223,39 @@ fn the_front_is_only_read_from_names() {
         Facing::PlusX
     );
 
-    // An exhaust at -Z says the front is +Z.
-    m.nodes[1].name = "Exhaust_01".into();
+    // A tail light at -Z says the front is +Z.
+    m.nodes[1].name = "Tail_light_01".into();
     m.nodes[1].translation = [0.0, 1.0, -3.0];
     assert_eq!(
         check_model(&m, &Expect::default()).measured.facing,
         Facing::PlusZ
     );
+
+    // An exhaust is at the rear of a tank and the front of a radial-engined aircraft: no vote.
+    m.nodes[1].name = "emtr_exhaust_01".into();
+    assert_eq!(
+        check_model(&m, &Expect::default()).measured.facing,
+        Facing::Unknown
+    );
+    // A plain "front" counts; a part's own front ("superstructure_front") does not.
+    m.nodes[1].name = "Front_L".into();
+    assert_eq!(
+        check_model(&m, &Expect::default()).measured.facing,
+        Facing::MinusZ
+    );
+    m.nodes[1].name = "superstructure_front".into();
+    assert_eq!(
+        check_model(&m, &Expect::default()).measured.facing,
+        Facing::Unknown
+    );
+    // A root named after the asset ("...FrontB") says nothing.
+    m.nodes[1].name = "front".into();
+    m.nodes[1].parent = None;
+    assert_eq!(
+        check_model(&m, &Expect::default()).measured.facing,
+        Facing::Unknown
+    );
+    m.nodes[1].parent = Some(0);
 
     // Words must match whole: "eyebrow" is not "eye", "backpack" is not a rear.
     m.nodes[1].name = "eyebrow".into();
@@ -237,6 +270,13 @@ fn the_front_is_only_read_from_names() {
         check_model(&m, &Expect::default()).measured.facing,
         Facing::MinusZ
     );
+    // "Eye-Back" is the back eye, not a front point.
+    m.nodes[1].name = "Eye-Back".into();
+    assert_eq!(
+        check_model(&m, &Expect::default()).measured.facing,
+        Facing::Unknown
+    );
+    m.nodes[1].name = "leftEye".into();
     // A point on the middle says nothing, and neither does a diagonal.
     m.nodes[1].translation = [0.0, 1.0, 0.0];
     assert_eq!(
@@ -619,6 +659,21 @@ fn a_plausible_walk_passes_and_reports_its_speed() {
     assert_eq!(codes(&r), ["animation.root_motion"], "{r}");
     assert!(r.findings[0].message.contains("1.50 m/s"), "{r}");
     assert_eq!(r.measured.clips, 1);
+    // Many clips are summarised in one finding.
+    let mut m = with_clip(walk());
+    let mut run = walk();
+    run.name = "run".into();
+    run.channels[0].values = vec![0.0, 1.0, 0.0, 0.0, 1.0, 6.0];
+    m.animations.push(run);
+    let r = check_animated(&m, &Expect::default());
+    assert_eq!(codes(&r), ["animation.root_motion"], "{r}");
+    let msg = &r.findings[0].message;
+    assert!(
+        msg.starts_with("2 clips")
+            && msg.contains("slowest 1.50")
+            && msg.contains("fastest 6.00 m/s (\"run\")"),
+        "{msg}"
+    );
 }
 
 #[test]

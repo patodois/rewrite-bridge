@@ -21,12 +21,20 @@ const FRONT_WORDS: &[&str] = &[
     "nose",
     "snout",
     "face",
-    "front",
     "headlight",
     "headlights",
 ];
+/// Words that mean "front" or "rear" in a plain way. They only count when the whole name is made
+/// of them and of `SIDE_WORDS`, because `superstructure_front` or `Door-Knocker-Front` name a
+/// part's own front, not the model's.
+const PLAIN_FRONT: &str = "front";
+const PLAIN_REAR: &str = "rear";
+const SIDE_WORDS: &[&str] = &[
+    "front", "rear", "left", "right", "l", "r", "point", "marker", "locator", "dummy", "socket",
+    "anchor",
+];
 /// Words that name a place on the back.
-const REAR_WORDS: &[&str] = &["rear", "exhaust", "tail", "taillight", "taillights"];
+const REAR_WORDS: &[&str] = &["tail", "taillight", "taillights"];
 /// A named point must be this far (metres, or this fraction of the horizontal extent, whichever
 /// is greater) from the middle of the model for the facing to be read from it.
 const FRONT_MIN_OFFSET_M: f64 = 0.03;
@@ -205,8 +213,10 @@ fn words(name: &str) -> Vec<String> {
 
 /// Front. The bridge says the front faces +Z, but a bare mesh cannot tell front from back, so
 /// the facing is only read where the asset names it: nodes or sockets called muzzle, eye, nose,
-/// front (positive) or rear, exhaust, tail (negative) vote with their offset from the middle of
-/// the model. Without such names, or when the votes do not clearly favour one axis, the facing is
+/// face, headlight, or plainly "front" (positive), or tail, taillight, or plainly "rear"
+/// (negative), vote with their offset from the middle of the model. Roots are skipped, and so is
+/// "exhaust": it is at the rear of a tank, the front of a radial-engined aircraft and the middle
+/// of a ship. Without such names, or when the votes do not clearly favour one axis, the facing is
 /// `Unknown` and no finding is made. A consumer that spawns a tank facing backwards cannot be
 /// helped by a guess, but can by a name.
 fn check_front(
@@ -226,9 +236,15 @@ fn check_front(
             return;
         }
         let w = words(name);
-        let sign = if w.iter().any(|w| FRONT_WORDS.contains(&w.as_str())) {
+        let plain = !w.is_empty() && w.iter().all(|w| SIDE_WORDS.contains(&w.as_str()));
+        let has = |list: &[&str]| w.iter().any(|w| list.contains(&w.as_str()));
+        // "Eye-Back" is the back eye: a front word next to a back word says nothing.
+        if has(FRONT_WORDS) && has(&["back", "rear", "behind"]) {
+            return;
+        }
+        let sign = if has(FRONT_WORDS) || (plain && has(&[PLAIN_FRONT])) {
             1.0
-        } else if w.iter().any(|w| REAR_WORDS.contains(&w.as_str())) {
+        } else if has(REAR_WORDS) || (plain && has(&[PLAIN_REAR])) {
             -1.0
         } else {
             return;
@@ -240,7 +256,10 @@ fn check_front(
         }
     };
     for (n, w) in model.nodes.iter().zip(worlds) {
-        add(&n.name, [w[12], w[13], w[14]]);
+        // A root is usually named after the whole asset ("...FrontB"), which says nothing.
+        if n.parent.is_some() {
+            add(&n.name, [w[12], w[13], w[14]]);
+        }
     }
     for s in sockets {
         if let Some(w) = worlds.get(s.node) {

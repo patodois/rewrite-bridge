@@ -165,7 +165,7 @@ consistent inverse bind matrices), materials and images (factor ranges, alpha mo
 texture's alpha, normal-map sanity), clips (quaternion hemispheres, zero scales, root-motion speed in
 m/s, a skeleton that stretches because the clip uses other units) and scenes (extent, instance scales,
 asset references). The front is only judged where an asset names it (a node or socket called `muzzle`,
-`eye`, `front`, `exhaust`); otherwise the facing is reported as unknown, never guessed. The colour
+`eye`, `nose`, `headlight`, `front`, `tail`, `rear`); otherwise the facing is reported as unknown, never guessed. The colour
 space of images is not checked because `Image` does not carry one: the contract fixes it.
 
 Some findings are conventions, not bugs. Drop a code your game knowingly differs on with

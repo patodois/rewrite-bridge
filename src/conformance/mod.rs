@@ -58,7 +58,7 @@
 //! | `orientation.not_upright` / `orientation.wide` | warning / info | a character lying down means Z-up data read as Y-up |
 //! | `orientation.feet_off_ground` | warning | characters are placed by their feet at y = 0 |
 //! | `orientation.off_centre` | info | the origin is far from the middle of the model, which shifts rotation pivots |
-//! | `front.not_plus_z` | warning | the front faces +Z; named front points (muzzle, eyes) say otherwise |
+//! | `front.not_plus_z` | warning | the front faces +Z; named front points (muzzle, eyes, face, headlight, plain front) or rear points (tail, plain rear) say otherwise |
 //! | `geometry.non_finite` | error | NaN or infinity poisons bounds, culling and skinning |
 //! | `geometry.empty_mesh` | warning | a mesh with vertices but no triangles draws nothing |
 //! | `geometry.normals_not_unit` | warning | lighting assumes unit normals |
@@ -80,11 +80,11 @@
 //! | `material.unused` | info | a material no mesh uses |
 //! | `image.empty` / `image.too_large` | error / warning | zero-sized, or larger than most GPUs accept |
 //! | `image.normal_map_suspect` | warning | a normal map should be blue-dominant and centred on green and red 0.5; otherwise channels are swapped or it is not a tangent-space map |
-//! | `animation.empty` / `animation.unnamed` / `animation.duplicate_name` | warning | the clip cannot be played or looked up by name |
+//! | `animation.empty` / `animation.unnamed` / `animation.duplicate_name` | warning | the clip cannot be played or looked up by name; one finding per model, with the count |
 //! | `animation.zero_duration` / `animation.duration_suspect` | warning | a clip of 0 s cannot loop; under 1 ms or over ten minutes is seconds vs milliseconds |
 //! | `animation.quaternion_sign_flip` | warning | neighbouring keys in opposite hemispheres make some players spin the long way round |
 //! | `animation.zero_scale` | warning | a zero scale key collapses the node and makes its matrix singular |
-//! | `animation.root_motion` | info | speed of the root, to eyeball units (a walk is 1 to 2 m/s) |
+//! | `animation.root_motion` | info | slowest, median and fastest speed of the root over the model's clips, to eyeball units (a walk is 1 to 2 m/s) |
 //! | `animation.root_motion_extreme` | warning | beyond [`ROOT_MOTION_EXTREME_MPS`] the clip is in the wrong units |
 //! | `animation.pose_extent_mismatch` | warning | the animated skeleton's size differs a lot from the rest pose: clip and model disagree on units |
 //! | `scene.empty` / `scene.unused_model` / `scene.duplicate_asset` | warning / info / info | nothing to draw; a model never placed; a model listed twice and loaded twice |
@@ -127,9 +127,11 @@ pub const SCALE_MAX_EXTENT_M: f32 = 2000.0;
 /// off the ground.
 pub const FEET_TOLERANCE_M: f32 = 0.3;
 /// A character whose height is below this fraction of its largest horizontal extent is lying down
-/// (`orientation.not_upright`). Between this and 1 it is only reported as info, since a T-pose or
-/// a four-legged animal is legitimately wider than tall.
-pub const UPRIGHT_MIN_RATIO: f32 = 0.5;
+/// (`orientation.not_upright`). A person exported Z-up and read as Y-up is about 0.15 to 0.25
+/// (depth over height). Between this and 1 it is only reported as info, since a T-pose or a
+/// four-legged animal is legitimately wider than tall; a long low creature (a rat with its tail,
+/// a trilobite) can still fall below it and should be given `Expect::with_character(false)`.
+pub const UPRIGHT_MIN_RATIO: f32 = 0.25;
 /// Distance (metres) between the bounding box centre and the origin, in X or Z, above which it is
 /// reported as info.
 pub const CENTRE_OFFSET_REPORT_M: f32 = 0.1;
@@ -226,7 +228,9 @@ impl Expect {
     }
 
     /// What can be said of an asset from its kind alone: a character is a character and between
-    /// 0.2 and 6 m tall (a mouse-sized creature to a dragon); everything else is generic.
+    /// 0.2 and 6 m tall (a mouse-sized creature to a dragon); vehicles, weapons, props and levels
+    /// are not characters, so a skeleton in them does not make them stand upright with their feet
+    /// on the ground; `Other` is generic.
     pub fn for_kind(kind: AssetKind) -> Self {
         match kind {
             AssetKind::Character => Self {
@@ -234,7 +238,11 @@ impl Expect {
                 is_character: Some(true),
                 ..Self::default()
             },
-            _ => Self::default(),
+            AssetKind::Other => Self::default(),
+            _ => Self {
+                is_character: Some(false),
+                ..Self::default()
+            },
         }
     }
 

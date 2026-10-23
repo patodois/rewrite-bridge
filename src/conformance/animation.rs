@@ -13,45 +13,74 @@ use super::{
 use crate::{AnimatedModel, Animation, Interpolation, Target};
 
 /// Runs every clip check on an animated model that already passed `validate`.
+///
+/// Clips come in hundreds (Hytale's goblin has 250), so what can be said once per model is: empty
+/// clips, repeated and missing names, and root-motion speeds are each one finding naming the
+/// count and the first example. Per-clip problems keep their own finding and location.
 pub(crate) fn check(am: &AnimatedModel, rep: &mut Report) {
     let nodes = &am.model.nodes;
     let rest = math::world_matrices(nodes);
     let markers = marker_nodes(am);
     let mut names = HashSet::new();
+    let (mut unnamed, mut dupes, mut empties): (Vec<usize>, Vec<usize>, Vec<usize>) =
+        (Vec::new(), Vec::new(), Vec::new());
+    let mut roots: Vec<RootMotion> = Vec::new();
     for (ci, a) in am.animations.iter().enumerate() {
         let loc = Location::clip(&a.name);
         if a.name.is_empty() {
-            rep.push(
-                Severity::Warning,
-                "animation.unnamed",
-                loc.clone(),
-                format!("clip {ci} has no name, so it cannot be looked up"),
-            );
+            unnamed.push(ci);
         } else if !names.insert(a.name.as_str()) {
-            rep.push(
-                Severity::Warning,
-                "animation.duplicate_name",
-                loc.clone(),
-                format!(
-                    "clip {ci} repeats the name {:?}; lookups find the first",
-                    a.name
-                ),
-            );
+            dupes.push(ci);
         }
         if a.channels.is_empty() {
-            rep.push(
-                Severity::Warning,
-                "animation.empty",
-                loc.clone(),
-                "the clip has no channels".into(),
-            );
+            empties.push(ci);
             continue;
         }
         check_duration(a, &loc, rep);
         check_channels(am, a, &loc, rep);
-        check_root_motion(am, a, &rest, &loc, rep);
+        if let Some(r) = root_motion(am, ci, &rest) {
+            roots.push(r);
+        }
         check_pose_extent(am, a, &rest, &markers, &loc, rep);
     }
+    let total = am.animations.len();
+    let clip_name = |ci: usize| am.animations[ci].name.as_str();
+    if let Some(&first) = empties.first() {
+        rep.push(
+            Severity::Warning,
+            "animation.empty",
+            Location::clip(clip_name(first)),
+            format!(
+                "{} of {total} clips have no channels, the first is {:?}",
+                empties.len(),
+                clip_name(first)
+            ),
+        );
+    }
+    if let Some(&first) = unnamed.first() {
+        rep.push(
+            Severity::Warning,
+            "animation.unnamed",
+            Location::none(),
+            format!(
+                "{} of {total} clips have no name, so they cannot be looked up; the first is clip {first}",
+                unnamed.len()
+            ),
+        );
+    }
+    if let Some(&first) = dupes.first() {
+        rep.push(
+            Severity::Warning,
+            "animation.duplicate_name",
+            Location::clip(clip_name(first)),
+            format!(
+                "{} of {total} clips repeat the name of an earlier clip (lookups find the first), the first is {:?}",
+                dupes.len(),
+                clip_name(first)
+            ),
+        );
+    }
+    report_root_motion(am, &roots, rep);
 }
 
 /// Duration. A clip of 0 s cannot loop or be sampled over time. One shorter than a millisecond
@@ -159,19 +188,22 @@ fn check_channels(am: &AnimatedModel, a: &Animation, loc: &Location, rep: &mut R
     }
 }
 
+/// The root of one clip travelling.
+struct RootMotion {
+    clip: usize,
+    channel: usize,
+    node: usize,
+    mps: f64,
+}
+
 /// Root motion. The farthest the root moves from its first key, per second of clip, in world
 /// metres. A walk is 1 to 2 m/s, a run 4 to 10, a car up to 70; 100 m/s or more is a unit bug
 /// (centimetres in the keys, metres in the model). The root is a node with no parent, or, when
 /// there is only one such node (an armature), its children.
-fn check_root_motion(
-    am: &AnimatedModel,
-    a: &Animation,
-    rest: &[Mat4],
-    loc: &Location,
-    rep: &mut Report,
-) {
+fn root_motion(am: &AnimatedModel, clip: usize, rest: &[Mat4]) -> Option<RootMotion> {
+    let a = &am.animations[clip];
     if a.duration_s <= 0.0 {
-        return;
+        return None;
     }
     let nodes = &am.model.nodes;
     let parentless: Vec<usize> = (0..nodes.len())
@@ -181,7 +213,7 @@ fn check_root_motion(
     if parentless.len() == 1 {
         candidates.extend((0..nodes.len()).filter(|&i| nodes[i].parent == Some(parentless[0])));
     }
-    let mut best: Option<(f64, usize)> = None;
+    let mut best: Option<RootMotion> = None;
     for (chi, ch) in a.channels.iter().enumerate() {
         if ch.target != Target::Translation || !candidates.contains(&ch.node) {
             continue;
@@ -199,31 +231,67 @@ fn check_root_motion(
         let excursion = (1..ch.times.len())
             .map(|k| math::len3(math::transform_vector(&parent, math::sub3(at(k), p0))))
             .fold(0.0, f64::max);
-        let speed = excursion / f64::from(a.duration_s);
-        if best.is_none_or(|(s, _)| speed > s) {
-            best = Some((speed, chi));
+        let mps = excursion / f64::from(a.duration_s);
+        if best.as_ref().is_none_or(|b| mps > b.mps) {
+            best = Some(RootMotion {
+                clip,
+                channel: chi,
+                node: ch.node,
+                mps,
+            });
         }
     }
-    let Some((speed, chi)) = best else { return };
-    let node = a.channels[chi].node;
-    let l = loc.clone().with_channel(chi).with_node(node);
-    let name = &nodes[node].name;
-    if speed >= ROOT_MOTION_EXTREME_MPS {
+    best
+}
+
+fn report_root_motion(am: &AnimatedModel, roots: &[RootMotion], rep: &mut Report) {
+    let name = |r: &RootMotion| am.animations[r.clip].name.as_str();
+    let where_ = |r: &RootMotion| {
+        Location::clip(name(r))
+            .with_channel(r.channel)
+            .with_node(r.node)
+    };
+    let mut extreme: Vec<&RootMotion> = roots
+        .iter()
+        .filter(|r| r.mps >= ROOT_MOTION_EXTREME_MPS)
+        .collect();
+    extreme.sort_by(|a, b| b.mps.total_cmp(&a.mps));
+    if let Some(r) = extreme.first() {
         rep.push(
             Severity::Warning,
             "animation.root_motion_extreme",
-            l,
+            where_(r),
             format!(
-                "node {node} ({name:?}) travels {speed:.1} m/s, over {ROOT_MOTION_EXTREME_MPS}: \
-                 are the keys in centimetres?"
+                "{} of {} moving clips travel over {ROOT_MOTION_EXTREME_MPS} m/s, the fastest is \
+                 {:?} at {:.1} m/s (node {} {:?}): are the keys in centimetres?",
+                extreme.len(),
+                roots.len(),
+                name(r),
+                r.mps,
+                r.node,
+                am.model.nodes[r.node].name
             ),
         );
-    } else if speed >= ROOT_MOTION_REPORT_MPS {
+    }
+    let mut moving: Vec<&RootMotion> = roots
+        .iter()
+        .filter(|r| r.mps >= ROOT_MOTION_REPORT_MPS && r.mps < ROOT_MOTION_EXTREME_MPS)
+        .collect();
+    moving.sort_by(|a, b| a.mps.total_cmp(&b.mps));
+    if let (Some(slow), Some(fast)) = (moving.first(), moving.last()) {
         rep.push(
             Severity::Info,
             "animation.root_motion",
-            l,
-            format!("node {node} ({name:?}) travels {speed:.2} m/s"),
+            where_(fast),
+            format!(
+                "{} clips move the root: slowest {:.2} m/s ({:?}), median {:.2} m/s, fastest {:.2} m/s ({:?})",
+                moving.len(),
+                slow.mps,
+                name(slow),
+                moving[moving.len() / 2].mps,
+                fast.mps,
+                name(fast)
+            ),
         );
     }
 }
