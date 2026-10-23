@@ -49,6 +49,10 @@ Messages a side does not use may simply be ignored by the receiver.
   `Collision`) or goes through the pixel file (see `Frame`).
 - UDP may drop or reorder datagrams even on loopback when a receive buffer fills. State is
   therefore "latest wins": every datagram is self-contained, and stale ones are discarded (section 7).
+- **Receive buffer.** A receiver SHOULD ask the OS for a UDP receive buffer of at least **4 MiB**
+  (`setsockopt(SO_RCVBUF)`; Java: `StandardSocketOptions.SO_RCVBUF`) when it binds its socket, and
+  ignore a failure or a smaller grant: the OS default is often under 1 MiB, which a snapshot of
+  `Collision` chunks (section 9.5) can exceed. Pacing on the sender's side is the other half.
 
 ## 3. Byte order, layout and numbers
 
@@ -169,7 +173,8 @@ Future versions keep the datagram header's first 8 bytes (magic, version, kind, 
   - `Pose`: per entity, drop a record whose `time_us` is older than the last one used.
   - `Collision`: chunks belong to a `query`; a chunk of an older query than the newest seen is
     dropped, and an incomplete query is discarded when a newer one starts.
-  - `Frame`: drop it unless its `frame` number is newer than the newest one shown.
+  - `Frame`: drop it unless its `frame` number is newer than the newest one shown *from the
+    current pixel file*; a new `frame_channel` resets that number (section 8).
 - **Full buffers.** UDP sends that would block are dropped (the next tick replaces them). The
   control channel is reliable; a side whose unsent control bytes exceed 1 MiB treats the peer as
   lost, rather than stall its game.
@@ -196,9 +201,14 @@ Future versions keep the datagram header's first 8 bytes (magic, version, kind, 
 | `protocol` | integer | highest supported version (in the host reply: the chosen version) |
 | `min_protocol` | integer | lowest supported version |
 | `udp_port` | integer | the sender's UDP port on 127.0.0.1 |
-| `heartbeat_ms` | integer | how often the sender sends `Heartbeat` |
+| `heartbeat_ms` | integer | how often the sender sends `Heartbeat`, **10 to 10000** |
 | `timeout_ms` | integer | the sender's own watchdog timeout |
 | `session` | integer, host only | nonzero `u32` session number |
+
+A `hello` whose `heartbeat_ms` is outside `10 ..= 10000` is a handshake error: the receiver sends
+`bye` with the reason and closes (section 6). Without a floor a peer could ask for a heartbeat every
+millisecond or, with a huge value, stretch the watchdog (`4 * heartbeat_ms`) for ever. A side whose
+own configuration is outside the range sends the nearest value inside it.
 
 ### `spawn`
 
@@ -217,6 +227,15 @@ Announces an entity of the sender's, to be drawn with a provider's asset. Its po
 | `name` | string, optional | display name |
 
 A second `spawn` with the same `entity` replaces the first.
+
+A receiver keeps pose state (section 9.4) **only for entities the peer has spawned and not
+despawned**:
+
+- a `Pose` record for any other id is ignored and counted (the Rust `Stats::unknown_entity`); a
+  peer cannot make the receiver allocate by inventing ids;
+- a peer has at most **1024** live spawned entities. A `spawn` of a new id beyond that is ignored
+  and logged (once per session is enough) and its poses are ignored too; a `spawn` of an id that is
+  already live always replaces it, and a `despawn` frees the place.
 
 ### `despawn`
 
@@ -243,8 +262,15 @@ Announces a pixel file (section 9.6) the sender will fill and refer to in `Frame
 {"type":"frame_channel","path":"/tmp/rewrite-bridge-2882400001-guest.frames","width":1280,"height":720,"slots":3}
 ```
 
-`path` is an absolute path to a file the receiver may map read-only. A later `frame_channel`
-replaces the previous one (for example after a resize).
+`path` is an absolute path to a file the receiver may map read-only (it is opened as section 9.6
+requires). A later `frame_channel` replaces the previous one (for example after a resize).
+
+Each pixel file numbers its frames from 1, so a writer starts again at 1 for a new file. A receiver
+therefore **resets its frame staleness (the newest frame number it has shown) for the channel when
+a `frame_channel` replaces the previous one**; without that it would drop the new file's frames
+until their numbers passed the old file's. A `Frame` datagram of the old file that was still in
+flight when the line arrived can be delivered after the reset; the receiver's read then finds that
+slot holding another frame (or the old file gone) and skips it.
 
 ### `bye`
 
@@ -327,7 +353,8 @@ PoseRecord, 80 bytes:
 | 56 | 12 | f32[3] | `velocity` | linear, world space, m/s |
 | 68 | 12 | f32[3] | `angular_velocity` | world space axis times rad/s |
 
-The datagram length must be exactly `24 + 8 + 80 * count`.
+The datagram length must be exactly `24 + 8 + 80 * count`. A record whose `entity` the peer has not
+spawned (section 8, `spawn`) is ignored.
 
 ### 9.5 Collision (kind 4), 32 + 36·n byte payload
 
@@ -351,6 +378,14 @@ same `center`, `radius` and `chunk_count`. A query with no triangles is one chun
 `triangle_count = 0`; it means "nothing solid nearby". The receiver replaces its previous
 collision set only once every chunk of a newer query has arrived.
 
+**Pacing.** A sender SHOULD NOT put a whole snapshot on the wire at once: it queues the chunks and
+sends at most **32** collision datagrams per tick (per `poll()` in the reference implementations),
+so the burst never exceeds what a receive buffer holds (32 full chunks are 256 KiB; a 400-chunk
+snapshot of 3.2 MB sent in one call is mostly lost on an OS default buffer). A snapshot queued
+while an older one still has chunks waiting **replaces** them, since the receiver discards an
+incomplete older query when a newer one starts anyway. Heartbeats, cameras and poses are not held
+back by the queue.
+
 ### 9.6 Frame (kind 5), 24-byte payload, 48-byte datagram, and the pixel file
 
 The sender renders, reads the image back to the CPU (and, if the file has a depth plane, the depth
@@ -358,7 +393,7 @@ too), writes it into a slot of the pixel file announced by `frame_channel`, then
 
 | Offset | Size | Type | Field | Meaning |
 |---|---|---|---|---|
-| 0 | 8 | u64 | `frame` | frame number, +1 per frame, starts at 1 |
+| 0 | 8 | u64 | `frame` | frame number, +1 per frame, starts at 1 in each pixel file |
 | 8 | 4 | u32 | `slot` | slot written, `frame % slots` |
 | 12 | 4 | u32 | `camera_seq` | header `seq` of the `Camera` the frame was rendered with, 0 if none |
 | 16 | 4 | u32 | `width` | pixels |
@@ -367,8 +402,9 @@ too), writes it into a slot of the pixel file announced by `frame_channel`, then
 `camera_seq` lets the host pair the pixels with the camera (and the poses) they were rendered for;
 section 9.7 says how it uses them to hide latency.
 
-**Pixel file.** A regular file in the sender's temp directory, created and sized by the sender,
-mapped read-write by the sender and read-only by the receiver. Layout:
+**Pixel file.** A regular file in the sender's temp directory, created exclusively and sized by the
+sender, mapped read-write by the sender and read-only by the receiver. The receiver treats the
+file as untrusted input (see "Opening and creating" below). Layout:
 
 File header, 64 bytes:
 
@@ -377,9 +413,9 @@ File header, 64 bytes:
 | 0 | 8 | u8[8] | `magic` | `"RBFRAME"` followed by one zero byte |
 | 8 | 4 | u32 | `version` | `1` |
 | 12 | 4 | u32 | `slots` | number of slots, 1 to 16; 3 is recommended |
-| 16 | 4 | u32 | `width` | pixels, maximum per slot |
-| 20 | 4 | u32 | `height` | pixels, maximum per slot |
-| 24 | 4 | u32 | `stride` | bytes per row, `width * 4` |
+| 16 | 4 | u32 | `width` | pixels, maximum per slot, 1 to 16384 |
+| 20 | 4 | u32 | `height` | pixels, maximum per slot, 1 to 16384 |
+| 24 | 4 | u32 | `stride` | bytes per row, exactly `width * 4` |
 | 28 | 4 | u32 | `format` | `1` = RGBA8, sRGB, straight (not premultiplied) alpha, rows top to bottom |
 | 32 | 8 | u64 | `slot_size` | bytes per slot including its header and depth plane, a multiple of 64 |
 | 40 | 4 | u32 | `depth_format` | `0` = no depth plane; `1` = `f32` linear view depth in metres (below); readers treat other values as `0` |
@@ -454,11 +490,42 @@ bytes. A reader that wants depth checks, before using the file, that `depth_form
 and, for `1`, that `depth_stride` is `width * 4`, `depth_offset` is a multiple of 64 and at least
 `64 + stride * height`, the plane `depth_offset + depth_stride * height` ends within `slot_size`, and
 the file is at least `64 + slots * slot_size` bytes long (compute in 64 bits, or check for
-overflow). A file that fails any of these is malformed and the reader refuses it. A `depth_format` the reader
+overflow). A file that fails any of these, or any check of "Opening and creating" below, is
+malformed and the reader refuses it. A `depth_format` the reader
 does not know is not an error: the reader treats the file as colour only, so a later revision can add
 a depth format without breaking older readers. With `depth_format` `0` or an unknown value the
-reader ignores `depth_stride` and `depth_offset`. A reader that does not use depth at all may skip these checks, as a revision 2
-reader does.
+reader ignores `depth_stride` and `depth_offset`. A reader that does not use depth at all may skip the depth checks, as a revision 2
+reader does; the other checks are not optional.
+
+**Opening and creating (revision 4).** The path in a `frame_channel` comes from the peer, and so
+does every byte of the file. A receiver MUST:
+
+1. refuse a `path` that is not absolute, and one that does not name a *regular file*: a symlink,
+   FIFO, device, directory or socket is refused. It checks the path before opening it and the
+   opened handle again (`fstat`; on Unix both must be the same device and inode). Where the OS has
+   non-blocking opens (`O_NONBLOCK`) it opens the file that way, so a FIFO a peer names cannot
+   block the receiver: opening one for reading waits for a writer for ever. (Java cannot ask for a
+   non-blocking open; it relies on the check before the open, and the swap race remains.)
+2. refuse a file whose `slots` is not 1 to 16, whose `width` or `height` is 0 or above **16384**, or
+   whose `stride` is not exactly `width * 4`, before it computes any size from them. (A colour
+   plane of 16384 x 16384 is 1 GiB; the limit is a ceiling for the format, and a receiver that
+   cannot afford a frame of that size may refuse files above a limit of its own.)
+3. do all size and offset arithmetic with overflow checks: `64 + slots * slot_size`,
+   `64 + slot * slot_size`, `64 + stride * height`, `depth_offset + depth_stride * height` and
+   the sums in "Compatibility and checks" above. A header whose numbers overflow is malformed. (A
+   `slot_size` chosen so that `slots * slot_size` wraps in 64 bits once passed the file-length
+   check of a reader that multiplied unchecked.)
+4. compare the file's current length (`fstat`, `FileChannel.size()`) with the length it mapped
+   **before each read**, and treat a shorter file as gone: skip the frame, drop the mapping, wait
+   for a new `frame_channel`. A file that shrinks under a live mapping makes the next access
+   fault (SIGBUS), which ends the process. The check narrows that window but cannot close it: a
+   truncation between the check and the copy still faults. The other half is on the sender (next
+   paragraph); the check guards against a broken or hostile peer, not a correct one.
+
+A sender MUST create the file exclusively (`O_CREAT | O_EXCL`, `CREATE_NEW`; creation fails if the
+path exists, so it never opens over another file) and MUST NOT truncate, shrink or resize it, or
+create another file at the path, after announcing it. A new size or a new session gets a new path
+and a new `frame_channel`.
 
 The sender deletes the file at the end of the session; a receiver never deletes it, and unmaps and
 closes it when the session ends or a new `frame_channel` replaces it. On Windows:
@@ -467,7 +534,9 @@ closes it when the session ends or a new `frame_channel` replaces it. On Windows
   receiver can open it while the sender has it, and the sender can delete it while the receiver
   still has it mapped (Windows removes the file once the last handle and view close);
 - the sender unmaps its own view (`UnmapViewOfFile`, then closes the mapping and file handles)
-  before deleting, since Windows refuses to delete or resize a file the calling process maps;
+  before deleting, since Windows refuses to delete or resize a file the calling process maps (a
+  Java sender can unmap only through JDK internals, which it tries by reflection; where that is
+  not possible the file outlives the writer on Windows until the temp directory is cleaned);
 - a file cannot be resized while any process maps it, so a sender never reuses a path a receiver
   may still map: a new size or a new session gets a new file and a new `frame_channel`.
 
@@ -703,6 +772,39 @@ control lines, send `Heartbeat` when `heartbeat_ms` has passed, and check the wa
   revision 1 or 2 reader reads the colour of a depth file as before, and a file without depth is
   byte for byte what revision 2 wrote. A `depth_format` a reader does not know means colour only,
   so later depth formats (16-bit, half float) can be added the same way.
+
+- v1, revision 4: validation and pacing, from a code review of both implementations. No byte
+  layout, message or field changed. What changed:
+  - **Frame numbering across pixel files (sections 7, 8, 9.6).** A new `frame_channel` resets the
+    receiver's newest-frame number, because each file numbers from 1; before, a resize made every
+    frame of the new file look stale until it passed the old file's count.
+  - **Collision bursts (sections 2, 9.5).** Senders queue the chunks of a snapshot and send at
+    most 32 collision datagrams per tick, a newer snapshot replacing queued chunks of an older one
+    (SHOULD); receivers ask for a 4 MiB UDP receive buffer (SHOULD). A snapshot of 400 chunks, sent
+    at once, mostly did not arrive.
+  - **Opening and creating pixel files (section 9.6, MUST).** Receivers refuse a path that is not
+    absolute or not a regular file (so a FIFO cannot hang them), refuse `width` or `height` above
+    16384 or a `stride` other than `width * 4` (the Rust reader had accepted larger), check all size
+    arithmetic for overflow (the Java reader's `slots * slot_size` could wrap past the file-length
+    check), and compare the file's length with their mapping before each read (a truncating peer
+    killed the reader with SIGBUS). Senders create the file exclusively and never truncate or
+    reuse a path (the Rust writer had truncated whatever was there).
+  - **Entity tables (sections 8 `spawn`, 9.4).** Pose state exists only for entities the peer
+    spawned, at most 1024 live ones; poses of other ids are ignored and counted. Before, every id a
+    peer invented added an entry to a table that was never trimmed. This includes a host's poses of
+    its own entities: they need a `spawn` too, as the table in section 1 already implied.
+  - **`heartbeat_ms` (section 8 `hello`).** 10 to 10000; outside it the `hello` is a handshake
+    error.
+
+  Why the protocol version stays 1: every datagram and every control line a correct revision 3
+  implementation sends is still valid and still means the same. The new rules reject only what
+  the layout sections already called invalid (a `stride` other than `width * 4`, a file shorter than
+  its header says, an entity id nobody spawned) or what no implementation produces (a heartbeat under
+  10 ms, a frame over 16384 pixels on a side, 1025 live entities: the Java writer already stopped at
+  32768 and the defaults are 250 ms and a handful of entities). Pacing and the buffer size are the
+  sender's and receiver's own behaviour, invisible on the wire. A peer that depended on the old
+  leniency (poses without a `spawn`, or a `heartbeat_ms` under 10) must add the `spawn` or raise
+  the value; the reference examples (`fake_guest`, link-java's `LinkDemo`) already spawn first.
 
 A change that alters any layout or meaning above needs a new protocol version. Adding a control
 message type or field, or a new datagram `kind`, does not, because receivers ignore what they do
