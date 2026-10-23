@@ -413,8 +413,8 @@ File header, 64 bytes:
 | 0 | 8 | u8[8] | `magic` | `"RBFRAME"` followed by one zero byte |
 | 8 | 4 | u32 | `version` | `1` |
 | 12 | 4 | u32 | `slots` | number of slots, 1 to 16; 3 is recommended |
-| 16 | 4 | u32 | `width` | pixels, maximum per slot, 1 to 16384 |
-| 20 | 4 | u32 | `height` | pixels, maximum per slot, 1 to 16384 |
+| 16 | 4 | u32 | `width` | pixels, maximum per slot, 1 to 16384 (`width * height` at most 67108864) |
+| 20 | 4 | u32 | `height` | pixels, maximum per slot, 1 to 16384 (`width * height` at most 67108864) |
 | 24 | 4 | u32 | `stride` | bytes per row, exactly `width * 4` |
 | 28 | 4 | u32 | `format` | `1` = RGBA8, sRGB, straight (not premultiplied) alpha, rows top to bottom |
 | 32 | 8 | u64 | `slot_size` | bytes per slot including its header and depth plane, a multiple of 64 |
@@ -506,10 +506,12 @@ does every byte of the file. A receiver MUST:
    non-blocking opens (`O_NONBLOCK`) it opens the file that way, so a FIFO a peer names cannot
    block the receiver: opening one for reading waits for a writer for ever. (Java cannot ask for a
    non-blocking open; it relies on the check before the open, and the swap race remains.)
-2. refuse a file whose `slots` is not 1 to 16, whose `width` or `height` is 0 or above **16384**, or
-   whose `stride` is not exactly `width * 4`, before it computes any size from them. (A colour
-   plane of 16384 x 16384 is 1 GiB; the limit is a ceiling for the format, and a receiver that
-   cannot afford a frame of that size may refuse files above a limit of its own.)
+2. refuse a file whose `slots` is not 1 to 16, whose `width` or `height` is 0 or above **16384**,
+   whose `width * height` is above **67108864** pixels (2^26, that is 8192 x 8192), or whose
+   `stride` is not exactly `width * 4`, before it computes any size from them. The pixel limit
+   caps what one read allocates at 256 MiB of colour plus 256 MiB of depth; a 16384 x 16384 file
+   would have been 1 GiB of colour alone. A receiver that cannot afford even that may refuse
+   files above a limit of its own, and a sender stays within both limits.
 3. do all size and offset arithmetic with overflow checks: `64 + slots * slot_size`,
    `64 + slot * slot_size`, `64 + stride * height`, `depth_offset + depth_stride * height` and
    the sums in "Compatibility and checks" above. A header whose numbers overflow is malformed. (A
@@ -784,7 +786,9 @@ control lines, send `Heartbeat` when `heartbeat_ms` has passed, and check the wa
     at once, mostly did not arrive.
   - **Opening and creating pixel files (section 9.6, MUST).** Receivers refuse a path that is not
     absolute or not a regular file (so a FIFO cannot hang them), refuse `width` or `height` above
-    16384 or a `stride` other than `width * 4` (the Rust reader had accepted larger), check all size
+    16384, a frame of more than 67108864 pixels (a sparse file whose header claimed 16384 x 16384
+    made one read allocate 1 GiB) or a `stride` other than `width * 4` (the Rust reader had
+    accepted larger), check all size
     arithmetic for overflow (the Java reader's `slots * slot_size` could wrap past the file-length
     check), and compare the file's length with their mapping before each read (a truncating peer
     killed the reader with SIGBUS). Senders create the file exclusively and never truncate or
@@ -800,8 +804,8 @@ control lines, send `Heartbeat` when `heartbeat_ms` has passed, and check the wa
   implementation sends is still valid and still means the same. The new rules reject only what
   the layout sections already called invalid (a `stride` other than `width * 4`, a file shorter than
   its header says, an entity id nobody spawned) or what no implementation produces (a heartbeat under
-  10 ms, a frame over 16384 pixels on a side, 1025 live entities: the Java writer already stopped at
-  32768 and the defaults are 250 ms and a handful of entities). Pacing and the buffer size are the
+  10 ms, a frame over 16384 pixels on a side or over 8192 x 8192 in all, 1025 live entities: the
+  Java writer already stopped at 32768 and the defaults are 250 ms and a handful of entities). Pacing and the buffer size are the
   sender's and receiver's own behaviour, invisible on the wire. A peer that depended on the old
   leniency (poses without a `spawn`, or a `heartbeat_ms` under 10) must add the `spawn` or raise
   the value; the reference examples (`fake_guest`, link-java's `LinkDemo`) already spawn first.

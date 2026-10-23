@@ -60,6 +60,9 @@ pub const MAX_PENDING_CONTROL: usize = 1 << 20;
 pub const LINGER: Duration = Duration::from_millis(200);
 /// Largest width or height of a pixel file that a reader accepts (contract section 9.6).
 pub const MAX_FRAME_DIM: u32 = 16384;
+/// Largest `width * height` of a pixel file, in pixels (2^26, 8192 x 8192): a read then copies at
+/// most 256 MiB of colour and 256 MiB of depth (contract section 9.6).
+pub const MAX_FRAME_PIXELS: u64 = 1 << 26;
 /// Live entities a receiver keeps for its peer; a `spawn` beyond this is ignored (section 8).
 pub const MAX_ENTITIES: usize = 1024;
 /// The range of `heartbeat_ms` a `hello` may announce (section 8).
@@ -2126,6 +2129,9 @@ impl FrameWriter {
         if width > MAX_FRAME_DIM || height > MAX_FRAME_DIM {
             return Err(invalid("width and height are at most 16384"));
         }
+        if u64::from(width) * u64::from(height) > MAX_FRAME_PIXELS {
+            return Err(invalid("width * height is at most 67108864 pixels"));
+        }
         let stride = width
             .checked_mul(4)
             .ok_or_else(|| invalid("width too large"))?;
@@ -2433,7 +2439,8 @@ impl FrameReader {
     /// revision does not know is read as colour only, so a later depth format stays readable.
     ///
     /// The path must be absolute and name a regular file (not a symlink, FIFO, device or
-    /// directory), `width` and `height` are at most [`MAX_FRAME_DIM`], and `stride` is exactly
+    /// directory), `width` and `height` are at most [`MAX_FRAME_DIM`] with `width * height` at
+    /// most [`MAX_FRAME_PIXELS`], and `stride` is exactly
     /// `width * 4` (contract section 9.6). A path that is not a regular file is refused before it
     /// is opened and the file is opened non-blocking where the OS has that, so a FIFO the peer
     /// names cannot stall the caller.
@@ -2470,6 +2477,9 @@ impl FrameReader {
         }
         if !(1..=MAX_FRAME_DIM).contains(&width) || !(1..=MAX_FRAME_DIM).contains(&height) {
             return Err(bad("pixel file width or height outside 1..=16384"));
+        }
+        if u64::from(width) * u64::from(height) > MAX_FRAME_PIXELS {
+            return Err(bad("pixel file width * height above 67108864 pixels"));
         }
         let colour_slot = slot_layout(stride, 0, height).map(|(_, size)| size);
         if u64::from(stride) != u64::from(width) * 4

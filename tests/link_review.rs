@@ -308,31 +308,60 @@ fn m3_a_symlink_or_a_directory_is_not_a_regular_file() {
     assert!(dir.is_some(), "a directory is refused");
 }
 
-/// Readers refuse a width or height above 16384, whatever the file's size says.
+/// A header-only pixel file of the given shape: sparse, so a big frame costs nothing on disk.
+fn sparse_file(path: &std::path::Path, w: u32, h: u32) {
+    let mut b = valid_file(1, 1, 1);
+    let stride = w * 4;
+    let slot = (64 + u64::from(stride) * u64::from(h)).div_ceil(64) * 64;
+    put_u32(&mut b, 16, w);
+    put_u32(&mut b, 20, h);
+    put_u32(&mut b, 24, stride);
+    b[32..40].copy_from_slice(&slot.to_le_bytes());
+    b.truncate(64);
+    std::fs::write(path, &b).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(64 + slot)
+        .unwrap();
+}
+
+/// Readers refuse a width or height above 16384, and a frame of more than 2^26 pixels
+/// (8192 x 8192: a read copies at most 256 MiB of colour and 256 MiB of depth).
 #[test]
 fn m4_oversized_dimensions_are_refused() {
     let path = tmp("dims.frames");
     for (w, h, ok) in [
         (16384u32, 1u32, true),
         (1, 16384, true),
+        (8192, 8192, true),
+        (16384, 4096, true),
+        (16384, 8192, false),
+        (8192, 16384, false),
+        (8193, 8192, false),
+        (16384, 16384, false),
         (16385, 1, false),
         (1, 16385, false),
         (65536, 1, false),
         (1, 65536, false),
     ] {
-        let mut b = valid_file(1, 1, 1);
-        let stride = w * 4;
-        let slot = (64 + u64::from(stride) * u64::from(h)).div_ceil(64) * 64;
-        put_u32(&mut b, 16, w);
-        put_u32(&mut b, 20, h);
-        put_u32(&mut b, 24, stride);
-        b[32..40].copy_from_slice(&slot.to_le_bytes());
-        b.resize(64 + slot as usize, 0);
-        std::fs::write(&path, &b).unwrap();
+        sparse_file(&path, w, h);
         let r = FrameReader::open(&path);
         assert_eq!(r.is_ok(), ok, "{w}x{h}: {:?}", r.err());
+        drop(r);
+        let _ = std::fs::remove_file(&path);
     }
-    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn m4_the_writer_stops_at_the_same_limits() {
+    for (w, h) in [(16384, 8192), (8193, 8192), (16385, 1)] {
+        let path = tmp(&format!("w{w}x{h}.frames"));
+        let err = FrameWriter::create(&path, w, h, 1).err().expect("refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{w}x{h}");
+        assert!(!path.exists(), "no file is created for {w}x{h}");
+    }
 }
 
 /// The contract says `stride = width * 4`; the Rust reader used to accept anything larger.
