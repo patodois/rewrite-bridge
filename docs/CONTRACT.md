@@ -382,7 +382,7 @@ File header, 64 bytes:
 | 24 | 4 | u32 | `stride` | bytes per row, `width * 4` |
 | 28 | 4 | u32 | `format` | `1` = RGBA8, sRGB, straight (not premultiplied) alpha, rows top to bottom |
 | 32 | 8 | u64 | `slot_size` | bytes per slot including its header and depth plane, a multiple of 64 |
-| 40 | 4 | u32 | `depth_format` | `0` = no depth plane; `1` = `f32` linear view depth in metres (below); other values are malformed |
+| 40 | 4 | u32 | `depth_format` | `0` = no depth plane; `1` = `f32` linear view depth in metres (below); readers treat other values as `0` |
 | 44 | 4 | u32 | `depth_stride` | bytes per depth row, `width * 4`; `0` when there is no depth plane |
 | 48 | 8 | u64 | `depth_offset` | byte offset of the depth plane from the start of the slot: a multiple of 64 and at least `64 + stride * height`; `0` when there is no depth plane |
 | 56 | 8 | | `reserved` | |
@@ -454,9 +454,10 @@ bytes. A reader that wants depth checks, before using the file, that `depth_form
 and, for `1`, that `depth_stride` is `width * 4`, `depth_offset` is a multiple of 64 and at least
 `64 + stride * height`, the plane `depth_offset + depth_stride * height` ends within `slot_size`, and
 the file is at least `64 + slots * slot_size` bytes long (compute in 64 bits, or check for
-overflow). A file that fails any of these, or whose `depth_format` the reader does not know, is
-malformed and the reader refuses it. With `depth_format` `0` the reader ignores `depth_stride` and
-`depth_offset`. A reader that does not use depth at all may skip these checks, as a revision 2
+overflow). A file that fails any of these is malformed and the reader refuses it. A `depth_format` the reader
+does not know is not an error: the reader treats the file as colour only, so a later revision can add
+a depth format without breaking older readers. With `depth_format` `0` or an unknown value the
+reader ignores `depth_stride` and `depth_offset`. A reader that does not use depth at all may skip these checks, as a revision 2
 reader does.
 
 The sender deletes the file at the end of the session; a receiver never deletes it, and unmaps and
@@ -515,8 +516,8 @@ depth values close to 1 resolve distant surfaces coarsely in ranges 0 and 1. For
 projection depth is already linear in the buffer and the host converts it with its own matrix.
 
 **Reprojection.** The guest renders with a `Camera` the host sent and puts that datagram's header
-`seq` in `Frame.camera_seq`. The host keeps the cameras it sent in a small ring keyed by `seq`, say
-the last 16. To present a frame it looks up `camera_seq` and reprojects the guest image from that
+`seq` in `Frame.camera_seq`. The host keeps the cameras it sent in a small ring keyed by `seq`,
+covering at least the last half second (32 cameras at 60 Hz). To present a frame it looks up `camera_seq` and reprojects the guest image from that
 render camera to the camera it is presenting now, which is newer, so the guest's image is shifted by
 the host's own motion in the meantime and only the guest's own animation shows the delay. For each
 non-empty guest pixel, with linear depth `t`:
@@ -700,7 +701,8 @@ control lines, send `Heartbeat` when `heartbeat_ms` has passed, and check the wa
   1: the new fields sit in bytes that revisions 1 and 2 reserved (written as zero, ignored on
   read) and zero keeps the old meaning, `slot_size` is what readers already use to find slots, so a
   revision 1 or 2 reader reads the colour of a depth file as before, and a file without depth is
-  byte for byte what revision 2 wrote.
+  byte for byte what revision 2 wrote. A `depth_format` a reader does not know means colour only,
+  so later depth formats (16-bit, half float) can be added the same way.
 
 A change that alters any layout or meaning above needs a new protocol version. Adding a control
 message type or field, or a new datagram `kind`, does not, because receivers ignore what they do

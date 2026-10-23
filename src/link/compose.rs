@@ -426,8 +426,8 @@ pub struct CameraRing {
 }
 
 impl CameraRing {
-    /// The size the contract suggests.
-    pub const DEFAULT_CAPACITY: usize = 16;
+    /// Half a second of cameras at 60 Hz, the window the contract suggests.
+    pub const DEFAULT_CAPACITY: usize = 32;
 
     pub fn new(capacity: usize) -> Self {
         Self {
@@ -959,6 +959,6 @@ mod tests {
         assert!(ring.get(0).is_none() && ring.get(99).is_none());
         ring.push(0, c(0.0));
         assert!(ring.get(0).is_none(), "0 means 'no camera'");
-        assert_eq!(CameraRing::default().cap, 16);
+        assert_eq!(CameraRing::default().cap, 32);
     }
 }

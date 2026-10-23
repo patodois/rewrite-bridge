@@ -2226,8 +2226,8 @@ pub struct FrameReader {
 
 impl FrameReader {
     /// Maps the file a `frame_channel` message named and checks its header, including the depth
-    /// fields: a file whose depth plane does not fit its slot, or whose `depth_format` this
-    /// revision does not know, is refused.
+    /// fields: a file whose depth plane does not fit its slot is refused. A `depth_format` this
+    /// revision does not know is read as colour only, so a later depth format stays readable.
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
         // SAFETY: the file is shared with its writer; this map is only read through raw
@@ -2259,9 +2259,8 @@ impl FrameReader {
             return Err(bad("inconsistent pixel file header"));
         }
         let depth = match DepthFormat::from_u32(hdr.depth_format) {
-            None => return Err(bad("unknown depth_format")),
-            // Revision 2 files have zeros here; other writers' bytes are not ours to judge.
-            Some(DepthFormat::None) => None,
+            // A later revision's depth format: its colour is still ours to read.
+            None | Some(DepthFormat::None) => None,
             Some(DepthFormat::LinearMetres) => {
                 let colour_end = SLOT_HEADER_LEN as u64 + u64::from(stride) * u64::from(height);
                 let plane = u64::from(hdr.depth_stride) * u64::from(height);
@@ -3201,6 +3200,19 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_depth_format_is_read_as_colour_only() {
+        let path = temp_path("future-depth");
+        let mut bytes = depth_file_bytes(&path);
+        for format in [2, u32::MAX] {
+            put_u32(&mut bytes, 40, format);
+            std::fs::write(&path, &bytes).unwrap();
+            let reader = FrameReader::open(&path).expect("a later depth format still opens");
+            assert!(!reader.has_depth(), "format {format}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn damaged_depth_headers_are_rejected_cleanly() {
         let path = temp_path("bad-depth");
         let good = depth_file_bytes(&path);
@@ -3209,11 +3221,6 @@ mod tests {
         let slot_size = u64_at(&good, 32);
         type Damage = Box<dyn Fn(&mut Vec<u8>)>;
         let cases: Vec<(&str, Damage)> = vec![
-            ("unknown depth_format 2", Box::new(|b| put_u32(b, 40, 2))),
-            (
-                "unknown depth_format max",
-                Box::new(|b| put_u32(b, 40, u32::MAX)),
-            ),
             (
                 "depth_offset at slot_size",
                 Box::new(move |b| put_u64(b, 48, slot_size)),
