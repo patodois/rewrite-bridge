@@ -7,9 +7,12 @@ lines. It knows nothing about any game; it spawns what the bridge's types descri
 ```toml
 [dependencies]
 bevy = "0.20"
-rewrite-bridge = { git = "https://github.com/patodois/rewrite-bridge" }
-rewrite-bridge-bevy = { git = "https://github.com/patodois/rewrite-bridge" }
+rewrite-bridge = { git = "https://github.com/patodois/rewrite-bridge", tag = "v0.1.0" }
+rewrite-bridge-bevy = { git = "https://github.com/patodois/rewrite-bridge", tag = "v0.1.0" }
 ```
+
+Use the same tag for both, and for every provider you add: two tags are two different crates to Cargo
+(see [one tag for the whole build](../README.md#one-tag-for-the-whole-build)).
 
 ```rust
 use bevy::prelude::*;
