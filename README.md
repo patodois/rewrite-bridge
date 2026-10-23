@@ -38,6 +38,45 @@ impl Provider for MyGame {
 }
 ```
 
+## Passthrough link
+
+With the optional `link` feature, two processes on the same machine can run as one mash-up: a
+**host** (the game the player is in) sends its camera and the collision near the player, and a
+**guest** answers with entity poses, spawns that name a provider's asset, and optionally rendered
+RGBA frames. Input focus is handed back and forth, and a heartbeat watchdog notices when either
+side freezes or dies.
+
+- Control: JSON lines over TCP on `127.0.0.1` (default port 47800).
+- State: little-endian binary UDP datagrams on `127.0.0.1`, at most 8192 bytes each.
+- Frames: a memory-mapped file in the temp directory, guarded by a seqlock.
+- Coordinates: the same glTF conventions as `Model`; each side converts its own.
+
+[`docs/CONTRACT.md`](docs/CONTRACT.md) is the versioned protocol (v1), with every byte offset and C
+structs, so plugins in other languages can implement it without this crate. In Rust:
+
+```rust
+use rewrite_bridge::link::{Event, Link, LinkConfig};
+
+let mut link = Link::guest(LinkConfig::new("My Game"))?;
+// Every frame or tick, e.g. in a Bevy system:
+for event in link.poll() {            // never blocks
+    if let Event::Camera { camera, .. } = event {
+        // place your world relative to the host's camera, then link.send_poses(&[...])
+    }
+}
+```
+
+Try it with two terminals:
+
+```sh
+cargo run --features link --example fake_host
+cargo run --features link --example fake_guest -- --frames
+```
+
+Without the feature the crate still has no dependencies; with it, it uses `memmap2` and
+`serde_json`. The link only exchanges what each process publishes about itself: it never reads
+another process's memory or injects code.
+
 ## License
 
 Licensed under either of MIT or Apache-2.0, at your option.
