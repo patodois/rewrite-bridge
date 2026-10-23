@@ -949,6 +949,8 @@ struct Fake {
     /// `load` returns a different model than `load_animated`.
     skew_load: bool,
     scenes: bool,
+    /// `list` fails for these filters (the empty string is the full listing).
+    list_fails_for: Vec<&'static str>,
 }
 
 fn info(id: &str, kind: AssetKind) -> AssetInfo {
@@ -964,6 +966,9 @@ impl Provider for Fake {
         "Fake"
     }
     fn list(&self, filter: &str) -> Result<Vec<AssetInfo>, BoxError> {
+        if self.list_fails_for.contains(&filter) {
+            return Err(format!("listing {filter:?} is down").into());
+        }
         Ok(self
             .entries
             .iter()
@@ -1025,6 +1030,7 @@ fn fake() -> Fake {
         ],
         skew_load: false,
         scenes: true,
+        list_fails_for: vec![],
     }
 }
 
@@ -1047,6 +1053,38 @@ fn a_provider_is_checked_asset_by_asset() {
     assert_eq!(missing.len(), 1, "{yard}");
     assert!(missing[0].message.contains("ghost"));
     assert_eq!(by_id(&rs, "cube").subject, "cube");
+}
+
+/// Review finding L40: a failed full listing used to switch the reference check off silently.
+#[test]
+fn asset_references_are_checked_when_the_full_listing_fails() {
+    let mut f = fake();
+    f.list_fails_for = vec![""];
+    let rs = check_provider(&f, &["yard"], &[]);
+    let yard = by_id(&rs, "yard");
+    let missing: Vec<_> = yard.with_code("scene.asset_missing").collect();
+    assert_eq!(missing.len(), 1, "{yard}");
+    assert!(missing[0].message.contains("ghost"));
+    // The same through the command line.
+    let mut out = Vec::new();
+    cli::run_to(&f, ["--id", "yard"].map(String::from), &mut out);
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("scene.asset_missing"), "{out}");
+}
+
+/// When even the single-asset lookups fail, the references cannot be judged: no false
+/// `scene.asset_missing`, but a finding that says the check could not run.
+#[test]
+fn unverifiable_references_are_reported_not_skipped() {
+    let mut f = fake();
+    f.list_fails_for = vec!["", "ghost"];
+    let rs = check_provider(&f, &["yard"], &[]);
+    let yard = by_id(&rs, "yard");
+    assert!(!yard.has("scene.asset_missing"), "{yard}");
+    let failed: Vec<_> = yard.with_code("provider.list_failed").collect();
+    assert_eq!(failed.len(), 1, "{yard}");
+    assert!(failed[0].message.contains("ghost"), "{yard}");
+    assert!(yard.passed(), "a warning, not an error");
 }
 
 #[test]
@@ -1143,6 +1181,13 @@ fn the_command_line_runs_and_sets_the_exit_status() {
     assert!(out.contains("unknown kind"));
     assert_eq!(run(&["--bogus"]).0, 2);
     assert_eq!(run(&["--limit"]).0, 2);
+    // Review finding L40: `--limit 0` used to check every asset.
+    let (code, out) = run(&["--limit", "0"]);
+    assert_eq!(code, 2, "{out}");
+    assert!(
+        out.contains("--limit") && !out.contains("asset(s) checked"),
+        "{out}"
+    );
     let (code, out) = run(&["--help"]);
     assert_eq!(code, 0);
     assert!(out.contains("--compare-load"));

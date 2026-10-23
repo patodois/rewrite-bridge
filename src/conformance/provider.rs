@@ -64,7 +64,7 @@ pub fn check_provider_with<S: AsRef<str>>(
     opts: &ProviderOptions,
     mut each: impl FnMut(&AssetInfo, Report),
 ) {
-    let mut known: Option<HashSet<String>> = None;
+    let mut known: Option<Option<HashSet<String>>> = None;
     let mut targets: Vec<(AssetInfo, bool)> = Vec::new();
     if ids.is_empty() {
         match provider.list("") {
@@ -129,7 +129,7 @@ fn check_one(
     provider: &dyn Provider,
     info: &AssetInfo,
     opts: &ProviderOptions,
-    known: &mut Option<HashSet<String>>,
+    known: &mut Option<Option<HashSet<String>>>,
 ) -> Report {
     let mut expect = (opts.expect)(info);
     expect.allow.extend(opts.allow.iter().cloned());
@@ -139,14 +139,30 @@ fn check_one(
                 Ok(s) => {
                     let mut r = check_scene(&s, &expect);
                     if r.passed() {
-                        let ids = known.get_or_insert_with(|| {
+                        let all = known.get_or_insert_with(|| {
                             provider
                                 .list("")
+                                .ok()
                                 .map(|v| v.into_iter().map(|a| a.id).collect())
-                                .unwrap_or_default()
                         });
-                        if !ids.is_empty() {
-                            scene::check_refs(&s, provider.game(), ids, &mut r);
+                        match all {
+                            Some(ids) if !ids.is_empty() => {
+                                scene::check_refs(&s, provider.game(), ids, &mut r);
+                            }
+                            // An empty listing says nothing about a scene's references.
+                            Some(_) => {}
+                            // The full listing failed; a lookup of each reference may still work.
+                            None => scene::check_refs_with(
+                                &s,
+                                provider.game(),
+                                |asset| {
+                                    provider
+                                        .list(asset)
+                                        .map(|v| v.iter().any(|a| a.id == asset))
+                                        .map_err(|e| e.to_string())
+                                },
+                                &mut r,
+                            ),
                         }
                     }
                     r

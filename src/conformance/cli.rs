@@ -33,7 +33,7 @@ check-conformance [options]
   --id ID          check this asset (repeatable); default: every listed asset
   --filter TEXT    check assets whose id or name contains TEXT
   --kind KIND      only assets of this kind: vehicle, character, weapon, prop, level, other (repeatable)
-  --limit N        stop after N assets
+  --limit N        stop after N assets (N at least 1)
   --compare-load   also require load(id) to equal load_animated(id).model
   --allow CODE     ignore findings with this code (repeatable)
   --verbose, -v    list info findings too (default: warnings and errors)
@@ -83,10 +83,13 @@ pub fn run_to(
                     .map(|k| kinds.push(k))
                     .ok_or_else(|| format!("unknown kind {v:?}"))
             }),
-            "--limit" => value("a number").and_then(|v| {
-                v.parse::<usize>()
-                    .map(|n| limit = Some(n))
-                    .map_err(|_| format!("{v:?} is not a number"))
+            "--limit" => value("a number").and_then(|v| match v.parse::<usize>() {
+                Ok(0) => Err("--limit must be at least 1 (0 would check nothing)".to_owned()),
+                Ok(n) => {
+                    limit = Some(n);
+                    Ok(())
+                }
+                Err(_) => Err(format!("{v:?} is not a number")),
             }),
             "--allow" => value("a code").map(|v| allow.push(v)),
             "--compare-load" => {

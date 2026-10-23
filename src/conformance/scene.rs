@@ -151,11 +151,26 @@ pub(crate) fn check(scene: &Scene, _expect: &Expect, rep: &mut Report) {
 
 /// Whether every asset reference of the scene that belongs to `game` is in `known`.
 pub(crate) fn check_refs(scene: &Scene, game: &str, known: &HashSet<String>, rep: &mut Report) {
+    check_refs_with(scene, game, |asset| Ok(known.contains(asset)), rep);
+}
+
+/// Like [`check_refs`], asking `has` about each reference of the game: `Ok(false)` is a missing
+/// asset, `Err` means the provider could not answer, which is a warning (the reference stays
+/// unchecked) and never a silent pass.
+pub(crate) fn check_refs_with(
+    scene: &Scene,
+    game: &str,
+    mut has: impl FnMut(&str) -> Result<bool, String>,
+    rep: &mut Report,
+) {
     for (i, m) in scene.models.iter().enumerate() {
         if let SceneModel::Asset(a) = m {
-            let ours = a.provider.as_deref().is_none_or(|p| p == game);
-            if ours && !known.contains(&a.asset) {
-                rep.push(
+            if !a.provider.as_deref().is_none_or(|p| p == game) {
+                continue;
+            }
+            match has(&a.asset) {
+                Ok(true) => {}
+                Ok(false) => rep.push(
                     Severity::Error,
                     "scene.asset_missing",
                     Location::none().with_model(i),
@@ -163,7 +178,17 @@ pub(crate) fn check_refs(scene: &Scene, game: &str, known: &HashSet<String>, rep
                         "model {i} refers to asset {:?}, which {game} does not list",
                         a.asset
                     ),
-                );
+                ),
+                Err(e) => rep.push(
+                    Severity::Warning,
+                    "provider.list_failed",
+                    Location::none().with_model(i),
+                    format!(
+                        "model {i} refers to asset {:?}, which could not be checked: \
+                         Provider::list failed: {e}",
+                        a.asset
+                    ),
+                ),
             }
         }
     }
