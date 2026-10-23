@@ -425,9 +425,7 @@ fn version_role_and_busy_rejections() {
             "expected hello",
         ),
     ] {
-        let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        tcp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let mut reader = BufReader::new(tcp.try_clone().unwrap());
+        let mut tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
         writeln!(&tcp, "{hello}").unwrap();
         events.clear();
         assert!(poll_host_until(&mut host, &mut events, |e, _| !e.is_empty()));
@@ -435,8 +433,10 @@ fn version_role_and_busy_rejections() {
             matches!(&events[..], [Event::HandshakeFailed { reason }] if reason.contains(expect)),
             "{events:?}"
         );
-        let bye = read_line(&mut reader);
+        // The bye, then a clean end of stream (the host half-closes), not a reset.
+        let (bye, how) = read_until_closed(&mut host, &mut tcp);
         assert!(bye.contains("\"bye\"") && bye.contains(expect), "{bye}");
+        assert!(how.is_ok(), "{how:?}");
         assert!(!host.is_connected());
     }
 
@@ -498,4 +498,133 @@ mod serde_json_like {
             udp_port: v["udp_port"].as_u64().unwrap() as u16,
         }
     }
+}
+
+/// What a rejected client reads until the host closes: the lines, then how it ended.
+fn read_until_closed(host: &mut Link, tcp: &mut TcpStream) -> (String, std::io::Result<()>) {
+    use std::io::Read;
+    tcp.set_nonblocking(true).unwrap();
+    let mut text = Vec::new();
+    let mut buf = [0u8; 4096];
+    let end = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < end {
+        host.poll();
+        match tcp.read(&mut buf) {
+            Ok(0) => return (String::from_utf8_lossy(&text).into_owned(), Ok(())),
+            Ok(n) => text.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => sleep(Duration::from_millis(2)),
+            Err(e) => return (String::from_utf8_lossy(&text).into_owned(), Err(e)),
+        }
+    }
+    panic!(
+        "host never closed; got {:?}",
+        String::from_utf8_lossy(&text)
+    );
+}
+
+/// A host that turns a client away while it still has unread data from it must not reset the
+/// connection (Windows then discards the bye), but half-close after the bye and drain.
+#[test]
+fn rejected_clients_get_the_bye_and_a_clean_end() {
+    let mut host = Link::host(cfg("Fake Host", 0)).unwrap();
+    let port = host.control_addr().unwrap().port();
+    let mut first = Link::guest(cfg("first", port)).unwrap();
+    let end = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < end && !(host.is_connected() && first.is_connected()) {
+        host.poll();
+        first.poll();
+        sleep(Duration::from_millis(2));
+    }
+    assert!(host.is_connected());
+    for _ in 0..20 {
+        // Busy: the host never reads this client's hello, which is still unread when it closes.
+        let mut tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let hello = r#"{"type":"hello","role":"guest","game":"late","protocol":1,"min_protocol":1,"udp_port":9,"heartbeat_ms":100,"timeout_ms":1000}"#;
+        writeln!(tcp, "{hello}").unwrap();
+        writeln!(tcp, "{}", " ".repeat(30_000)).unwrap();
+        sleep(Duration::from_millis(5));
+        let (text, how) = read_until_closed(&mut host, &mut tcp);
+        assert!(text.contains(r#""reason":"busy""#), "{text:?}");
+        assert!(
+            how.is_ok(),
+            "busy rejection ended with {how:?} after {text:?}"
+        );
+        first.poll();
+    }
+}
+
+/// A raw host on a listener of its own, for guest-side tests.
+fn raw_host_accepting(guest: &mut Link) -> TcpStream {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut cfg = cfg("Fake Guest", listener.local_addr().unwrap().port());
+    cfg.reconnect = Duration::from_secs(10); // One attempt is enough here.
+    *guest = Link::guest(cfg).unwrap();
+    let end = Instant::now() + Duration::from_secs(3);
+    loop {
+        guest.poll();
+        if let Ok((s, _)) = listener.accept() {
+            s.set_nonblocking(false).unwrap();
+            return s;
+        }
+        assert!(Instant::now() < end, "guest never connected");
+        sleep(Duration::from_millis(2));
+    }
+}
+
+fn poll_guest_until(guest: &mut Link, f: impl Fn(&[Event]) -> bool) -> Vec<Event> {
+    let mut events = vec![];
+    let end = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < end && !f(&events) {
+        events.extend(guest.poll());
+        sleep(Duration::from_millis(2));
+    }
+    events
+}
+
+/// A guest that turns a host down says why, then half-closes too.
+#[test]
+fn a_guest_rejecting_a_host_sends_bye_then_a_clean_end() {
+    use std::io::Read;
+    let mut guest = Link::guest(cfg("unused", 1)).unwrap();
+    let mut tcp = raw_host_accepting(&mut guest);
+    // A host hello without a session number is invalid.
+    writeln!(
+        tcp,
+        r#"{{"type":"hello","role":"host","game":"broken","protocol":1,"min_protocol":1,"udp_port":9,"heartbeat_ms":100,"timeout_ms":1000}}"#
+    )
+    .unwrap();
+    let events = poll_guest_until(&mut guest, |e| !e.is_empty());
+    assert!(
+        matches!(&events[..], [Event::HandshakeFailed { reason }] if reason.contains("session")),
+        "{events:?}"
+    );
+    tcp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut text = String::new();
+    let how = tcp.read_to_string(&mut text);
+    assert!(how.is_ok(), "{how:?} after {text:?}");
+    let mut lines = text.lines();
+    assert!(lines.next().unwrap().contains("\"hello\""));
+    let bye = lines.next().unwrap();
+    assert!(bye.contains("\"bye\"") && bye.contains("session"), "{bye}");
+}
+
+/// A peer that resets the connection right after its bye (a careless implementation, or Windows
+/// closing a socket with unread data): the bye still decides how the session ended.
+#[test]
+fn a_reset_after_a_received_bye_is_a_clean_end() {
+    let mut guest = Link::guest(cfg("unused", 1)).unwrap();
+    let tcp = raw_host_accepting(&mut guest);
+    // Let the guest's hello arrive and leave it unread; then bye and drop, which sends a reset.
+    sleep(Duration::from_millis(50));
+    writeln!(&tcp, r#"{{"type":"bye","reason":"go away"}}"#).unwrap();
+    sleep(Duration::from_millis(20));
+    drop(tcp);
+    let events = poll_guest_until(&mut guest, |e| !e.is_empty());
+    assert_eq!(
+        events,
+        [Event::HandshakeFailed {
+            reason: "peer said bye: go away".into()
+        }]
+    );
 }

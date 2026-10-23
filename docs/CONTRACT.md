@@ -117,13 +117,37 @@ native space at the boundary, on send and on receive; the wire is always in this
 5. From then on both sides send UDP datagrams with `version = v` and `session = session`. A
    datagram with another session, another version or another source address is dropped silently.
    The guest sends nothing over UDP before it has the host's `hello`.
-6. Either side may end the session with `bye` and close the TCP connection. Closing TCP without
-   `bye` (a crash) ends it too. After the session ends, the host listens for a new guest and the
-   guest may reconnect; the new session gets a new `session` number, and entities, focus and pixel
-   files from the old one are forgotten.
+6. Either side may end the session with `bye` and close the TCP connection as in section 6.1.
+   Closing TCP without `bye` (a crash) ends it too. After the session ends, the host listens for a
+   new guest and the guest may reconnect; the new session gets a new `session` number, and
+   entities, focus and pixel files from the old one are forgotten.
 
 `hello` has to be the first line in each direction. A side that has not received the peer's
 `hello` within its own `timeout_ms` of the TCP connection closes it.
+
+### 6.1 Closing: after sending `bye`, half-close and drain
+
+Every side that closes a control connection, host or guest, for any reason (a rejected `hello`,
+`"busy"`, a protocol error, the watchdog, or shutting down), does this:
+
+1. Write the `bye` line and flush it.
+2. Half-close: shut down the write side only (`shutdown(fd, SHUT_WR)`, or `SD_SEND` on Windows).
+3. Read and discard whatever still arrives, until the peer's end of stream (a read of 0 bytes),
+   an error, or **200 ms**, whichever comes first.
+4. Close the socket.
+
+The reason: closing a socket that still holds unread received data makes the OS send a reset
+instead of a normal close. Windows then discards data the peer has received but not yet read,
+so the `bye` is lost and the peer only sees "connection reset" (`WSAECONNRESET`, 10054). Draining
+first means the socket closes with nothing unread.
+
+On the receiving side, **a received `bye` decides how the session ended.** Process every complete
+line read before a read error; if one of them is a `bye`, a reset or end of stream that follows it
+is the clean end of the session, not a failure. A side that receives a `bye` closes its socket as
+above, without sending a `bye` of its own.
+
+A game loop must not block for step 3: keep the closing socket in a list and drain it,
+non-blocking, on each tick until it is done.
 
 Future versions keep the datagram header's first 8 bytes (magic, version, kind, flags) and the
 `hello` fields above, so two implementations can always negotiate.
@@ -224,7 +248,9 @@ replaces the previous one (for example after a resize).
 
 ### `bye`
 
-`{"type":"bye","reason":"shutting down"}`. The sender closes the connection after it.
+`{"type":"bye","reason":"shutting down"}`. The sender then half-closes, drains and closes the
+connection (section 6.1). The host also answers a connection it cannot take with
+`{"type":"bye","reason":"busy"}`, before or without reading that client's `hello`.
 
 ## 9. Datagrams (UDP, binary)
 
@@ -382,9 +408,21 @@ Reader, on a `Frame` datagram:
 3. Acquire fence, then `l2 = lock`. If `l2 != l1` or the copied `frame` is not the datagram's
    `frame`, the slot was overwritten while copying: discard the copy and wait for the next frame.
 
-With 3 or more slots the writer rarely reaches the slot being read. On Windows the file must be
-created with `FILE_SHARE_READ | FILE_SHARE_WRITE` so the receiver can open it. The sender deletes
-the file at the end of the session; a receiver never deletes it.
+With 3 or more slots the writer rarely reaches the slot being read.
+
+The sender deletes the file at the end of the session; a receiver never deletes it, and unmaps and
+closes it when the session ends or a new `frame_channel` replaces it. On Windows:
+
+- both sides open the file with `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`, so the
+  receiver can open it while the sender has it, and the sender can delete it while the receiver
+  still has it mapped (Windows removes the file once the last handle and view close);
+- the sender unmaps its own view (`UnmapViewOfFile`, then closes the mapping and file handles)
+  before deleting, since Windows refuses to delete or resize a file the calling process maps;
+- a file cannot be resized while any process maps it, so a sender never reuses a path a receiver
+  may still map: a new size or a new session gets a new file and a new `frame_channel`.
+
+A sender that crashes leaves its file behind. Names should contain the sender's process id, so a
+later run can tell its own files from a dead process's.
 
 ## 10. C layouts
 
@@ -516,7 +554,10 @@ control lines, send `Heartbeat` when `heartbeat_ms` has passed, and check the wa
 
 ## 12. Versioning of this document
 
-- v1 (this version): first release.
+- v1: first release.
+- v1, revision 2: section 6.1 (half-close and drain after `bye`; a received `bye` wins over a
+  following reset) and the Windows file-sharing rules for the pixel file. No layout or message
+  changed, so the protocol version stays 1.
 
 A change that alters any layout or meaning above needs a new protocol version. Adding a control
 message type or field, or a new datagram `kind`, does not, because receivers ignore what they do

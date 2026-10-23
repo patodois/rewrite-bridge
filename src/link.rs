@@ -19,9 +19,11 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::mem::ManuallyDrop;
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{fence, AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use memmap2::{Mmap, MmapMut};
@@ -50,6 +52,11 @@ pub const FRAME_LEN: usize = 24;
 pub const MAX_LINE: usize = 65536;
 /// Unsent control bytes beyond which the peer counts as lost.
 pub const MAX_PENDING_CONTROL: usize = 1 << 20;
+/// How long a closing control connection is drained after its `bye` (contract section 6).
+pub const LINGER: Duration = Duration::from_millis(200);
+/// How long one connection attempt of a guest may take. It runs on a helper thread, so a slow
+/// refusal (Windows retries a refused localhost SYN for about two seconds) never blocks a poll.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// [`Pose::flags`] bit: do not interpolate from the entity's previous pose.
 pub const POSE_TELEPORT: u32 = 1;
@@ -1083,9 +1090,58 @@ impl Ctl {
     }
 }
 
+/// A control connection being closed gracefully: its last bytes (usually a `bye`) are flushed,
+/// the write side is shut down, and whatever the peer still sends is read and discarded until it
+/// closes too or [`LINGER`] passes. Dropping a socket with unread received data makes the OS send
+/// a reset instead, and on Windows that reset can destroy the `bye` before the peer reads it.
+struct Closing {
+    ctl: Ctl,
+    deadline: Instant,
+    shut: bool,
+}
+
+impl Closing {
+    fn new(ctl: Ctl, now: Instant) -> Self {
+        Self {
+            ctl,
+            deadline: now + LINGER,
+            shut: false,
+        }
+    }
+
+    /// Makes progress without blocking; false once the socket can be dropped.
+    fn pump(&mut self, now: Instant) -> bool {
+        if now >= self.deadline || self.ctl.flush().is_err() {
+            return false;
+        }
+        if !self.shut {
+            if !self.ctl.wbuf.is_empty() {
+                return true;
+            }
+            if self.ctl.stream.shutdown(Shutdown::Write).is_err() {
+                return false;
+            }
+            self.shut = true;
+        }
+        let mut buf = [0u8; 4096];
+        for _ in 0..64 {
+            match self.ctl.stream.read(&mut buf) {
+                Ok(0) => return false,
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return true,
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+}
+
 enum Conn {
     /// No connection. A guest retries at `next_try`; a host waits for one.
     Idle { next_try: Instant },
+    /// Guest: a helper thread is connecting.
+    Connecting { rx: Receiver<io::Result<TcpStream>> },
     /// Connected, waiting for the peer's `hello`.
     Handshake { ctl: Ctl, since: Instant },
     Live {
@@ -1119,6 +1175,8 @@ pub struct Link {
     events: Vec<Event>,
     stats: Stats,
     out: Vec<u8>,
+    /// Connections being closed gracefully, see [`Closing`].
+    closing: Vec<Closing>,
     // Receive-side filters, reset per session.
     last_camera: Option<u32>,
     pose_times: HashMap<u32, u64>,
@@ -1173,6 +1231,7 @@ impl Link {
             events: Vec::new(),
             stats: Stats::default(),
             out: Vec::with_capacity(MAX_DATAGRAM),
+            closing: Vec::new(),
             last_camera: None,
             pose_times: HashMap::new(),
             last_collision: None,
@@ -1220,6 +1279,7 @@ impl Link {
     /// looks dead to its peer, as intended.
     pub fn poll(&mut self) -> Vec<Event> {
         let now = Instant::now();
+        self.closing.retain_mut(|c| c.pump(now));
         self.poll_connect(now);
         self.poll_control(now);
         self.poll_udp(now);
@@ -1242,49 +1302,77 @@ impl Link {
 
     fn poll_connect(&mut self, now: Instant) {
         if let Some(listener) = &self.listener {
+            let mut busy = Vec::new();
             loop {
                 let stream = match listener.accept() {
                     Ok((s, _)) => s,
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                     Err(_) => break,
                 };
+                let Ok(ctl) = Ctl::new(stream) else { continue };
                 if matches!(self.conn, Conn::Idle { .. }) {
-                    if let Ok(ctl) = Ctl::new(stream) {
-                        self.conn = Conn::Handshake { ctl, since: now };
-                    }
-                } else if let Ok(mut ctl) = Ctl::new(stream) {
-                    ctl.queue(&Control::Bye {
-                        reason: "busy".into(),
+                    self.conn = Conn::Handshake { ctl, since: now };
+                } else {
+                    busy.push(ctl);
+                }
+            }
+            for ctl in busy {
+                self.retire(ctl, Some("busy".into()), now);
+            }
+            return;
+        }
+        match &self.conn {
+            Conn::Idle { next_try } if now >= *next_try => {
+                let addr = localhost(self.cfg.control_port);
+                let (tx, rx) = mpsc::channel();
+                let spawned = std::thread::Builder::new()
+                    .name("rewrite-bridge-connect".into())
+                    .spawn(move || {
+                        let _ = tx.send(TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT));
                     });
-                    let _ = ctl.flush();
-                }
+                self.conn = match spawned {
+                    Ok(_) => Conn::Connecting { rx },
+                    Err(_) => Conn::Idle {
+                        next_try: now + self.cfg.reconnect,
+                    },
+                };
             }
-            return;
+            Conn::Connecting { rx } => {
+                let connected = match rx.try_recv() {
+                    Err(TryRecvError::Empty) => return,
+                    Ok(r) => r.and_then(Ctl::new),
+                    Err(TryRecvError::Disconnected) => Err(ErrorKind::BrokenPipe.into()),
+                };
+                self.conn = match connected {
+                    Ok(mut ctl) => {
+                        ctl.queue(&self.hello(PROTOCOL_VERSION, None));
+                        Conn::Handshake { ctl, since: now }
+                    }
+                    Err(_) => Conn::Idle {
+                        next_try: now + self.cfg.reconnect,
+                    },
+                };
+            }
+            _ => {}
         }
-        let Conn::Idle { next_try } = self.conn else {
-            return;
-        };
-        if now < next_try {
-            return;
+    }
+
+    /// Closes a control connection gracefully, after an optional `bye`.
+    fn retire(&mut self, mut ctl: Ctl, bye: Option<String>, now: Instant) {
+        if let Some(reason) = bye {
+            ctl.queue(&Control::Bye { reason });
+            self.stats.lines_sent += 1;
         }
-        let addr = localhost(self.cfg.control_port);
-        match TcpStream::connect_timeout(&addr, Duration::from_millis(100)).and_then(Ctl::new) {
-            Ok(mut ctl) => {
-                ctl.queue(&self.hello(PROTOCOL_VERSION, None));
-                self.conn = Conn::Handshake { ctl, since: now };
-            }
-            Err(_) => {
-                self.conn = Conn::Idle {
-                    next_try: now + self.cfg.reconnect,
-                }
-            }
+        let mut c = Closing::new(ctl, now);
+        if c.pump(now) {
+            self.closing.push(c);
         }
     }
 
     fn ctl(&mut self) -> Option<&mut Ctl> {
         match &mut self.conn {
             Conn::Handshake { ctl, .. } | Conn::Live { ctl, .. } => Some(ctl),
-            Conn::Idle { .. } => None,
+            Conn::Idle { .. } | Conn::Connecting { .. } => None,
         }
     }
 
@@ -1437,16 +1525,10 @@ impl Link {
             now
         };
         let was_live = matches!(self.conn, Conn::Live { .. });
-        if let Conn::Handshake { mut ctl, .. } | Conn::Live { mut ctl, .. } =
+        if let Conn::Handshake { ctl, .. } | Conn::Live { ctl, .. } =
             std::mem::replace(&mut self.conn, Conn::Idle { next_try })
         {
-            if bye {
-                ctl.queue(&Control::Bye {
-                    reason: reason.clone(),
-                });
-                let _ = ctl.flush();
-            }
-            let _ = ctl.stream.shutdown(std::net::Shutdown::Both);
+            self.retire(ctl, bye.then(|| reason.clone()), now);
         }
         self.reset_session();
         self.events.push(if was_live {
@@ -1718,7 +1800,7 @@ impl Link {
 
     /// Ends the session with a `bye`. A guest reconnects after [`LinkConfig::reconnect`].
     pub fn disconnect(&mut self, reason: &str) {
-        if !matches!(self.conn, Conn::Idle { .. }) {
+        if self.ctl().is_some() {
             self.end(reason.to_owned(), true);
             self.events.pop(); // The caller knows; don't report its own disconnect back.
         }
@@ -1726,12 +1808,18 @@ impl Link {
 }
 
 impl Drop for Link {
+    /// Says `bye` and closes gracefully, which may block for up to [`LINGER`].
     fn drop(&mut self) {
-        if let Some(ctl) = self.ctl() {
-            ctl.queue(&Control::Bye {
-                reason: "closing".into(),
-            });
-            let _ = ctl.flush();
+        let now = Instant::now();
+        if let Conn::Handshake { ctl, .. } | Conn::Live { ctl, .. } =
+            std::mem::replace(&mut self.conn, Conn::Idle { next_try: now })
+        {
+            self.retire(ctl, Some("closing".into()), now);
+        }
+        while !self.closing.is_empty() {
+            std::thread::sleep(Duration::from_millis(2));
+            let now = Instant::now();
+            self.closing.retain_mut(|c| c.pump(now));
         }
     }
 }
@@ -1773,7 +1861,9 @@ pub enum FrameMiss {
 
 /// Writes RGBA frames into a memory-mapped pixel file (contract section 9.6).
 pub struct FrameWriter {
-    map: MmapMut,
+    /// Unmapped by hand in `drop`, before the file is deleted: Windows refuses to delete a file
+    /// this process still maps.
+    map: ManuallyDrop<MmapMut>,
     path: PathBuf,
     channel: FrameChannel,
     stride: u32,
@@ -1817,7 +1907,7 @@ impl FrameWriter {
         map[..FILE_HEADER_LEN].copy_from_slice(&h);
         let path = std::path::absolute(path)?;
         Ok(Self {
-            map,
+            map: ManuallyDrop::new(map),
             channel: FrameChannel {
                 path: path.to_string_lossy().into_owned(),
                 width,
@@ -1831,9 +1921,13 @@ impl FrameWriter {
         })
     }
 
-    /// Creates the file in the temp directory, named after this process and `tag`.
+    /// Creates a new file in the temp directory, named after this process, `tag` and a counter, so
+    /// no two calls share a path. (A path a peer may still have mapped cannot be resized or
+    /// replaced on Windows; announce a fresh one instead of reusing it.)
     pub fn create_temp(tag: &str, width: u32, height: u32, slots: u32) -> io::Result<Self> {
-        let name = format!("rewrite-bridge-{}-{tag}.frames", std::process::id());
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let name = format!("rewrite-bridge-{}-{tag}-{n}.frames", std::process::id());
         Self::create(&std::env::temp_dir().join(name), width, height, slots)
     }
 
@@ -1904,6 +1998,8 @@ impl FrameWriter {
 
 impl Drop for FrameWriter {
     fn drop(&mut self) {
+        // SAFETY: `map` is not used again; unmapping first lets Windows delete the file.
+        unsafe { ManuallyDrop::drop(&mut self.map) };
         let _ = std::fs::remove_file(&self.path);
     }
 }
