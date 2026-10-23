@@ -324,12 +324,32 @@ impl Error for Invalid {}
 
 impl Model {
     /// Checks that every index and attribute is consistent, so providers can catch mistakes
-    /// before a renderer does.
+    /// before a renderer does:
+    ///
+    /// - a node's parent comes before it, and its translation, rotation and scale are finite, the
+    ///   rotation a unit quaternion within [`QUATERNION_TOLERANCE`];
+    /// - an image has a nonzero size and exactly `width * height * 4` bytes;
+    /// - a skin has one inverse bind matrix per joint, and its joints are nodes;
+    /// - a mesh's attributes have one entry per position, its indices form whole triangles and
+    ///   stay in range, and its material, node and skin exist;
+    /// - in a skinned mesh every weight is finite and not negative, the four weights of a vertex
+    ///   sum to 1 (within 1e-3), and every slot that carries weight names a joint of the skin.
     pub fn validate(&self) -> Result<(), Invalid> {
         let bad = |msg: String| Err(Invalid(format!("{}: {msg}", self.name)));
         for (i, n) in self.nodes.iter().enumerate() {
             if n.parent.is_some_and(|p| p >= i) {
                 return bad(format!("node {i} ({}) comes before its parent", n.name));
+            }
+            for (what, v) in [("translation", &n.translation[..]), ("scale", &n.scale[..])] {
+                if v.iter().any(|c| !c.is_finite()) {
+                    return bad(format!(
+                        "node {i} ({}) has a non-finite {what} {v:?}",
+                        n.name
+                    ));
+                }
+            }
+            if let Some(why) = transform::quaternion_problem(&n.rotation) {
+                return bad(format!("node {i} ({}) rotation: {why}", n.name));
             }
         }
         for (i, img) in self
@@ -339,6 +359,12 @@ impl Model {
             .flatten()
             .enumerate()
         {
+            if img.width == 0 || img.height == 0 {
+                return bad(format!(
+                    "image {i} is {}x{}: width and height must be at least 1",
+                    img.width, img.height
+                ));
+            }
             if img.rgba.len() as u64 != u64::from(img.width) * u64::from(img.height) * 4 {
                 return bad(format!(
                     "image {i} is {}x{} but holds {} bytes",
@@ -402,12 +428,18 @@ impl Model {
                         return mesh("skinned without joints and weights".into());
                     }
                     for (v, (j, w)) in m.joints.iter().zip(&m.weights).enumerate() {
-                        if let Some(&j) = j
+                        if let Some(x) = w.iter().find(|x| !x.is_finite()) {
+                            return mesh(format!("vertex {v} has a non-finite weight {x}"));
+                        }
+                        if let Some(x) = w.iter().find(|&&x| x < 0.0) {
+                            return mesh(format!("vertex {v} has a negative weight {x}"));
+                        }
+                        // Every slot that carries weight must name a joint of the skin; a slot
+                        // with no weight may hold anything.
+                        if let Some((&j, _)) = j
                             .iter()
                             .zip(w)
-                            .find(|(_, &w)| w > 0.0)
-                            .map(|(j, _)| j)
-                            .filter(|&&j| usize::from(j) >= skin.joints.len())
+                            .find(|(&j, &w)| w > 0.0 && usize::from(j) >= skin.joints.len())
                         {
                             return mesh(format!(
                                 "vertex {v} uses joint {j}, past the skin's {}",

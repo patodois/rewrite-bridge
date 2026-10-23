@@ -425,27 +425,29 @@ fn skin_weights_are_checked_beyond_the_sum() {
     let r = check_model(&ok, &Expect::default());
     assert!(r.findings.is_empty(), "{r}");
 
+    // Since contract revision 4 `validate` itself rejects negative or non-finite weights and any
+    // weighted slot past the skin, so conformance reports them as `structure.invalid`.
+    let invalid = |m: &Model| {
+        let r = check_model(m, &Expect::default());
+        assert_eq!(codes(&r), ["structure.invalid"], "{r}");
+        assert!(!r.passed());
+        r.findings[0].message.clone()
+    };
+
     // Negative weights that still sum to 1.
     let mut m = ok.clone();
     m.meshes[0].weights[4] = [1.5, -0.5, 0.0, 0.0];
-    let r = check_model(&m, &Expect::default());
-    assert!(r.has("skin.negative_weights"), "{r}");
-    assert!(!r.passed());
+    assert!(invalid(&m).contains("negative weight"));
 
-    // A NaN slips through validate's sum test.
     let mut m = ok.clone();
     m.meshes[0].weights[4] = [f32::NAN, 0.0, 0.0, 0.0];
-    assert_eq!(m.validate(), Ok(()));
-    let r = check_model(&m, &Expect::default());
-    assert!(r.has("skin.weights_non_finite"), "{r}");
+    assert!(invalid(&m).contains("non-finite weight"));
 
-    // validate only looks at the first influencing joint; a second one past the skin passes it.
+    // A second weighted slot past the skin.
     let mut m = ok.clone();
     m.meshes[0].joints[4] = [1, 7, 0, 0];
     m.meshes[0].weights[4] = [0.5, 0.5, 0.0, 0.0];
-    assert_eq!(m.validate(), Ok(()));
-    let r = check_model(&m, &Expect::default());
-    assert!(r.has("skin.joint_out_of_range"), "{r}");
+    assert!(invalid(&m).contains("uses joint 7"));
 
     // Bad sums are validate's.
     let mut m = ok;
@@ -577,7 +579,10 @@ fn images_are_checked() {
         height: 0,
         rgba: vec![],
     });
-    assert!(check_model(&m, &Expect::default()).has("image.empty"));
+    // `validate` refuses a zero-sized image, so this is `structure.invalid` now.
+    let r = check_model(&m, &Expect::default());
+    assert_eq!(codes(&r), ["structure.invalid"], "{r}");
+    assert!(r.findings[0].message.contains("0x0"), "{r}");
 
     // Mean (0.5, 0.5, 1.0) is a flat tangent-space normal map; red-dominant is not.
     let mut m = cube();

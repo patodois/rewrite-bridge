@@ -365,10 +365,10 @@ fn check_triangles(m: &crate::Mesh, loc: &Location, rep: &mut Report) {
     }
 }
 
-/// Weights. `validate` checks that the weights sum to 1, but a NaN slips through its comparison,
-/// it only looks at the first influencing joint, and it allows negative weights. Skinning
-/// multiplies by these numbers directly, so a NaN spreads to the whole vertex, a negative weight
-/// pushes it the wrong way, and a joint slot past the skin reads outside the matrix palette.
+/// Weights. Skinning multiplies by these numbers directly, so a NaN spreads to the whole vertex,
+/// a negative weight pushes it the wrong way, and a joint slot past the skin reads outside the
+/// matrix palette. Since contract revision 4 `validate` rejects all three itself, so a model only
+/// gets here if it passed it; this stays as a second line of defence.
 fn check_weights(model: &Model, mi: usize, loc: &Location, rep: &mut Report) {
     let m = &model.meshes[mi];
     let Some(skin) = m.skin.and_then(|s| model.skins.get(s)) else {

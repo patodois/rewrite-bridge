@@ -67,7 +67,7 @@
 //! | `geometry.degenerate_triangles` | warning / info | zero-area triangles waste work and break tangent generation |
 //! | `geometry.unused_vertices` | info | dead weight in the vertex buffer |
 //! | `geometry.no_normals` | info | the consumer has to invent flat normals |
-//! | `skin.weights_non_finite` / `skin.negative_weights` / `skin.joint_out_of_range` | error | skinning reads garbage or explodes |
+//! | `skin.weights_non_finite` / `skin.negative_weights` / `skin.joint_out_of_range` | error | skinning reads garbage or explodes (`validate` rejects these since contract revision 4, so `check_model` reports them as `structure.invalid`; the codes stay for stability) |
 //! | `skin.inverse_bind_non_finite` / `skin.inverse_bind_singular` | error | a collapsed or non-finite bind matrix flattens the mesh at its joint |
 //! | `skin.inverse_bind_not_affine` | warning | the last row must be 0, 0, 0, 1 |
 //! | `skin.bind_pose_mismatch` | info | the node pose is not the bind pose, so the model is deformed before any clip plays (some games bind that way) |
@@ -78,7 +78,7 @@
 //! | `material.blend_opaque_texture` | warning | blending an opaque texture costs sorting for nothing |
 //! | `material.opaque_transparent_texture` | warning | the transparent texels will show as solid colour |
 //! | `material.unused` | info | a material no mesh uses |
-//! | `image.empty` / `image.too_large` | error / warning | zero-sized, or larger than most GPUs accept |
+//! | `image.empty` / `image.too_large` | error / warning | zero-sized (`validate` rejects it too, as `structure.invalid`), or larger than most GPUs accept |
 //! | `image.normal_map_suspect` | warning | a normal map should be blue-dominant and centred on green and red 0.5; otherwise channels are swapped or it is not a tangent-space map |
 //! | `animation.empty` / `animation.unnamed` / `animation.duplicate_name` | warning | the clip cannot be played or looked up by name; one finding per model, with the count |
 //! | `animation.zero_duration` / `animation.duration_suspect` | warning | a clip of 0 s cannot loop; under 1 ms or over ten minutes is seconds vs milliseconds |
