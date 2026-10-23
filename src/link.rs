@@ -8,7 +8,9 @@
 //!   [`Control::to_line`] / [`Control::parse`] for the JSON-lines control channel;
 //! - [`Link`], which owns the sockets, does the handshake, heartbeat and watchdog, and is driven by
 //!   a non-blocking [`Link::poll`] from a game loop or a Bevy system;
-//! - [`FrameWriter`] / [`FrameReader`] for RGBA frames in a memory-mapped file.
+//! - [`FrameWriter`] / [`FrameReader`] for RGBA frames, and optionally their linear depth, in a
+//!   memory-mapped file; [`compose`] has the reference CPU reprojection and depth compositing for
+//!   such frames.
 //!
 //! The link only exchanges what each process chooses to publish. It never touches another process.
 
@@ -28,6 +30,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use memmap2::{Mmap, MmapMut};
 use serde_json::{json, Map, Value};
+
+pub mod compose;
 
 /// The protocol version this implementation speaks.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -210,6 +214,21 @@ pub enum DepthRange {
     Reversed = 2,
 }
 
+/// `(a, b)` such that a perspective projection's clip depth is `z_clip = a * z_view + b` while
+/// `w_clip = -z_view`, for the three conventions of [`DepthRange`] (contract section 9.3).
+fn depth_terms(near: f32, far: f32, range: DepthRange) -> (f32, f32) {
+    let (n, f) = (f64::from(near), f64::from(far));
+    let (a, b) = match (range, far.is_finite()) {
+        (DepthRange::NegOneToOne, true) => ((f + n) / (n - f), 2.0 * f * n / (n - f)),
+        (DepthRange::NegOneToOne, false) => (-1.0, -2.0 * n),
+        (DepthRange::ZeroToOne, true) => (f / (n - f), f * n / (n - f)),
+        (DepthRange::ZeroToOne, false) => (-1.0, -n),
+        (DepthRange::Reversed, true) => (n / (f - n), n * f / (f - n)),
+        (DepthRange::Reversed, false) => (0.0, n),
+    };
+    (a as f32, b as f32)
+}
+
 /// The host's view, sent once per rendered frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Camera {
@@ -254,13 +273,9 @@ impl Camera {
         proj[0] = t / aspect;
         proj[5] = t;
         proj[11] = -1.0;
-        if far.is_finite() {
-            proj[10] = (far + near) / (near - far);
-            proj[14] = 2.0 * far * near / (near - far);
-        } else {
-            proj[10] = -1.0;
-            proj[14] = -2.0 * near;
-        }
+        let (a, b) = depth_terms(near, far, DepthRange::NegOneToOne);
+        proj[10] = a;
+        proj[14] = b;
         Self {
             view,
             proj,
@@ -270,6 +285,17 @@ impl Camera {
             viewport,
             depth_range: DepthRange::NegOneToOne,
         }
+    }
+
+    /// The same camera with its projection's depth row rewritten for `range` (and
+    /// [`Camera::depth_range`] set to match). [`look_at`](Self::look_at) builds an OpenGL range
+    /// one; a host whose engine uses another convention converts with this.
+    pub fn with_depth_range(mut self, range: DepthRange) -> Self {
+        let (a, b) = depth_terms(self.near, self.far, range);
+        self.proj[10] = a;
+        self.proj[14] = b;
+        self.depth_range = range;
+        self
     }
 
     /// The camera's world position, assuming `view` is a rigid transform.
@@ -1834,8 +1860,71 @@ const FRAME_MAGIC: &[u8; 8] = b"RBFRAME\0";
 pub const FORMAT_RGBA8_SRGB: u32 = 1;
 pub const MAX_SLOTS: u32 = 16;
 
-fn slot_size(stride: u32, height: u32) -> u64 {
-    (SLOT_HEADER_LEN as u64 + u64::from(stride) * u64::from(height)).div_ceil(64) * 64
+/// What the depth plane of a pixel file holds (the file header's `depth_format`, revision 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DepthFormat {
+    /// No depth plane: the file is exactly what revision 2 and earlier wrote.
+    None = 0,
+    /// One `f32` per pixel: linear view depth in metres, the distance along the camera's forward
+    /// axis (positive in front of the camera). `+inf`, or any non-finite value, means "nothing
+    /// here".
+    LinearMetres = 1,
+}
+
+impl DepthFormat {
+    /// The format a header value names, `None` for a value this revision does not know.
+    pub fn from_u32(v: u32) -> Option<Self> {
+        match v {
+            0 => Some(Self::None),
+            1 => Some(Self::LinearMetres),
+            _ => None,
+        }
+    }
+}
+
+/// Size and shape of the file a [`FrameWriter`] creates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameFileOptions {
+    /// Largest frame a slot holds, in pixels.
+    pub width: u32,
+    pub height: u32,
+    /// 1 to [`MAX_SLOTS`]; 3 is recommended.
+    pub slots: u32,
+    pub depth: DepthFormat,
+}
+
+impl FrameFileOptions {
+    /// A colour-only file, like [`FrameWriter::create`] makes.
+    pub fn new(width: u32, height: u32, slots: u32) -> Self {
+        Self {
+            width,
+            height,
+            slots,
+            depth: DepthFormat::None,
+        }
+    }
+
+    /// The same file with a linear-metres depth plane in every slot.
+    pub fn with_depth(mut self) -> Self {
+        self.depth = DepthFormat::LinearMetres;
+        self
+    }
+}
+
+fn round_up_64(n: u64) -> u64 {
+    n.div_ceil(64) * 64
+}
+
+/// Where a slot's depth plane starts and how big the slot is: `(depth_offset, slot_size)`.
+/// `depth_stride == 0` means no depth plane.
+fn slot_layout(stride: u32, depth_stride: u32, height: u32) -> (u64, u64) {
+    let colour_end = SLOT_HEADER_LEN as u64 + u64::from(stride) * u64::from(height);
+    if depth_stride == 0 {
+        return (0, round_up_64(colour_end));
+    }
+    let depth_offset = round_up_64(colour_end);
+    let end = depth_offset + u64::from(depth_stride) * u64::from(height);
+    (depth_offset, round_up_64(end))
 }
 
 /// A pixel frame read back from a [`FrameReader`].
@@ -1859,7 +1948,8 @@ pub enum FrameMiss {
     Replaced,
 }
 
-/// Writes RGBA frames into a memory-mapped pixel file (contract section 9.6).
+/// Writes RGBA frames, and optionally their depth, into a memory-mapped pixel file (contract
+/// section 9.6).
 pub struct FrameWriter {
     /// Unmapped by hand in `drop`, before the file is deleted: Windows refuses to delete a file
     /// this process still maps.
@@ -1867,22 +1957,41 @@ pub struct FrameWriter {
     path: PathBuf,
     channel: FrameChannel,
     stride: u32,
+    /// Bytes per depth row, 0 when the file has no depth plane.
+    depth_stride: u32,
+    depth_offset: u64,
     slot_size: u64,
     next_frame: u64,
 }
 
 impl FrameWriter {
-    /// Creates (or truncates) the file at `path` with room for `slots` frames of up to
+    /// Creates (or truncates) a colour-only file at `path` with room for `slots` frames of up to
     /// `width` x `height` pixels.
     pub fn create(path: &Path, width: u32, height: u32, slots: u32) -> io::Result<Self> {
+        Self::create_with(path, &FrameFileOptions::new(width, height, slots))
+    }
+
+    /// Like [`create`](Self::create), with the options of [`FrameFileOptions`], e.g. a depth plane.
+    pub fn create_with(path: &Path, opts: &FrameFileOptions) -> io::Result<Self> {
         let invalid = |m: &str| io::Error::new(ErrorKind::InvalidInput, m.to_owned());
+        let FrameFileOptions {
+            width,
+            height,
+            slots,
+            depth,
+        } = *opts;
         if !(1..=MAX_SLOTS).contains(&slots) || width == 0 || height == 0 {
             return Err(invalid("slots must be 1 to 16 and the size nonzero"));
         }
         let stride = width
             .checked_mul(4)
             .ok_or_else(|| invalid("width too large"))?;
-        let slot_size = slot_size(stride, height);
+        let depth_stride = if depth == DepthFormat::None {
+            0
+        } else {
+            stride
+        };
+        let (depth_offset, slot_size) = slot_layout(stride, depth_stride, height);
         let len = FILE_HEADER_LEN as u64 + slot_size * u64::from(slots);
         let file = OpenOptions::new()
             .read(true)
@@ -1903,6 +2012,9 @@ impl FrameWriter {
         w.u32(stride);
         w.u32(FORMAT_RGBA8_SRGB);
         w.u64(slot_size);
+        w.u32(depth as u32);
+        w.u32(depth_stride);
+        w.u64(depth_offset);
         h.resize(FILE_HEADER_LEN, 0);
         map[..FILE_HEADER_LEN].copy_from_slice(&h);
         let path = std::path::absolute(path)?;
@@ -1916,6 +2028,8 @@ impl FrameWriter {
             },
             path,
             stride,
+            depth_stride,
+            depth_offset,
             slot_size,
             next_frame: 1,
         })
@@ -1925,10 +2039,15 @@ impl FrameWriter {
     /// no two calls share a path. (A path a peer may still have mapped cannot be resized or
     /// replaced on Windows; announce a fresh one instead of reusing it.)
     pub fn create_temp(tag: &str, width: u32, height: u32, slots: u32) -> io::Result<Self> {
+        Self::create_temp_with(tag, &FrameFileOptions::new(width, height, slots))
+    }
+
+    /// [`create_temp`](Self::create_temp) with [`FrameFileOptions`].
+    pub fn create_temp_with(tag: &str, opts: &FrameFileOptions) -> io::Result<Self> {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let name = format!("rewrite-bridge-{}-{tag}-{n}.frames", std::process::id());
-        Self::create(&std::env::temp_dir().join(name), width, height, slots)
+        Self::create_with(&std::env::temp_dir().join(name), opts)
     }
 
     /// What to pass to [`Link::announce_frames`].
@@ -1936,11 +2055,34 @@ impl FrameWriter {
         &self.channel
     }
 
+    /// Whether every slot has a depth plane, in which case [`write_depth`](Self::write_depth)
+    /// must be used.
+    pub fn has_depth(&self) -> bool {
+        self.depth_stride != 0
+    }
+
     /// Writes one frame of tightly packed RGBA rows into the next slot and returns the
-    /// announcement to send with [`Link::send_frame`].
+    /// announcement to send with [`Link::send_frame`]. For a file without a depth plane; a file
+    /// with one needs [`write_depth`](Self::write_depth), since stale depth from an older frame
+    /// would be worse than none.
     pub fn write(
         &mut self,
         rgba: &[u8],
+        width: u32,
+        height: u32,
+        camera_seq: u32,
+        time_us: u64,
+    ) -> Result<FrameReady, WireError> {
+        self.write_depth(rgba, None, width, height, camera_seq, time_us)
+    }
+
+    /// Like [`write`](Self::write), and also the frame's linear depth in metres, `width * height`
+    /// values in the same row order as the colour (`+inf` where nothing was drawn). `depth` must be
+    /// `Some` exactly when the file has a depth plane.
+    pub fn write_depth(
+        &mut self,
+        rgba: &[u8],
+        depth: Option<&[f32]>,
         width: u32,
         height: u32,
         camera_seq: u32,
@@ -1952,6 +2094,18 @@ impl FrameWriter {
         let row = width as usize * 4;
         if rgba.len() != row * height as usize {
             return Err(WireError::BadValue("rgba length is not width * height * 4"));
+        }
+        match depth {
+            Some(_) if !self.has_depth() => {
+                return Err(WireError::BadValue("the pixel file has no depth plane"))
+            }
+            None if self.has_depth() => {
+                return Err(WireError::BadValue("the pixel file needs depth"))
+            }
+            Some(d) if d.len() != width as usize * height as usize => {
+                return Err(WireError::BadValue("depth length is not width * height"))
+            }
+            _ => {}
         }
         let frame = self.next_frame;
         self.next_frame += 1;
@@ -1973,12 +2127,26 @@ impl FrameWriter {
         lock.store(odd, Ordering::Relaxed);
         fence(Ordering::Release);
         let stride = self.stride as usize;
-        // SAFETY: every range is inside the slot, which `create` sized for width x height.
+        // SAFETY: every range is inside the slot, which `create_with` sized for the largest frame
+        // (colour rows, then the depth plane at `depth_offset`).
         unsafe {
             std::ptr::copy_nonoverlapping(h.as_ptr(), ptr.add(base + 8), h.len());
             for y in 0..height as usize {
                 let at = base + SLOT_HEADER_LEN + y * stride;
                 std::ptr::copy_nonoverlapping(rgba.as_ptr().add(y * row), ptr.add(at), row);
+            }
+            if let Some(depth) = depth {
+                let dstride = self.depth_stride as usize;
+                let plane = base + self.depth_offset as usize;
+                for y in 0..height as usize {
+                    let dst = ptr.add(plane + y * dstride);
+                    for (x, v) in depth[y * width as usize..][..width as usize]
+                        .iter()
+                        .enumerate()
+                    {
+                        std::ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), dst.add(x * 4), 4);
+                    }
+                }
             }
         }
         lock.store(odd.wrapping_add(1), Ordering::Release);
@@ -2011,18 +2179,36 @@ fn lock_at<'a, T>(map: *const T, base: usize) -> &'a AtomicU64 {
     unsafe { &*((map as *const u8).add(base) as *const AtomicU64) }
 }
 
-#[allow(clippy::type_complexity)]
-fn parse_file_header(b: &[u8]) -> Result<([u8; 8], u32, u32, u32, u32, u32, u32, u64), WireError> {
+/// The pixel file header's fields after the magic.
+struct FileHeader {
+    version: u32,
+    slots: u32,
+    width: u32,
+    height: u32,
+    stride: u32,
+    format: u32,
+    slot_size: u64,
+    depth_format: u32,
+    depth_stride: u32,
+    depth_offset: u64,
+}
+
+fn parse_file_header(b: &[u8]) -> Result<([u8; 8], FileHeader), WireError> {
     let mut r = In { b, at: 0 };
     Ok((
         r.bytes()?,
-        r.u32()?,
-        r.u32()?,
-        r.u32()?,
-        r.u32()?,
-        r.u32()?,
-        r.u32()?,
-        r.u64()?,
+        FileHeader {
+            version: r.u32()?,
+            slots: r.u32()?,
+            width: r.u32()?,
+            height: r.u32()?,
+            stride: r.u32()?,
+            format: r.u32()?,
+            slot_size: r.u64()?,
+            depth_format: r.u32()?,
+            depth_stride: r.u32()?,
+            depth_offset: r.u64()?,
+        },
     ))
 }
 
@@ -2034,10 +2220,14 @@ pub struct FrameReader {
     height: u32,
     stride: u32,
     slot_size: u64,
+    /// `(depth_offset, depth_stride)` when the file has a depth plane.
+    depth: Option<(u64, u32)>,
 }
 
 impl FrameReader {
-    /// Maps the file a `frame_channel` message named and checks its header.
+    /// Maps the file a `frame_channel` message named and checks its header, including the depth
+    /// fields: a file whose depth plane does not fit its slot, or whose `depth_format` this
+    /// revision does not know, is refused.
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
         // SAFETY: the file is shared with its writer; this map is only read through raw
@@ -2047,18 +2237,48 @@ impl FrameReader {
         if map.len() < FILE_HEADER_LEN {
             return Err(bad("pixel file too short"));
         }
-        let (magic, version, slots, width, height, stride, format, slot_sz) =
-            parse_file_header(&map[..FILE_HEADER_LEN]).map_err(|_| bad("header"))?;
+        let (magic, hdr) = parse_file_header(&map[..FILE_HEADER_LEN]).map_err(|_| bad("header"))?;
+        let FileHeader {
+            version,
+            slots,
+            width,
+            height,
+            stride,
+            format,
+            slot_size: slot_sz,
+            ..
+        } = hdr;
         if &magic != FRAME_MAGIC || version != 1 || format != FORMAT_RGBA8_SRGB {
             return Err(bad("not a v1 RGBA8 pixel file"));
         }
         if !(1..=MAX_SLOTS).contains(&slots)
             || u64::from(stride) < u64::from(width) * 4
-            || slot_sz < slot_size(stride, height)
+            || slot_sz < slot_layout(stride, 0, height).1
             || slot_sz % 64 != 0
         {
             return Err(bad("inconsistent pixel file header"));
         }
+        let depth = match DepthFormat::from_u32(hdr.depth_format) {
+            None => return Err(bad("unknown depth_format")),
+            // Revision 2 files have zeros here; other writers' bytes are not ours to judge.
+            Some(DepthFormat::None) => None,
+            Some(DepthFormat::LinearMetres) => {
+                let colour_end = SLOT_HEADER_LEN as u64 + u64::from(stride) * u64::from(height);
+                let plane = u64::from(hdr.depth_stride) * u64::from(height);
+                let fits = hdr
+                    .depth_offset
+                    .checked_add(plane)
+                    .is_some_and(|end| end <= slot_sz);
+                if u64::from(hdr.depth_stride) != u64::from(width) * 4
+                    || hdr.depth_offset % 64 != 0
+                    || hdr.depth_offset < colour_end
+                    || !fits
+                {
+                    return Err(bad("inconsistent depth plane in the pixel file header"));
+                }
+                Some((hdr.depth_offset, hdr.depth_stride))
+            }
+        };
         let need = slot_sz
             .checked_mul(u64::from(slots))
             .and_then(|n| n.checked_add(FILE_HEADER_LEN as u64));
@@ -2072,12 +2292,40 @@ impl FrameReader {
             height,
             stride,
             slot_size: slot_sz,
+            depth,
         })
     }
 
+    /// Whether the file has a depth plane for [`read_depth`](Self::read_depth) to return.
+    pub fn has_depth(&self) -> bool {
+        self.depth.is_some()
+    }
+
     /// Copies the announced frame into `rgba` as tightly packed rows, if the slot still holds it
-    /// intact.
+    /// intact. A depth plane, if the file has one, is ignored.
     pub fn read(&self, ready: &FrameReady, rgba: &mut Vec<u8>) -> Result<FrameData, FrameMiss> {
+        self.read_inner(ready, rgba, None)
+    }
+
+    /// Like [`read`](Self::read), and also copies the frame's linear depth in metres into `depth`
+    /// (`width * height` values). A file without a depth plane leaves `depth` empty. The seqlock
+    /// covers colour and depth together: either both are from the announced frame or you get a
+    /// [`FrameMiss`].
+    pub fn read_depth(
+        &self,
+        ready: &FrameReady,
+        rgba: &mut Vec<u8>,
+        depth: &mut Vec<f32>,
+    ) -> Result<FrameData, FrameMiss> {
+        self.read_inner(ready, rgba, Some(depth))
+    }
+
+    fn read_inner(
+        &self,
+        ready: &FrameReady,
+        rgba: &mut Vec<u8>,
+        depth: Option<&mut Vec<f32>>,
+    ) -> Result<FrameData, FrameMiss> {
         if ready.slot >= self.slots || ready.width > self.width || ready.height > self.height {
             return Err(FrameMiss::OutOfRange);
         }
@@ -2116,6 +2364,28 @@ impl FrameReader {
             unsafe {
                 std::ptr::copy_nonoverlapping(ptr.add(at), rgba.as_mut_ptr().add(y * row), row)
             };
+        }
+        if let Some(depth) = depth {
+            depth.clear();
+            if let Some((offset, dstride)) = self.depth {
+                depth.resize(data.width as usize * data.height as usize, 0.0);
+                for y in 0..data.height as usize {
+                    let at = base + offset as usize + y * dstride as usize;
+                    // SAFETY: as above; `open` checked that the whole plane is inside the slot,
+                    // and `row` is at most `dstride`. The destination is the vector's own f32s,
+                    // filled bytewise.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            ptr.add(at),
+                            (depth.as_mut_ptr() as *mut u8).add(y * row),
+                            row,
+                        )
+                    };
+                }
+                for v in depth.iter_mut() {
+                    *v = f32::from_bits(u32::from_le(v.to_bits()));
+                }
+            }
         }
         fence(Ordering::Acquire);
         if lock.load(Ordering::Relaxed) != l1 {
@@ -2705,5 +2975,422 @@ mod tests {
         std::fs::write(&path, &valid[..100]).unwrap();
         assert!(FrameReader::open(&path).is_err());
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- Pixel file with depth (contract section 9.6, revision 3)
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "rewrite-bridge-{name}-{}.frames",
+            std::process::id()
+        ))
+    }
+
+    /// Distinct, recognisable pixels and depths for frame `n` of size `w` x `h`.
+    fn pattern(n: u8, w: u32, h: u32) -> (Vec<u8>, Vec<f32>) {
+        let rgba = (0..w * h * 4)
+            .map(|i| (i as u8).wrapping_mul(n).wrapping_add(n))
+            .collect();
+        let depth = (0..w * h)
+            .map(|i| match i % 5 {
+                0 => f32::INFINITY,
+                1 => f32::NAN,
+                _ => f32::from(n) + i as f32 * 0.25,
+            })
+            .collect();
+        (rgba, depth)
+    }
+
+    /// Bitwise equality, since the pattern holds NaN.
+    fn same_bits(a: &[f32], b: &[f32]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    #[test]
+    fn a_depth_file_has_the_layout_the_contract_gives() {
+        let path = temp_path("layout");
+        // 8 x 4: colour ends at 64 + 32 * 4 = 192, a multiple of 64; the plane is 128 bytes.
+        // 7 x 3: colour ends at 64 + 28 * 3 = 148, so the plane starts at 192 and ends at 276.
+        for (w, h, depth_offset, slot_size) in [(8u32, 4u32, 192u64, 320u64), (7, 3, 192, 320)] {
+            let wr = FrameWriter::create_with(&path, &FrameFileOptions::new(w, h, 3).with_depth())
+                .unwrap();
+            assert!(wr.has_depth());
+            let b = std::fs::read(&path).unwrap();
+            assert_eq!(&b[..8], b"RBFRAME\0");
+            assert_eq!(u32_at(&b, 8), 1, "the file version stays 1");
+            assert_eq!(u32_at(&b, 12), 3);
+            assert_eq!(u32_at(&b, 16), w);
+            assert_eq!(u32_at(&b, 20), h);
+            assert_eq!(u32_at(&b, 24), w * 4);
+            assert_eq!(u32_at(&b, 28), FORMAT_RGBA8_SRGB);
+            assert_eq!(u64_at(&b, 32), slot_size);
+            assert_eq!(u32_at(&b, 40), 1, "depth_format");
+            assert_eq!(u32_at(&b, 44), w * 4, "depth_stride");
+            assert_eq!(u64_at(&b, 48), depth_offset);
+            assert!(b[56..64].iter().all(|&x| x == 0), "56..64 stay reserved");
+            assert_eq!(slot_size % 64, 0);
+            assert_eq!(depth_offset % 64, 0);
+            assert!(depth_offset >= 64 + u64::from(w * 4 * h));
+            assert!(slot_size >= depth_offset + u64::from(w * 4 * h));
+            assert_eq!(b.len() as u64, 64 + 3 * slot_size);
+            drop(wr);
+        }
+        // Without depth the same bytes are zero and the slot is the revision-2 size.
+        let wr = FrameWriter::create(&path, 7, 3, 3).unwrap();
+        assert!(!wr.has_depth());
+        let b = std::fs::read(&path).unwrap();
+        assert!(b[40..64].iter().all(|&x| x == 0));
+        assert_eq!(u64_at(&b, 32), 192);
+        drop(wr);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn colour_and_depth_round_trip_exactly_through_three_slots() {
+        let path = temp_path("depth-roundtrip");
+        let mut w =
+            FrameWriter::create_with(&path, &FrameFileOptions::new(8, 4, 3).with_depth()).unwrap();
+        let r = FrameReader::open(&path).unwrap();
+        assert!(r.has_depth());
+        let (mut rgba, mut depth) = (Vec::new(), Vec::new());
+        // A smaller frame than the file allows is packed tightly, at the file's strides.
+        for (n, (fw, fh)) in [
+            (1u8, (8, 4)),
+            (2, (6, 3)),
+            (3, (8, 4)),
+            (4, (1, 1)),
+            (5, (7, 4)),
+        ] {
+            let (img, dep) = pattern(n, fw, fh);
+            let ready = w
+                .write_depth(&img, Some(&dep), fw, fh, u32::from(n) * 10, 99)
+                .unwrap();
+            assert_eq!(ready.slot, (u64::from(n) % 3) as u32);
+            let data = r.read_depth(&ready, &mut rgba, &mut depth).unwrap();
+            assert_eq!(rgba, img, "colour of frame {n}");
+            assert!(same_bits(&depth, &dep), "depth of frame {n}");
+            assert_eq!(
+                (data.frame, data.camera_seq),
+                (u64::from(n), u32::from(n) * 10)
+            );
+            assert_eq!((data.width, data.height), (fw, fh));
+        }
+        // Frame 3 is still in its slot and still reads whole; frame 2's slot was reused by 5.
+        let old = FrameReady {
+            frame: 3,
+            slot: 0,
+            camera_seq: 30,
+            width: 8,
+            height: 4,
+        };
+        assert_eq!(
+            r.read_depth(&old, &mut rgba, &mut depth).map(|d| d.frame),
+            Ok(3)
+        );
+        let gone = FrameReady {
+            frame: 2,
+            slot: 2,
+            camera_seq: 20,
+            width: 6,
+            height: 3,
+        };
+        assert_eq!(
+            r.read_depth(&gone, &mut rgba, &mut depth),
+            Err(FrameMiss::Replaced)
+        );
+        // The seqlock covers the depth read too: a writer caught mid-frame.
+        let (img, dep) = pattern(9, 8, 4);
+        let ready = w.write_depth(&img, Some(&dep), 8, 4, 0, 0).unwrap();
+        let base = FILE_HEADER_LEN + (w.slot_size * u64::from(ready.slot)) as usize;
+        lock_at(w.map.as_mut_ptr(), base).fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            r.read_depth(&ready, &mut rgba, &mut depth),
+            Err(FrameMiss::Torn)
+        );
+        // Wrong arguments are refused instead of leaving stale depth behind.
+        assert!(
+            w.write(&img, 8, 4, 0, 0).is_err(),
+            "a depth file needs depth"
+        );
+        assert!(w.write_depth(&img, Some(&dep[1..]), 8, 4, 0, 0).is_err());
+        drop(r);
+        drop(w);
+        assert!(!path.exists());
+    }
+
+    /// What a revision 2 reader does, written from the old contract text and nothing else: it
+    /// knows bytes 0..40 of the file header and a slot's first 36 bytes, finds slots by
+    /// `slot_size`, and never looks at the reserved bytes.
+    fn rev2_read(file: &[u8], slot: usize) -> (u64, u32, u32, Vec<u8>) {
+        assert_eq!(&file[..8], b"RBFRAME\0");
+        assert_eq!(u32_at(file, 8), 1);
+        let (w, h, stride) = (
+            u32_at(file, 16) as usize,
+            u32_at(file, 20) as usize,
+            u32_at(file, 24) as usize,
+        );
+        assert_eq!(u32_at(file, 28), 1);
+        let slot_size = u64_at(file, 32) as usize;
+        assert!(slot_size.is_multiple_of(64) && slot_size >= 64 + stride * h);
+        let base = 64 + slot * slot_size;
+        let (fw, fh) = (
+            u32_at(file, base + 28) as usize,
+            u32_at(file, base + 32) as usize,
+        );
+        assert!(fw <= w && fh <= h);
+        let mut px = Vec::new();
+        for y in 0..fh {
+            px.extend_from_slice(&file[base + 64 + y * stride..][..fw * 4]);
+        }
+        (u64_at(file, base + 8), fw as u32, fh as u32, px)
+    }
+
+    #[test]
+    fn v1_readers_still_read_the_colour_of_a_depth_file() {
+        let path = temp_path("v1-compat");
+        let mut w =
+            FrameWriter::create_with(&path, &FrameFileOptions::new(8, 4, 3).with_depth()).unwrap();
+        let mut sent = Vec::new();
+        for n in 1..=4u8 {
+            let (img, dep) = pattern(n, 6, 3);
+            sent.push((w.write_depth(&img, Some(&dep), 6, 3, 1, 5).unwrap(), img));
+        }
+        let file = std::fs::read(&path).unwrap();
+        let r = FrameReader::open(&path).unwrap();
+        let mut out = Vec::new();
+        for (ready, img) in sent.iter().skip(1) {
+            // The independent revision 2 reader, on the raw bytes.
+            let (frame, fw, fh, px) = rev2_read(&file, ready.slot as usize);
+            assert_eq!((frame, fw, fh), (ready.frame, 6, 3));
+            assert_eq!(&px, img);
+            // And this crate's old entry point, which ignores depth.
+            r.read(ready, &mut out).unwrap();
+            assert_eq!(&out, img);
+        }
+        drop(r);
+        drop(w);
+
+        // A v1 file (no depth): read_depth works and returns no depth.
+        let mut w = FrameWriter::create(&path, 8, 4, 3).unwrap();
+        let r = FrameReader::open(&path).unwrap();
+        assert!(!r.has_depth());
+        let (img, _) = pattern(2, 5, 2);
+        let ready = w.write(&img, 5, 2, 7, 1).unwrap();
+        let mut depth = vec![1.0];
+        let data = r.read_depth(&ready, &mut out, &mut depth).unwrap();
+        assert_eq!((out.as_slice(), data.camera_seq), (img.as_slice(), 7));
+        assert!(depth.is_empty(), "no depth plane, no depth");
+        assert!(w.write_depth(&img, Some(&[0.0; 10]), 5, 2, 0, 0).is_err());
+        drop(r);
+        drop(w);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A valid depth file's bytes, to be damaged.
+    fn depth_file_bytes(path: &Path) -> Vec<u8> {
+        let w =
+            FrameWriter::create_with(path, &FrameFileOptions::new(8, 4, 2).with_depth()).unwrap();
+        std::fs::read(w.path()).unwrap()
+    }
+
+    fn put_u32(b: &mut [u8], at: usize, v: u32) {
+        b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    fn put_u64(b: &mut [u8], at: usize, v: u64) {
+        b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    #[test]
+    fn damaged_depth_headers_are_rejected_cleanly() {
+        let path = temp_path("bad-depth");
+        let good = depth_file_bytes(&path);
+        std::fs::write(&path, &good).unwrap();
+        assert!(FrameReader::open(&path).is_ok());
+        let slot_size = u64_at(&good, 32);
+        type Damage = Box<dyn Fn(&mut Vec<u8>)>;
+        let cases: Vec<(&str, Damage)> = vec![
+            ("unknown depth_format 2", Box::new(|b| put_u32(b, 40, 2))),
+            (
+                "unknown depth_format max",
+                Box::new(|b| put_u32(b, 40, u32::MAX)),
+            ),
+            (
+                "depth_offset at slot_size",
+                Box::new(move |b| put_u64(b, 48, slot_size)),
+            ),
+            (
+                "depth_offset past slot_size",
+                Box::new(move |b| put_u64(b, 48, slot_size + 64)),
+            ),
+            (
+                "depth_offset huge",
+                Box::new(|b| put_u64(b, 48, u64::MAX - 63)),
+            ),
+            ("depth_offset overflows", Box::new(|b| put_u64(b, 48, !63))),
+            (
+                "depth_offset inside the colour",
+                Box::new(|b| put_u64(b, 48, 128)),
+            ),
+            (
+                "depth_offset zero with depth",
+                Box::new(|b| put_u64(b, 48, 0)),
+            ),
+            (
+                "depth_offset not a multiple of 64",
+                Box::new(|b| put_u64(b, 48, 200)),
+            ),
+            (
+                "plane runs past the slot",
+                Box::new(|b| put_u64(b, 48, 256)),
+            ),
+            ("depth_stride too small", Box::new(|b| put_u32(b, 44, 28))),
+            ("depth_stride too large", Box::new(|b| put_u32(b, 44, 36))),
+            (
+                "depth_stride zero with depth",
+                Box::new(|b| put_u32(b, 44, 0)),
+            ),
+            ("depth_stride huge", Box::new(|b| put_u32(b, 44, u32::MAX))),
+            (
+                "slot_size too small for the plane",
+                Box::new(|b| put_u64(b, 32, 256)),
+            ),
+            (
+                "slot_size not a multiple of 64",
+                Box::new(|b| put_u64(b, 32, 330)),
+            ),
+            (
+                "file cut inside the last plane",
+                Box::new(|b| b.truncate(b.len() - 8)),
+            ),
+        ];
+        for (what, damage) in &cases {
+            let mut b = good.clone();
+            damage(&mut b);
+            std::fs::write(&path, &b).unwrap();
+            assert!(FrameReader::open(&path).is_err(), "accepted: {what}");
+        }
+        // With depth_format 0 the other two fields are not looked at: a colour-only reader of a
+        // file from a writer that left bytes there still works.
+        let mut b = good.clone();
+        put_u32(&mut b, 40, 0);
+        put_u64(&mut b, 48, u64::MAX);
+        put_u32(&mut b, 44, 12345);
+        std::fs::write(&path, &b).unwrap();
+        let r = FrameReader::open(&path).unwrap();
+        assert!(!r.has_depth());
+        drop(r);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fuzzed_pixel_file_headers_never_panic_or_read_out_of_bounds() {
+        let path = temp_path("fuzz-depth");
+        let good = depth_file_bytes(&path);
+        let mut rng = Rng(0xD1CE);
+        let ready = |slot| FrameReady {
+            frame: 0,
+            slot,
+            camera_seq: 0,
+            width: 8,
+            height: 4,
+        };
+        let (mut opened, mut with_depth) = (0, 0);
+        let (mut rgba, mut depth) = (Vec::new(), Vec::new());
+        for i in 0..3000 {
+            let mut b = good.clone();
+            for _ in 0..1 + rng.next() % 4 {
+                let at = if i % 2 == 0 {
+                    40 + rng.next() as usize % 24 // the new fields
+                } else {
+                    rng.next() as usize % 64
+                };
+                match rng.next() % 3 {
+                    0 => b[at] = rng.next() as u8,
+                    1 => b[at] ^= 1 << (rng.next() % 8),
+                    _ => b[at] = [0, 0xFF, 0x40, 0x80][rng.next() as usize % 4],
+                }
+            }
+            std::fs::write(&path, &b).unwrap();
+            if let Ok(r) = FrameReader::open(&path) {
+                opened += 1;
+                with_depth += usize::from(r.has_depth());
+                // Whatever opens must be safe to read from, whichever slot is asked for.
+                for slot in 0..3 {
+                    let _ = r.read_depth(&ready(slot), &mut rgba, &mut depth);
+                    let _ = r.read(&ready(slot), &mut rgba);
+                }
+            }
+        }
+        assert!(opened > 100 && with_depth > 50, "{opened} {with_depth}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_seqlock_keeps_colour_and_depth_together_under_a_racing_writer() {
+        // One slot, so every write lands on the slot the reader is copying.
+        let path = temp_path("race");
+        let mut w = FrameWriter::create_with(&path, &FrameFileOptions::new(64, 32, 1).with_depth())
+            .unwrap();
+        let r = FrameReader::open(&path).unwrap();
+        let latest = std::sync::Arc::new(AtomicU64::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (l2, s2) = (latest.clone(), stop.clone());
+        let writer = std::thread::spawn(move || {
+            for n in 1..=3000u64 {
+                // Every colour byte and every depth value carries the frame number.
+                let img = vec![n as u8; 64 * 32 * 4];
+                let dep = vec![n as f32; 64 * 32];
+                let ready = w.write_depth(&img, Some(&dep), 64, 32, 0, n).unwrap();
+                assert_eq!(ready.frame, n);
+                l2.store(n, Ordering::Release);
+                std::thread::sleep(Duration::from_micros(30));
+            }
+            s2.store(true, Ordering::Release);
+            w
+        });
+        let (mut rgba, mut depth) = (Vec::new(), Vec::new());
+        let (mut good, mut missed) = (0u32, 0u32);
+        while !stop.load(Ordering::Acquire) {
+            let n = latest.load(Ordering::Acquire);
+            if n == 0 {
+                continue;
+            }
+            let ready = FrameReady {
+                frame: n,
+                slot: 0,
+                camera_seq: 0,
+                width: 64,
+                height: 32,
+            };
+            match r.read_depth(&ready, &mut rgba, &mut depth) {
+                Ok(data) => {
+                    good += 1;
+                    assert_eq!(data.frame, n);
+                    assert!(
+                        rgba.iter().all(|&b| b == n as u8),
+                        "torn colour in frame {n}"
+                    );
+                    assert!(
+                        depth.iter().all(|&d| d == n as f32),
+                        "torn depth in frame {n}"
+                    );
+                }
+                Err(_) => missed += 1,
+            }
+        }
+        let w = writer.join().unwrap();
+        // Once the writer is done the last frame reads whole.
+        let last = FrameReady {
+            frame: 3000,
+            slot: 0,
+            camera_seq: 0,
+            width: 64,
+            height: 32,
+        };
+        assert!(r.read_depth(&last, &mut rgba, &mut depth).is_ok());
+        assert!(good > 0, "{good} whole frames, {missed} misses");
+        println!("race test: {good} whole frames, {missed} misses");
+        drop(r);
+        drop(w);
     }
 }
