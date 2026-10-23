@@ -326,12 +326,13 @@ fn main() -> std::io::Result<()> {
                 log(format!(
                     "sent {cameras} cameras; got {poses} poses in {pose_msgs} datagrams, {frames} frames; \
                      presented {age_n} (age mean {:.1} ms, max {age_max:.1} ms); last pose {:?}; \
-                     pose latency {latency_us} us; malformed {} stale {} foreign {}",
+                     pose latency {latency_us} us; malformed {} stale {} foreign {} unknown_entity {}",
                     age_sum / age_n.max(1) as f32,
                     last_pose.map(|p| p.translation.map(|x| (x * 100.0).round() / 100.0)),
                     s.malformed,
                     s.stale,
-                    s.foreign
+                    s.foreign,
+                    s.unknown_entity
                 ));
             }
             (cameras, pose_msgs, poses, frames) = (0, 0, 0, 0);
