@@ -15,7 +15,7 @@
 //! The link only exchanges what each process chooses to publish. It never touches another process.
 
 use std::collections::hash_map::RandomState;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -58,6 +58,16 @@ pub const MAX_LINE: usize = 65536;
 pub const MAX_PENDING_CONTROL: usize = 1 << 20;
 /// How long a closing control connection is drained after its `bye` (contract section 6).
 pub const LINGER: Duration = Duration::from_millis(200);
+/// Largest width or height of a pixel file that a reader accepts (contract section 9.6).
+pub const MAX_FRAME_DIM: u32 = 16384;
+/// Live entities a receiver keeps for its peer; a `spawn` beyond this is ignored (section 8).
+pub const MAX_ENTITIES: usize = 1024;
+/// The range of `heartbeat_ms` a `hello` may announce (section 8).
+pub const HEARTBEAT_MS_RANGE: std::ops::RangeInclusive<u32> = 10..=10_000;
+/// Collision datagrams one [`Link::poll`] sends at most (section 9.5).
+pub const COLLISION_PER_POLL: usize = 32;
+/// The UDP receive buffer a receiver asks for, in bytes (section 2); the OS may grant less.
+pub const RECV_BUFFER_BYTES: usize = 4 << 20;
 /// How long one connection attempt of a guest may take. It runs on a helper thread, so a slow
 /// refusal (Windows retries a refused localhost SYN for about two seconds) never blocks a poll.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -939,6 +949,9 @@ pub struct LinkConfig {
     pub control_port: u16,
     /// This side's UDP port (0 = any free port); announced to the peer in `hello`.
     pub udp_port: u16,
+    /// How often this side sends a `Heartbeat`. A `hello` carries it as `heartbeat_ms`, which a
+    /// peer accepts only from 10 ms to 10 s, so [`Link::host`] and [`Link::guest`] clamp it to
+    /// [`HEARTBEAT_MS_RANGE`].
     pub heartbeat: Duration,
     /// Watchdog timeout; the effective one is at least 4 peer heartbeats.
     pub timeout: Duration,
@@ -991,7 +1004,8 @@ pub enum Event {
         header: Header,
         camera: Camera,
     },
-    /// Poses newer than the last one of their entity.
+    /// Poses of entities the peer spawned (others are dropped and counted in
+    /// [`Stats::unknown_entity`]), newer than the last one of their entity.
     Poses {
         header: Header,
         poses: Vec<Pose>,
@@ -1002,7 +1016,10 @@ pub enum Event {
         header: Header,
         frame: FrameReady,
     },
+    /// The peer spawned an entity. At most [`MAX_ENTITIES`] are live at once; a spawn beyond that
+    /// is ignored (no event, counted in [`Stats::spawn_ignored`]).
     Spawn(Spawn),
+    /// The peer despawned an entity it had spawned (a despawn of an unknown id gives no event).
     Despawn {
         entity: u32,
     },
@@ -1012,6 +1029,8 @@ pub enum Event {
         focus: Role,
         requested: bool,
     },
+    /// The peer announced a pixel file; it replaces the previous one, and the frame numbers
+    /// start again at 1 (open it with [`FrameReader::open`]).
     FrameChannel(FrameChannel),
 }
 
@@ -1030,6 +1049,10 @@ pub struct Stats {
     pub send_dropped: u64,
     pub lines_sent: u64,
     pub lines_received: u64,
+    /// Pose records for an entity the peer never spawned (or already despawned); not delivered.
+    pub unknown_entity: u64,
+    /// Spawns ignored because the peer already had [`MAX_ENTITIES`] live entities.
+    pub spawn_ignored: u64,
 }
 
 struct Ctl {
@@ -1203,9 +1226,13 @@ pub struct Link {
     out: Vec<u8>,
     /// Connections being closed gracefully, see [`Closing`].
     closing: Vec<Closing>,
+    /// Collision chunks waiting to be sent, [`COLLISION_PER_POLL`] per poll.
+    collision_queue: VecDeque<CollisionChunk>,
     // Receive-side filters, reset per session.
     last_camera: Option<u32>,
-    pose_times: HashMap<u32, u64>,
+    /// The peer's live spawned entities, each with the `time_us` of its newest pose.
+    entities: HashMap<u32, u64>,
+    spawn_ignored_logged: bool,
     last_collision: Option<u32>,
     assembly: Option<Assembly>,
     last_frame: u64,
@@ -1217,6 +1244,47 @@ fn localhost(port: u16) -> SocketAddr {
 
 fn millis(d: Duration) -> u32 {
     d.as_millis().min(u128::from(u32::MAX)) as u32
+}
+
+/// Asks the OS for a UDP receive buffer of `bytes` (contract section 2: collision snapshots
+/// arrive in bursts). Best effort: the OS may grant less, or refuse, and the link works either way.
+fn request_recv_buffer(udp: &UdpSocket, bytes: usize) {
+    let bytes = i32::try_from(bytes).unwrap_or(i32::MAX);
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a valid socket descriptor, and a pointer to a c_int that lives through the call.
+        unsafe {
+            libc::setsockopt(
+                udp.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                std::ptr::addr_of!(bytes).cast(),
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            );
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        extern "system" {
+            fn setsockopt(s: usize, level: i32, name: i32, value: *const u8, len: i32) -> i32;
+        }
+        const SOL_SOCKET: i32 = 0xffff;
+        const SO_RCVBUF: i32 = 0x1002;
+        // SAFETY: a valid socket, and a pointer to an i32 that lives through the call.
+        unsafe {
+            setsockopt(
+                udp.as_raw_socket() as usize,
+                SOL_SOCKET,
+                SO_RCVBUF,
+                std::ptr::addr_of!(bytes).cast(),
+                std::mem::size_of::<i32>() as i32,
+            );
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = (udp, bytes);
 }
 
 fn random_session() -> u32 {
@@ -1240,8 +1308,15 @@ impl Link {
         Self::new(Role::Guest, cfg, None)
     }
 
-    fn new(role: Role, cfg: LinkConfig, listener: Option<TcpListener>) -> io::Result<Self> {
+    fn new(role: Role, mut cfg: LinkConfig, listener: Option<TcpListener>) -> io::Result<Self> {
+        // The `hello` carries `heartbeat_ms`, which a peer accepts only within HEARTBEAT_MS_RANGE.
+        let (lo, hi) = (HEARTBEAT_MS_RANGE.start(), HEARTBEAT_MS_RANGE.end());
+        cfg.heartbeat = cfg.heartbeat.clamp(
+            Duration::from_millis(u64::from(*lo)),
+            Duration::from_millis(u64::from(*hi)),
+        );
         let udp = UdpSocket::bind(localhost(cfg.udp_port))?;
+        request_recv_buffer(&udp, RECV_BUFFER_BYTES);
         udp.set_nonblocking(true)?;
         let now = Instant::now();
         Ok(Self {
@@ -1258,8 +1333,10 @@ impl Link {
             stats: Stats::default(),
             out: Vec::with_capacity(MAX_DATAGRAM),
             closing: Vec::new(),
+            collision_queue: VecDeque::new(),
             last_camera: None,
-            pose_times: HashMap::new(),
+            entities: HashMap::new(),
+            spawn_ignored_logged: false,
             last_collision: None,
             assembly: None,
             last_frame: 0,
@@ -1309,6 +1386,7 @@ impl Link {
         self.poll_connect(now);
         self.poll_control(now);
         self.poll_udp(now);
+        self.pump_collision();
         self.poll_timers(now);
         std::mem::take(&mut self.events)
     }
@@ -1439,10 +1517,28 @@ impl Link {
         }
         match msg {
             Control::Hello(_) => return Err(("second hello".into(), true)),
-            Control::Spawn(s) => self.events.push(Event::Spawn(s)),
+            Control::Spawn(s) => {
+                // A second spawn of a live id replaces the first; a new id needs a free place.
+                if !self.entities.contains_key(&s.entity) {
+                    if self.entities.len() >= MAX_ENTITIES {
+                        self.stats.spawn_ignored += 1;
+                        if !std::mem::replace(&mut self.spawn_ignored_logged, true) {
+                            eprintln!(
+                                "rewrite-bridge: the peer has {MAX_ENTITIES} live entities; \
+                                 further spawns are ignored (entity {} and later ones)",
+                                s.entity
+                            );
+                        }
+                        return Ok(());
+                    }
+                    self.entities.insert(s.entity, 0);
+                }
+                self.events.push(Event::Spawn(s));
+            }
             Control::Despawn { entity } => {
-                self.pose_times.remove(&entity);
-                self.events.push(Event::Despawn { entity });
+                if self.entities.remove(&entity).is_some() {
+                    self.events.push(Event::Despawn { entity });
+                }
             }
             Control::Input { focus, .. } => {
                 let requested = self.role == Role::Host;
@@ -1451,7 +1547,11 @@ impl Link {
                 }
                 self.events.push(Event::Focus { focus, requested });
             }
-            Control::FrameChannel(c) => self.events.push(Event::FrameChannel(c)),
+            Control::FrameChannel(c) => {
+                // A new pixel file numbers its frames from 1 again (contract section 8).
+                self.last_frame = 0;
+                self.events.push(Event::FrameChannel(c));
+            }
             Control::Bye { .. } | Control::Unknown(_) => {}
         }
         Ok(())
@@ -1467,6 +1567,17 @@ impl Link {
         }
         if h.udp_port == 0 {
             return Err(("peer announced udp_port 0".into(), true));
+        }
+        if !HEARTBEAT_MS_RANGE.contains(&h.heartbeat_ms) {
+            return Err((
+                format!(
+                    "peer announced heartbeat_ms {}, outside {}..={}",
+                    h.heartbeat_ms,
+                    HEARTBEAT_MS_RANGE.start(),
+                    HEARTBEAT_MS_RANGE.end()
+                ),
+                true,
+            ));
         }
         let (protocol, session) = match self.role {
             Role::Host => {
@@ -1536,7 +1647,9 @@ impl Link {
     fn reset_session(&mut self) {
         self.focus = Role::Host;
         self.last_camera = None;
-        self.pose_times.clear();
+        self.entities.clear();
+        self.spawn_ignored_logged = false;
+        self.collision_queue.clear();
         self.last_collision = None;
         self.assembly = None;
         self.last_frame = 0;
@@ -1621,16 +1734,23 @@ impl Link {
                 self.events.push(Event::Camera { header, camera });
             }
             Datagram::Pose(mut poses) => {
-                let before = poses.len();
-                poses.retain(|p| {
-                    let last = self.pose_times.entry(p.entity).or_insert(0);
-                    let fresh = p.time_us >= *last;
-                    if fresh {
-                        *last = p.time_us;
+                let (mut stale, mut unknown) = (0u64, 0u64);
+                poses.retain(|p| match self.entities.get_mut(&p.entity) {
+                    None => {
+                        unknown += 1;
+                        false
                     }
-                    fresh
+                    Some(last) if p.time_us >= *last => {
+                        *last = p.time_us;
+                        true
+                    }
+                    Some(_) => {
+                        stale += 1;
+                        false
+                    }
                 });
-                self.stats.stale += (before - poses.len()) as u64;
+                self.stats.stale += stale;
+                self.stats.unknown_entity += unknown;
                 if !poses.is_empty() {
                     self.events.push(Event::Poses { header, poses });
                 }
@@ -1774,24 +1894,40 @@ impl Link {
         Ok(())
     }
 
-    /// Sends a collision snapshot in as many chunks as it needs; returns its query number.
+    /// Queues a collision snapshot, in as many chunks as it needs, and returns its query number.
+    /// The chunks go out [`COLLISION_PER_POLL`] per [`Link::poll`], so a big snapshot never
+    /// overflows the receiver's socket buffer; a snapshot queued while an older one still has
+    /// chunks waiting replaces them (the receiver would discard the old query anyway).
     pub fn send_collision(
         &mut self,
         center: [f32; 3],
         radius: f32,
         triangles: &[Triangle],
     ) -> Result<u32, LinkError> {
+        if !self.is_connected() {
+            return Err(LinkError::NotConnected);
+        }
         let c = Collision {
             query: self.next_query,
             center,
             radius,
             triangles: triangles.to_vec(),
         };
-        for chunk in c.chunks()? {
-            self.send(&Datagram::Collision(chunk))?;
-        }
+        self.collision_queue = c.chunks()?.into();
         self.next_query = self.next_query.wrapping_add(1);
         Ok(c.query)
+    }
+
+    /// Sends up to [`COLLISION_PER_POLL`] queued collision chunks.
+    fn pump_collision(&mut self) {
+        for _ in 0..COLLISION_PER_POLL {
+            let Some(chunk) = self.collision_queue.pop_front() else {
+                break;
+            };
+            if self.send(&Datagram::Collision(chunk)).is_err() {
+                self.collision_queue.clear();
+            }
+        }
     }
 
     /// Announces a frame written with [`FrameWriter::write`].
@@ -1911,20 +2047,20 @@ impl FrameFileOptions {
     }
 }
 
-fn round_up_64(n: u64) -> u64 {
-    n.div_ceil(64) * 64
+fn round_up_64(n: u64) -> Option<u64> {
+    Some(n.checked_add(63)? / 64 * 64)
 }
 
-/// Where a slot's depth plane starts and how big the slot is: `(depth_offset, slot_size)`.
-/// `depth_stride == 0` means no depth plane.
-fn slot_layout(stride: u32, depth_stride: u32, height: u32) -> (u64, u64) {
-    let colour_end = SLOT_HEADER_LEN as u64 + u64::from(stride) * u64::from(height);
+/// Where a slot's depth plane starts and how big the slot is: `(depth_offset, slot_size)`, or
+/// `None` if the arithmetic overflows. `depth_stride == 0` means no depth plane.
+fn slot_layout(stride: u32, depth_stride: u32, height: u32) -> Option<(u64, u64)> {
+    let colour_end = (u64::from(stride) * u64::from(height)).checked_add(SLOT_HEADER_LEN as u64)?;
     if depth_stride == 0 {
-        return (0, round_up_64(colour_end));
+        return Some((0, round_up_64(colour_end)?));
     }
-    let depth_offset = round_up_64(colour_end);
-    let end = depth_offset + u64::from(depth_stride) * u64::from(height);
-    (depth_offset, round_up_64(end))
+    let depth_offset = round_up_64(colour_end)?;
+    let end = depth_offset.checked_add(u64::from(depth_stride) * u64::from(height))?;
+    Some((depth_offset, round_up_64(end)?))
 }
 
 /// A pixel frame read back from a [`FrameReader`].
@@ -1937,7 +2073,8 @@ pub struct FrameData {
     pub height: u32,
 }
 
-/// Why [`FrameReader::read`] returned no frame. All of them mean "wait for the next one".
+/// Why [`FrameReader::read`] returned no frame. All of them mean "wait for the next one", except
+/// [`FrameMiss::Gone`], after which the reader is of no further use.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FrameMiss {
     /// The slot or size in the datagram does not fit the file.
@@ -1946,6 +2083,9 @@ pub enum FrameMiss {
     Torn,
     /// The slot already holds another frame.
     Replaced,
+    /// The file is now shorter than the mapping made of it (the peer truncated it). Nothing was
+    /// read; drop the reader and wait for a new `frame_channel`.
+    Gone,
 }
 
 /// Writes RGBA frames, and optionally their depth, into a memory-mapped pixel file (contract
@@ -1965,8 +2105,8 @@ pub struct FrameWriter {
 }
 
 impl FrameWriter {
-    /// Creates (or truncates) a colour-only file at `path` with room for `slots` frames of up to
-    /// `width` x `height` pixels.
+    /// Creates a colour-only file at `path` with room for `slots` frames of up to `width` x
+    /// `height` pixels. The path must not exist (contract section 9.6: a sender never reuses one).
     pub fn create(path: &Path, width: u32, height: u32, slots: u32) -> io::Result<Self> {
         Self::create_with(path, &FrameFileOptions::new(width, height, slots))
     }
@@ -1983,6 +2123,9 @@ impl FrameWriter {
         if !(1..=MAX_SLOTS).contains(&slots) || width == 0 || height == 0 {
             return Err(invalid("slots must be 1 to 16 and the size nonzero"));
         }
+        if width > MAX_FRAME_DIM || height > MAX_FRAME_DIM {
+            return Err(invalid("width and height are at most 16384"));
+        }
         let stride = width
             .checked_mul(4)
             .ok_or_else(|| invalid("width too large"))?;
@@ -1991,15 +2134,23 @@ impl FrameWriter {
         } else {
             stride
         };
-        let (depth_offset, slot_size) = slot_layout(stride, depth_stride, height);
-        let len = FILE_HEADER_LEN as u64 + slot_size * u64::from(slots);
+        let (depth_offset, slot_size) = slot_layout(stride, depth_stride, height)
+            .ok_or_else(|| invalid("the frame size overflows"))?;
+        let len = slot_size
+            .checked_mul(u64::from(slots))
+            .and_then(|n| n.checked_add(FILE_HEADER_LEN as u64))
+            .ok_or_else(|| invalid("the file size overflows"))?;
+        // `create_new`: an existing file (a peer may still map it) is never truncated or reused.
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .open(path)?;
-        file.set_len(len)?;
+        if let Err(e) = file.set_len(len) {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err(e);
+        }
         // SAFETY: we just created the file and only this writer maps it writable.
         let mut map = unsafe { MmapMut::map_mut(&file)? };
         let mut h = Vec::with_capacity(FILE_HEADER_LEN);
@@ -2045,9 +2196,16 @@ impl FrameWriter {
     /// [`create_temp`](Self::create_temp) with [`FrameFileOptions`].
     pub fn create_temp_with(tag: &str, opts: &FrameFileOptions) -> io::Result<Self> {
         static NEXT: AtomicU32 = AtomicU32::new(0);
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let name = format!("rewrite-bridge-{}-{tag}-{n}.frames", std::process::id());
-        Self::create_with(&std::env::temp_dir().join(name), opts)
+        // A crashed run may have left a file with this process id's name behind; skip its path.
+        for _ in 0..64 {
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let name = format!("rewrite-bridge-{}-{tag}-{n}.frames", std::process::id());
+            match Self::create_with(&std::env::temp_dir().join(name), opts) {
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+                other => return other,
+            }
+        }
+        Err(io::Error::from(ErrorKind::AlreadyExists))
     }
 
     /// What to pass to [`Link::announce_frames`].
@@ -2179,6 +2337,43 @@ fn lock_at<'a, T>(map: *const T, base: usize) -> &'a AtomicU64 {
     unsafe { &*((map as *const u8).add(base) as *const AtomicU64) }
 }
 
+/// Opens the file a peer named for reading, if it is an absolute path to a regular file.
+///
+/// Opening a FIFO for reading blocks until a writer appears, so the type is checked before the
+/// open (`symlink_metadata` does not follow a final symlink) and again on the opened handle, and
+/// where the OS has `O_NONBLOCK` the open does not wait even if the file is swapped for a FIFO in
+/// between. On Unix the handle must be the very file that was checked.
+fn open_regular(path: &Path) -> io::Result<File> {
+    let bad = |m: &str| io::Error::new(ErrorKind::InvalidInput, m.to_owned());
+    if !path.is_absolute() {
+        return Err(bad("the pixel file path is not absolute"));
+    }
+    let before = std::fs::symlink_metadata(path)?;
+    if !before.file_type().is_file() {
+        return Err(bad("the pixel file is not a regular file"));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let after = file.metadata()?;
+    if !after.is_file() {
+        return Err(bad("the pixel file is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (before.dev(), before.ino()) != (after.dev(), after.ino()) {
+            return Err(bad("the pixel file was replaced while it was opened"));
+        }
+    }
+    Ok(file)
+}
+
 /// The pixel file header's fields after the magic.
 struct FileHeader {
     version: u32,
@@ -2213,7 +2408,15 @@ fn parse_file_header(b: &[u8]) -> Result<([u8; 8], FileHeader), WireError> {
 }
 
 /// Reads frames from a peer's pixel file, mapped read-only.
+///
+/// The peer owns the file. A peer that truncates it while it is mapped would crash a reader with
+/// SIGBUS on a plain access, so every [`read`](Self::read) first compares the file's current
+/// length with the mapped one and answers [`FrameMiss::Gone`] if it shrank. That narrows the race
+/// but cannot close it: a truncation between that check and the copy still faults. The contract
+/// forbids a sender to truncate or resize a pixel file it announced, so this guards against a
+/// broken or hostile peer only.
 pub struct FrameReader {
+    file: File,
     map: Mmap,
     slots: u32,
     width: u32,
@@ -2228,12 +2431,23 @@ impl FrameReader {
     /// Maps the file a `frame_channel` message named and checks its header, including the depth
     /// fields: a file whose depth plane does not fit its slot is refused. A `depth_format` this
     /// revision does not know is read as colour only, so a later depth format stays readable.
+    ///
+    /// The path must be absolute and name a regular file (not a symlink, FIFO, device or
+    /// directory), `width` and `height` are at most [`MAX_FRAME_DIM`], and `stride` is exactly
+    /// `width * 4` (contract section 9.6). A path that is not a regular file is refused before it
+    /// is opened and the file is opened non-blocking where the OS has that, so a FIFO the peer
+    /// names cannot stall the caller.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = File::open(path)?;
-        // SAFETY: the file is shared with its writer; this map is only read through raw
-        // pointers and the seqlock below, never as a Rust slice that could change under it.
-        let map = unsafe { Mmap::map(&file)? };
         let bad = |m: &str| io::Error::new(ErrorKind::InvalidData, m.to_owned());
+        let file = open_regular(path)?;
+        let file_len = file.metadata()?.len();
+        if file_len < FILE_HEADER_LEN as u64 {
+            return Err(bad("pixel file too short"));
+        }
+        // SAFETY: the file is shared with its writer; this map is only read through raw
+        // pointers and the seqlock below, never as a Rust slice that could change under it. A
+        // peer that truncates the file is handled in `read_inner` (see the type's docs).
+        let map = unsafe { Mmap::map(&file)? };
         if map.len() < FILE_HEADER_LEN {
             return Err(bad("pixel file too short"));
         }
@@ -2251,9 +2465,15 @@ impl FrameReader {
         if &magic != FRAME_MAGIC || version != 1 || format != FORMAT_RGBA8_SRGB {
             return Err(bad("not a v1 RGBA8 pixel file"));
         }
-        if !(1..=MAX_SLOTS).contains(&slots)
-            || u64::from(stride) < u64::from(width) * 4
-            || slot_sz < slot_layout(stride, 0, height).1
+        if !(1..=MAX_SLOTS).contains(&slots) {
+            return Err(bad("inconsistent pixel file header: slots"));
+        }
+        if !(1..=MAX_FRAME_DIM).contains(&width) || !(1..=MAX_FRAME_DIM).contains(&height) {
+            return Err(bad("pixel file width or height outside 1..=16384"));
+        }
+        let colour_slot = slot_layout(stride, 0, height).map(|(_, size)| size);
+        if u64::from(stride) != u64::from(width) * 4
+            || colour_slot.is_none_or(|min| slot_sz < min)
             || slot_sz % 64 != 0
         {
             return Err(bad("inconsistent pixel file header"));
@@ -2285,6 +2505,7 @@ impl FrameReader {
             return Err(bad("pixel file shorter than its header says"));
         }
         Ok(Self {
+            file,
             map,
             slots,
             width,
@@ -2328,7 +2549,20 @@ impl FrameReader {
         if ready.slot >= self.slots || ready.width > self.width || ready.height > self.height {
             return Err(FrameMiss::OutOfRange);
         }
-        let base = FILE_HEADER_LEN + (self.slot_size * u64::from(ready.slot)) as usize;
+        // The peer must not shrink its file; if it did, touching the map would fault.
+        if self
+            .file
+            .metadata()
+            .map_or(true, |m| m.len() < self.map.len() as u64)
+        {
+            return Err(FrameMiss::Gone);
+        }
+        let base = self
+            .slot_size
+            .checked_mul(u64::from(ready.slot))
+            .and_then(|n| n.checked_add(FILE_HEADER_LEN as u64))
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or(FrameMiss::OutOfRange)?;
         let ptr = self.map.as_ptr();
         let lock = lock_at(ptr, base);
         let l1 = lock.load(Ordering::Acquire);
@@ -2967,6 +3201,7 @@ mod tests {
         }
         // A valid header that claims more slots than the file holds. The writer's file is copied
         // and cut short, since Windows refuses to resize a file while it is mapped.
+        let _ = std::fs::remove_file(&path); // a sender never reuses a path
         let valid = {
             let w = FrameWriter::create(&path, 4, 4, 2).unwrap();
             std::fs::read(w.path()).unwrap()

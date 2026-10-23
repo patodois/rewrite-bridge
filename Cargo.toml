@@ -15,9 +15,13 @@ members = ["rewrite-bridge-bevy"]
 memmap2 = { version = "0.9", optional = true }
 serde_json = { version = "1", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# O_NONBLOCK and setsockopt (SO_RCVBUF) for the link; memmap2 already brings libc in on Unix.
+libc = { version = "0.2", optional = true }
+
 [features]
 # The passthrough link (docs/CONTRACT.md): UDP + TCP on 127.0.0.1 and a memory-mapped pixel file.
-link = ["dep:memmap2", "dep:serde_json"]
+link = ["dep:memmap2", "dep:serde_json", "dep:libc"]
 
 # The worked example of docs/WRITING_A_PROVIDER.md; `test = true` makes `cargo test` run its tests.
 [[example]]
@@ -34,4 +38,8 @@ required-features = ["link"]
 
 [[test]]
 name = "link_loopback"
+required-features = ["link"]
+
+[[test]]
+name = "link_review"
 required-features = ["link"]

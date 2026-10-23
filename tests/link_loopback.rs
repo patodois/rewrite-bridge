@@ -110,7 +110,18 @@ fn handshake_then_every_message() {
         (cam, cam_seq, hp.session)
     );
 
-    // Spawn and 250 poses (three datagrams), guest to host.
+    // Spawn 250 entities (poses of an entity that was never spawned are ignored) and send their
+    // poses (three datagrams), guest to host.
+    for entity in (0..250).filter(|&e| e != 1) {
+        p.guest
+            .spawn(&Spawn {
+                entity,
+                provider: "Warframe".into(),
+                asset: "/Lotus/Demo".into(),
+                name: None,
+            })
+            .unwrap();
+    }
     p.guest
         .spawn(&Spawn {
             entity: 1,
@@ -327,6 +338,13 @@ fn a_foreign_guest_built_from_the_contract() {
     assert_eq!(v.protocol, 1);
     assert_eq!(host.peer().unwrap().game, "SKSE plugin");
     assert_eq!(host.peer().unwrap().session, v.session);
+
+    // Poses are ignored until their entity is spawned.
+    writeln!(
+        writer,
+        r#"{{"type":"spawn","entity":42,"provider":"SKSE","asset":"npc"}}"#
+    )
+    .unwrap();
 
     let host_udp = ("127.0.0.1", v.udp_port);
     let mut dg = Vec::new();

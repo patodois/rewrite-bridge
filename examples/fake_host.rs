@@ -6,7 +6,10 @@
 //! win. Run `fake_guest --frames` against it.
 //!
 //! cargo run --release --features link --example fake_host -- [--port 47800] [--seconds 10]
-//!     [--dump DIR [--dump-every 25] [--dump-max 6]] [--stats-every 10]
+//!     [--dump DIR [--dump-every 25] [--dump-max 6]] [--stats-every 10] [--big-collision CHUNKS]
+//!
+//! `--big-collision N` sends a snapshot of N full chunks (N * 226 triangles) each second instead of
+//! the small ground patch, to exercise the sender's pacing and the guest's reassembly.
 
 #[path = "common/raster.rs"]
 mod raster;
@@ -90,6 +93,7 @@ fn main() -> std::io::Result<()> {
     let dump_every: u32 = arg("--dump-every").unwrap_or(25);
     let dump_max: u32 = arg("--dump-max").unwrap_or(6);
     let stats_every: u32 = arg("--stats-every").unwrap_or(10);
+    let big_collision: Option<usize> = arg("--big-collision");
     if let Some(dir) = &dump {
         std::fs::create_dir_all(dir)?;
     }
@@ -202,13 +206,21 @@ fn main() -> std::io::Result<()> {
                 // A flat 20 x 20 m ground of 1 m quads around the camera: 800 triangles, 4 chunks.
                 let eye = camera.eye();
                 let (cx, cz) = (eye[0].round(), eye[2].round());
-                let mut tris = Vec::new();
+                let mut tris: Vec<Triangle> = Vec::new();
                 for i in -10..10 {
                     for j in -10..10 {
                         let (x, z) = (cx + i as f32, cz + j as f32);
                         tris.push([[x, 0.0, z], [x, 0.0, z + 1.0], [x + 1.0, 0.0, z + 1.0]]);
                         tris.push([[x, 0.0, z], [x + 1.0, 0.0, z + 1.0], [x + 1.0, 0.0, z]]);
                     }
+                }
+                if let Some(chunks) = big_collision {
+                    tris = (0..chunks * MAX_TRIANGLES)
+                        .map(|i| {
+                            let x = (i % 4096) as f32;
+                            [[x, 0.0, 0.0], [x + 1.0, 0.0, 0.0], [x, 0.0, 1.0]]
+                        })
+                        .collect();
                 }
                 let _ = link.send_collision([cx, 0.0, cz], 10.0, &tris);
             }
