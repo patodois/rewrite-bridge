@@ -15,7 +15,7 @@ reads or writes another process's memory, injects code, or touches anti-cheat.
 |---|---|---|---|
 | control | TCP, `127.0.0.1` | JSON lines (UTF-8) | `hello`, `spawn`, `despawn`, `input`, `frame_channel`, `bye` |
 | state | UDP, `127.0.0.1` | binary, little-endian | `Heartbeat`, `Camera`, `Pose`, `Collision`, `Frame` |
-| pixels | memory-mapped file | binary, little-endian | RGBA frames announced by `Frame` |
+| pixels | memory-mapped file | binary, little-endian | RGBA frames, optional linear depth, announced by `Frame` |
 
 Who sends what:
 
@@ -297,6 +297,10 @@ present as possible, so the guest renders with the camera the host will actually
 Metal); `2` = reversed, near 1 and far 0 (Bevy's default and many D3D engines). Other values are
 malformed.
 
+`proj` is the projection with +y up in normalized device coordinates: pixel row 0 of an image
+rendered with it is NDC y = +1, whatever the host's graphics API does to its own framebuffer (a host
+whose API flips Y flips it back before sending). Section 9.7 relies on this to reproject frames.
+
 Offsets in this table and the following ones are relative to the payload, which starts at byte
 24 of the datagram.
 
@@ -349,8 +353,8 @@ collision set only once every chunk of a newer query has arrived.
 
 ### 9.6 Frame (kind 5), 24-byte payload, 48-byte datagram, and the pixel file
 
-The sender renders, reads the image back to the CPU, writes it into a slot of the pixel file
-announced by `frame_channel`, then sends `Frame`:
+The sender renders, reads the image back to the CPU (and, if the file has a depth plane, the depth
+too), writes it into a slot of the pixel file announced by `frame_channel`, then sends `Frame`:
 
 | Offset | Size | Type | Field | Meaning |
 |---|---|---|---|---|
@@ -360,7 +364,8 @@ announced by `frame_channel`, then sends `Frame`:
 | 16 | 4 | u32 | `width` | pixels |
 | 20 | 4 | u32 | `height` | pixels |
 
-`camera_seq` lets the host pair the pixels with the camera (and the poses) they were rendered for.
+`camera_seq` lets the host pair the pixels with the camera (and the poses) they were rendered for;
+section 9.7 says how it uses them to hide latency.
 
 **Pixel file.** A regular file in the sender's temp directory, created and sized by the sender,
 mapped read-write by the sender and read-only by the receiver. Layout:
@@ -376,11 +381,14 @@ File header, 64 bytes:
 | 20 | 4 | u32 | `height` | pixels, maximum per slot |
 | 24 | 4 | u32 | `stride` | bytes per row, `width * 4` |
 | 28 | 4 | u32 | `format` | `1` = RGBA8, sRGB, straight (not premultiplied) alpha, rows top to bottom |
-| 32 | 8 | u64 | `slot_size` | bytes per slot including its header, a multiple of 64 |
-| 40 | 24 | | `reserved` | |
+| 32 | 8 | u64 | `slot_size` | bytes per slot including its header and depth plane, a multiple of 64 |
+| 40 | 4 | u32 | `depth_format` | `0` = no depth plane; `1` = `f32` linear view depth in metres (below); other values are malformed |
+| 44 | 4 | u32 | `depth_stride` | bytes per depth row, `width * 4`; `0` when there is no depth plane |
+| 48 | 8 | u64 | `depth_offset` | byte offset of the depth plane from the start of the slot: a multiple of 64 and at least `64 + stride * height`; `0` when there is no depth plane |
+| 56 | 8 | | `reserved` | |
 
 Slot `i` starts at `64 + i * slot_size`. Slot header, 64 bytes, followed by `stride * height`
-pixel bytes:
+pixel bytes and, when `depth_format` is `1`, the depth plane at `depth_offset`:
 
 | Offset | Size | Type | Field | Meaning |
 |---|---|---|---|---|
@@ -392,23 +400,64 @@ pixel bytes:
 | 32 | 4 | u32 | `height` | pixels used, `<=` file height |
 | 36 | 28 | | `reserved` | |
 | 64 | | u8[] | pixels | `stride * height` bytes |
+| `depth_offset` | | f32[] | depth | `depth_stride * height` bytes, only if `depth_format` is `1` |
+
+```
+slot start  +0              slot header           64 bytes
+            +64             colour rows           stride * height
+            +depth_offset   depth rows            depth_stride * height   (depth_format 1 only)
+```
+
+With `depth_format` `0`, `slot_size` is `64 + stride * height` rounded up to a multiple of 64 and
+bytes 40 to 63 of the file header are zero: the file is exactly what revisions 1 and 2 wrote. With
+`depth_format` `1`, a writer sets `depth_stride = width * 4`, `depth_offset = 64 + stride * height`
+rounded up to a multiple of 64, and `slot_size = depth_offset + depth_stride * height` rounded up
+to a multiple of 64. (Receivers read the three values from the header and do not recompute them.)
+
+**Depth plane.** `depth_format` `1` means one little-endian `f32` per pixel: the **linear view
+depth in metres**, the distance of the surface along the camera's forward axis, that is `-z` in
+view space (section 4), so it is positive in front of the camera. It is not the distance to the
+eye, and it does not depend on the camera's projection, depth range or near and far planes, so a
+guest and a host built on different engines read it the same way. `+inf`, or any other non-finite
+value, means "nothing here". Rows run top to bottom like the colour, row `y` starts at
+`depth_offset + y * depth_stride`, and only the first `width` values of a row, with `width` and
+`height` from the slot header, are used; the rest is padding. Pixels whose alpha is 0 are empty
+whatever their depth; a writer should still store `+inf` there. Colour and depth belong to one
+frame: the seqlock below covers both, there is no second counter, and a writer with a depth plane
+writes depth with every frame, so a slot never holds the colour of one frame and the depth of
+another.
+
+The `Camera` that the frame was rendered with is the one named by `camera_seq`. Section 9.7 says
+how the depth is converted to and from a depth buffer and how the host reprojects and composites.
 
 `lock` is 8-byte aligned in the file and must be accessed with atomic 64-bit operations.
 
 Writer:
 1. Store `lock + 1` (now odd), then issue a release fence
    (`std::atomic_thread_fence(std::memory_order_release)`).
-2. Write the slot header fields and the pixels.
+2. Write the slot header fields, the pixels and, if the file has one, the depth plane.
 3. Store `lock + 1` again (even), with release ordering.
 4. Send the `Frame` datagram.
 
 Reader, on a `Frame` datagram:
 1. `l1 = lock` (acquire). If `l1` is odd, skip this frame.
-2. Copy the header fields and pixels out.
+2. Copy the header fields, the pixels and the depth plane (if wanted) out.
 3. Acquire fence, then `l2 = lock`. If `l2 != l1` or the copied `frame` is not the datagram's
    `frame`, the slot was overwritten while copying: discard the copy and wait for the next frame.
 
 With 3 or more slots the writer rarely reaches the slot being read.
+
+**Compatibility and checks.** The depth fields use bytes that revisions 1 and 2 reserved, and
+`slot_size` grows to make room, so older readers keep working: they read the header fields they
+know, find slot `i` by `slot_size`, and read the colour as before, never looking at the reserved
+bytes. A reader that wants depth checks, before using the file, that `depth_format` is `0` or `1`
+and, for `1`, that `depth_stride` is `width * 4`, `depth_offset` is a multiple of 64 and at least
+`64 + stride * height`, the plane `depth_offset + depth_stride * height` ends within `slot_size`, and
+the file is at least `64 + slots * slot_size` bytes long (compute in 64 bits, or check for
+overflow). A file that fails any of these, or whose `depth_format` the reader does not know, is
+malformed and the reader refuses it. With `depth_format` `0` the reader ignores `depth_stride` and
+`depth_offset`. A reader that does not use depth at all may skip these checks, as a revision 2
+reader does.
 
 The sender deletes the file at the end of the session; a receiver never deletes it, and unmaps and
 closes it when the session ends or a new `frame_channel` replaces it. On Windows:
@@ -423,6 +472,86 @@ closes it when the session ends or a new `frame_channel` replaces it. On Windows
 
 A sender that crashes leaves its file behind. Names should contain the sender's process id, so a
 later run can tell its own files from a dead process's.
+
+### 9.7 Depth, reprojection and compositing
+
+This is how a receiver (normally the host) turns a guest's frame, colour and depth, into pixels of
+its own image. The wire does not change: it uses the pixel file of section 9.6 and the `camera_seq`
+that `Frame` already carries. The steps below are what a receiver **should** do; a receiver that
+skips them still works, it just pastes the guest's image over its own, as before revision 3.
+
+The Rust crate's `link::compose` module is a reference implementation on the CPU. It is meant for
+testing and small images; an engine does the same on the GPU.
+
+Conventions: pixel `(0, 0)` is the top-left corner and a pixel's centre is at `(x + 0.5, y + 0.5)`.
+NDC has +x to the right and +y up (section 9.3), so `ndc_x = (x + 0.5) / width * 2 - 1` and
+`ndc_y = 1 - (y + 0.5) / height * 2`.
+
+**Depth buffer to linear metres.** A host has its scene depth in a depth buffer in the convention
+of its `Camera.depth_range`, and needs it in linear metres to compare it with the guest's. Let `n`
+be `near`, `f` be `far`, `d` the value in the convention of `depth_range` (section 9.3) and `t` the linear
+depth in metres. For a perspective projection with `w_clip = -z_view`:
+
+| `depth_range` | `d` of a surface `t` metres away | `t` from `d` | infinite `far`: `d` | infinite `far`: `t` |
+|---|---|---|---|---|
+| 0, near -1, far +1 | `(f+n)/(f-n) - 2fn/((f-n)t)` | `2fn / ((f+n) - d(f-n))` | `1 - 2n/t` | `2n/(1-d)` |
+| 1, near 0, far 1 | `f(t-n) / (t(f-n))` | `fn / (f - d(f-n))` | `1 - n/t` | `n/(1-d)` |
+| 2, near 1, far 0 | `n(f-t) / (t(f-n))` | `nf / (n + d(f-n))` | `n/t` | `n/d` |
+
+For range 0, `d` is NDC `z`, in `-1 ..= 1`. An OpenGL depth buffer stores `(z + 1) / 2`, so convert
+first (`d = 2 * stored - 1`). These formulas are the inverse of the projection's depth row, which
+for a perspective projection built from `near` and `far` is `z_clip = a * z_view + b` with:
+
+| `depth_range` | `a` | `b` | `a`, `b` with infinite `far` |
+|---|---|---|---|
+| 0 | `(f+n)/(n-f)` | `2fn/(n-f)` | `-1`, `-2n` |
+| 1 | `f/(n-f)` | `fn/(n-f)` | `-1`, `-n` |
+| 2 | `n/(f-n)` | `nf/(f-n)` | `0`, `n` |
+
+(`d = z_clip / w_clip` and `w_clip = -z_view = t`.) A value that gives no positive finite `t`, a
+cleared buffer for instance (`d = 0` in range 2, or `d = 1` with an infinite `far` in ranges 0 and
+1), means "nothing here": `t = +inf`. Compute in a wider type than `f32` where you can, since
+depth values close to 1 resolve distant surfaces coarsely in ranges 0 and 1. For an orthographic
+projection depth is already linear in the buffer and the host converts it with its own matrix.
+
+**Reprojection.** The guest renders with a `Camera` the host sent and puts that datagram's header
+`seq` in `Frame.camera_seq`. The host keeps the cameras it sent in a small ring keyed by `seq`, say
+the last 16. To present a frame it looks up `camera_seq` and reprojects the guest image from that
+render camera to the camera it is presenting now, which is newer, so the guest's image is shifted by
+the host's own motion in the meantime and only the guest's own animation shows the delay. For each
+non-empty guest pixel, with linear depth `t`:
+
+1. Unproject with the render camera: the view-space point is `(x_v, y_v, -t)`, where for a centred
+   perspective projection `x_v = ndc_x * t / proj[0]` and `y_v = ndc_y * t / proj[5]` (for any
+   other projection, solve the first two rows of `proj` for `x_v` and `y_v` given `w_clip` and
+   `z_v = -t`). Then `p_world = inverse(view_render) * (x_v, y_v, -t, 1)`.
+2. Project with the present camera: `p' = view_present * p_world`, `t' = -p'.z` (skip the pixel if
+   `t' <= 0`), `clip = proj_present * p'`, `ndc = clip.xy / clip.w`, window position
+   `((ndc_x + 1) / 2 * W, (1 - ndc_y) / 2 * H)`.
+3. Write the colour and `t'` into the destination pixel (or pixels: a pixel's footprint may cover
+   several), keeping the smaller `t'` where two land on one.
+
+Destination pixels nothing landed on are **holes**: transparent, depth `+inf` (the guest never saw
+what a disocclusion reveals, and the old view does not cover the whole new one). Anything that
+depends on the viewpoint inside the guest's shading, such as reflections, is not corrected. If
+`camera_seq` is 0, or not in the ring, the host composites without reprojection, as if the guest
+had rendered with the current camera.
+
+**Compositing.** For each pixel the host compares the guest's linear depth `t_g`, after
+reprojection, with its own scene depth `t_h` converted to linear metres, and the nearer one wins:
+
+- a guest pixel takes part if its alpha is above 0 and `t_g` is finite and positive;
+- it covers the host's pixel if `t_g < t_h` (a non-finite `t_h` means the host drew nothing there);
+  equal depths go to the host;
+- where it covers, the result is the straight-alpha "over": `rgb = g * a + h * (1 - a)`, with the
+  colours as the file carries them (sRGB-encoded; an engine may convert to linear light first);
+- otherwise the host's pixel is kept.
+
+This is occlusion both ways: a wall 5 m from the camera hides a guest object 8 m away, and a guest
+object 3 m away covers the wall. A guest that sends no depth (`depth_format` `0`) is pasted over the
+host's image, nothing can hide it and it cannot hide anything.
+
+To tell how stale a frame is, compare the present time with the slot's `time_us` (section 5).
 
 ## 10. C layouts
 
@@ -441,6 +570,7 @@ check that.
 
 enum rbl_kind { RBL_HEARTBEAT = 1, RBL_CAMERA = 2, RBL_POSE = 3, RBL_COLLISION = 4, RBL_FRAME = 5 };
 enum rbl_depth_range { RBL_DEPTH_NEG_ONE_TO_ONE = 0, RBL_DEPTH_ZERO_TO_ONE = 1, RBL_DEPTH_REVERSED = 2 };
+enum rbl_depth_format { RBL_DEPTH_NONE = 0, RBL_DEPTH_LINEAR_F32 = 1 };  /* pixel file depth_format */
 #define RBL_POSE_TELEPORT  1u
 
 typedef struct rbl_header {      /* 24 bytes, offset 0 of every datagram */
@@ -511,10 +641,14 @@ typedef struct rbl_frame_file {  /* 64 bytes at offset 0 of the pixel file */
     uint32_t stride;             /* 24 */
     uint32_t format;             /* 28 */
     uint64_t slot_size;          /* 32 */
-    uint8_t  reserved[24];       /* 40 */
+    uint32_t depth_format;       /* 40, rbl_depth_format; 0 in revision 1 and 2 files */
+    uint32_t depth_stride;       /* 44, width * 4, or 0 */
+    uint64_t depth_offset;       /* 48, from the slot start, multiple of 64, or 0 */
+    uint8_t  reserved[8];        /* 56 */
 } rbl_frame_file;
 
-typedef struct rbl_frame_slot {  /* 64 bytes at 64 + i * slot_size, pixels follow */
+typedef struct rbl_frame_slot {  /* 64 bytes at 64 + i * slot_size; pixels follow, then
+                                    the f32 depth plane at depth_offset, if the file has one */
     uint64_t lock;               /*  0, atomic */
     uint64_t frame;              /*  8 */
     uint64_t time_us;            /* 16 */
@@ -558,7 +692,17 @@ control lines, send `Heartbeat` when `heartbeat_ms` has passed, and check the wa
 - v1, revision 2: section 6.1 (half-close and drain after `bye`; a received `bye` wins over a
   following reset) and the Windows file-sharing rules for the pixel file. No layout or message
   changed, so the protocol version stays 1.
+- v1, revision 3: the pixel file can carry a depth plane next to the colour (section 9.6:
+  `depth_format`, `depth_stride` and `depth_offset` in file header bytes 40 to 55, `slot_size`
+  grown to cover the plane), and section 9.7 says how a receiver reprojects a frame with the
+  `camera_seq` it already has and composites it with a depth test. Section 9.3 now says that
+  `proj` is +y up in NDC. No message and no existing field changed, so the protocol version stays
+  1: the new fields sit in bytes that revisions 1 and 2 reserved (written as zero, ignored on
+  read) and zero keeps the old meaning, `slot_size` is what readers already use to find slots, so a
+  revision 1 or 2 reader reads the colour of a depth file as before, and a file without depth is
+  byte for byte what revision 2 wrote.
 
 A change that alters any layout or meaning above needs a new protocol version. Adding a control
 message type or field, or a new datagram `kind`, does not, because receivers ignore what they do
-not know.
+not know. Neither does giving a meaning to `reserved` bytes, as revision 3 does, as long as zero
+keeps the old meaning.
