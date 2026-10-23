@@ -159,53 +159,126 @@ pub fn subtree(model: &rb::Model, node: usize) -> Vec<bool> {
     inside
 }
 
+/// A unit quaternion from a bridge rotation. A zero (or non-finite) quaternion, which `validate` rejects but a
+/// hand-built model can still carry, would normalize to NaN and poison every matrix below it: it is the identity here.
+fn unit_rotation(q: [f32; 4]) -> Quat {
+    let quat = Quat::from_array(q);
+    let len = quat.length();
+    if len.is_finite() && len > 1e-6 {
+        quat * (1.0 / len)
+    } else {
+        warn!("a rotation {q:?} cannot be normalized; using the identity");
+        Quat::IDENTITY
+    }
+}
+
 /// The local transform of a node
 pub fn node_transform(node: &rb::Node) -> Transform {
     Transform {
         translation: Vec3::from(node.translation),
-        rotation: Quat::from_array(node.rotation).normalize(),
+        rotation: unit_rotation(node.rotation),
         scale: Vec3::from(node.scale),
     }
 }
 
-/// Every node's rest transform in model space (relative to the model's root)
+/// Every node's rest transform in model space (relative to the model's root). A parent that does not come
+/// before its child (a model `validate` rejects) is ignored: the node is a root.
 pub fn rest_globals(model: &rb::Model) -> Vec<Mat4> {
     let mut out: Vec<Mat4> = Vec::with_capacity(model.nodes.len());
-    for n in &model.nodes {
+    for (i, n) in model.nodes.iter().enumerate() {
         let local = node_transform(n).to_matrix();
-        out.push(n.parent.map_or(local, |p| out[p] * local));
+        let parent = match n.parent {
+            Some(p) if p < i => Some(out[p]),
+            Some(p) => {
+                warn!(
+                    "{}: node {i} ({}) has parent {p}, which does not come before it; treated as a root",
+                    model.name, n.name
+                );
+                None
+            }
+            None => None,
+        };
+        out.push(parent.map_or(local, |g| g * local));
     }
     out
 }
 
 /// Where a mesh's vertices are in model space with every node at rest: rigid meshes go through their
-/// node's transform, skinned meshes through their joints (as Bevy's skinning does)
+/// node's transform, skinned meshes through their joints (as Bevy's skinning does).
+///
+/// Never panics on a model `validate` would reject (a node, joint or inverse-bind index out of range, joint
+/// and weight arrays that do not match the positions): such a mesh is skipped with a warning and gives no
+/// vertices.
 pub fn rest_positions(model: &rb::Model, mesh: &rb::Mesh, globals: &[Mat4]) -> Vec<Vec3> {
     match mesh.skin.and_then(|s| model.skins.get(s)) {
         Some(skin) => {
-            let joint: Vec<Mat4> = skin
-                .joints
-                .iter()
-                .zip(&skin.inverse_bind)
-                .map(|(&node, ib)| globals[node] * Mat4::from_cols_array(ib))
-                .collect();
-            mesh.positions
+            if skin.joints.len() != skin.inverse_bind.len()
+                || mesh.joints.len() != mesh.positions.len()
+                || mesh.weights.len() != mesh.positions.len()
+            {
+                warn!(
+                    "{}: mesh {} has {} positions, {} joint sets, {} weight sets and a skin with {} joints and {} inverse binds; skipped",
+                    model.name,
+                    mesh.name,
+                    mesh.positions.len(),
+                    mesh.joints.len(),
+                    mesh.weights.len(),
+                    skin.joints.len(),
+                    skin.inverse_bind.len()
+                );
+                return Vec::new();
+            }
+            let mut joint: Vec<Mat4> = Vec::with_capacity(skin.joints.len());
+            for (&node, ib) in skin.joints.iter().zip(&skin.inverse_bind) {
+                let Some(g) = globals.get(node) else {
+                    warn!(
+                        "{}: a skin joint is node {node}, past the model's {} nodes; mesh {} skipped",
+                        model.name,
+                        globals.len(),
+                        mesh.name
+                    );
+                    return Vec::new();
+                };
+                joint.push(*g * Mat4::from_cols_array(ib));
+            }
+            let mut out = Vec::with_capacity(mesh.positions.len());
+            for (&p, (j, w)) in mesh
+                .positions
                 .iter()
                 .zip(mesh.joints.iter().zip(&mesh.weights))
-                .map(|(&p, (j, w))| {
-                    let p = Vec3::from(p);
-                    let mut sum = Vec3::ZERO;
-                    for k in 0..4 {
-                        if w[k] > 0.0 {
-                            sum += w[k] * joint[usize::from(j[k])].transform_point3(p);
-                        }
+            {
+                let p = Vec3::from(p);
+                let mut sum = Vec3::ZERO;
+                for k in 0..4 {
+                    if w[k] > 0.0 {
+                        let Some(m) = joint.get(usize::from(j[k])) else {
+                            warn!(
+                                "{}: mesh {} binds a vertex to joint {}, but the skin has {}; skipped",
+                                model.name,
+                                mesh.name,
+                                j[k],
+                                joint.len()
+                            );
+                            return Vec::new();
+                        };
+                        sum += w[k] * m.transform_point3(p);
                     }
-                    sum
-                })
-                .collect()
+                }
+                out.push(sum);
+            }
+            out
         }
         None => {
-            let m = globals[mesh.node];
+            let Some(m) = globals.get(mesh.node) else {
+                warn!(
+                    "{}: mesh {} sits on node {}, past the model's {} nodes; skipped",
+                    model.name,
+                    mesh.name,
+                    mesh.node,
+                    globals.len()
+                );
+                return Vec::new();
+            };
             mesh.positions
                 .iter()
                 .map(|&p| m.transform_point3(Vec3::from(p)))
@@ -308,6 +381,18 @@ fn linear_to_srgb(c: f32) -> u8 {
 /// level with an odd size repeats its last row or column). Colour channels of sRGB images are
 /// averaged in linear light, alpha always linearly.
 pub fn mip_chain(width: u32, height: u32, rgba: &[u8], srgb: bool) -> Vec<Vec<u8>> {
+    // An empty image has no levels, and one whose pixels are fewer than its size says would index past the end
+    // (both are images `validate` rejects, but this is a public function)
+    let needed = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(4));
+    if width == 0 || height == 0 || needed.is_none_or(|n| rgba.len() < n) {
+        warn!(
+            "mip_chain: a {width}x{height} image with {} bytes has no mip levels",
+            rgba.len()
+        );
+        return Vec::new();
+    }
     let decode: Vec<f32> = (0..=255u8)
         .map(|v| {
             if srgb {
@@ -491,7 +576,8 @@ pub fn spawn_model_owned(
 
     let mut nodes: Vec<Entity> = Vec::with_capacity(model.nodes.len());
     for (i, n) in model.nodes.iter().enumerate() {
-        let parent = n.parent.map_or(root, |p| nodes[p]);
+        // Parents come first (`validate` checks it); a parent that does not is ignored rather than indexed
+        let parent = n.parent.and_then(|p| nodes.get(p).copied()).unwrap_or(root);
         nodes.push(
             commands
                 .spawn((
@@ -520,7 +606,9 @@ pub fn spawn_model_owned(
     let globals = rest_globals(&model);
     let mut mirrored: Vec<Option<Handle<StandardMaterial>>> = vec![None; materials.len()];
 
-    let skins: Vec<SkinnedMesh> = model
+    // A skin whose joints do not name nodes of the model, or that has no inverse bind for a joint, cannot be
+    // built; it is `None` and the meshes bound to it are skipped (`validate` rejects such models)
+    let skins: Vec<Option<SkinnedMesh>> = model
         .skins
         .iter()
         .map(|s| {
@@ -531,13 +619,24 @@ pub fn spawn_model_owned(
                     s.joints.len()
                 );
             }
+            if s.joints.len() != s.inverse_bind.len() || s.joints.iter().any(|&j| j >= nodes.len())
+            {
+                warn!(
+                    "{}: a skin with {} joints and {} inverse binds does not fit the model's {} nodes; its meshes are skipped",
+                    model.name,
+                    s.joints.len(),
+                    s.inverse_bind.len(),
+                    nodes.len()
+                );
+                return None;
+            }
             let ibm: Vec<Mat4> = s.inverse_bind.iter().map(Mat4::from_cols_array).collect();
-            SkinnedMesh {
+            Some(SkinnedMesh {
                 inverse_bindposes: assets
                     .inverse_bindposes
                     .add(SkinnedMeshInverseBindposes::from(ibm)),
                 joints: s.joints.iter().map(|&j| nodes[j]).collect(),
-            }
+            })
         })
         .collect();
 
@@ -545,7 +644,27 @@ pub fn spawn_model_owned(
     for mesh in std::mem::take(&mut model.meshes) {
         let tangents_needed = normal_mapped.get(mesh.material).copied().unwrap_or(false);
         let (name, node, material) = (mesh.name.clone(), mesh.node, mesh.material);
-        let skin = mesh.skin.and_then(|s| skins.get(s));
+        let skin = mesh
+            .skin
+            .and_then(|s| skins.get(s))
+            .and_then(Option::as_ref);
+        // A mesh that names a node, a material or a skin the model does not have cannot be drawn. Skip it
+        // with a warning, but keep an (empty) entity so `SpawnedModel::meshes` stays one per model mesh.
+        if node >= nodes.len()
+            || material >= materials.len()
+            || (mesh.skin.is_some() && skin.is_none())
+        {
+            warn!(
+                "{}: mesh {name} uses node {node}, material {material} and skin {:?}, which the model ({} nodes, {} materials, {} skins) does not have; skipped",
+                model.name,
+                mesh.skin,
+                nodes.len(),
+                materials.len(),
+                skins.len()
+            );
+            meshes.push(commands.spawn((Name::new(name), ChildOf(root))).id());
+            continue;
+        }
         let mut bevy_mesh = into_bevy_mesh(mesh, tangents_needed, options.usage);
         if skin.is_some() && options.skinned_bounds == SkinnedBounds::Dynamic {
             if let Err(e) = bevy_mesh.generate_skinned_mesh_bounds() {
@@ -594,12 +713,58 @@ pub fn spawn_model_owned(
     }
 }
 
+/// Whether the affine matrix `m` shears: its linear part is not a rotation times a scale (its columns are not
+/// pairwise perpendicular), so no [`Transform`] can hold it. A parent scaled `[2, 1, 1]` over a child turned 45
+/// degrees is the usual way to get one.
+fn has_shear(m: &Mat4) -> bool {
+    let (a, b, c) = (
+        m.x_axis.truncate(),
+        m.y_axis.truncate(),
+        m.z_axis.truncate(),
+    );
+    let skew =
+        |u: Vec3, v: Vec3| u.dot(v).abs() > 1e-4 * u.length() * v.length().max(f32::MIN_POSITIVE);
+    skew(a, b) || skew(a, c) || skew(b, c)
+}
+
+/// Puts the matrix `m` into the mesh's vertices: positions go through it, normals through its inverse transpose,
+/// tangents through its linear part. A matrix that mirrors (negative determinant) also turns the triangles round,
+/// and the tangents' handedness over, so the mesh needs no mirrored material. Returns false, leaving the mesh as it
+/// was, when `m` cannot be inverted (a zero scale).
+fn bake_matrix(mesh: &mut rb::Mesh, m: Mat4) -> bool {
+    let lin = Mat3::from_mat4(m);
+    let det = lin.determinant();
+    if !det.is_finite() || det.abs() < 1e-12 {
+        return false;
+    }
+    let normal = lin.inverse().transpose();
+    for p in &mut mesh.positions {
+        *p = m.transform_point3(Vec3::from(*p)).to_array();
+    }
+    for n in &mut mesh.normals {
+        *n = (normal * Vec3::from(*n)).normalize_or_zero().to_array();
+    }
+    let handedness = if det < 0.0 { -1.0 } else { 1.0 };
+    for t in &mut mesh.tangents {
+        let v = (lin * Vec3::new(t[0], t[1], t[2])).normalize_or_zero();
+        *t = [v.x, v.y, v.z, t[3] * handedness];
+    }
+    if det < 0.0 {
+        let (triangles, _) = mesh.indices.as_chunks_mut::<3>();
+        for tri in triangles {
+            tri.swap(1, 2);
+        }
+    }
+    true
+}
+
 /// One mesh of a static model, uploaded once, to be placed any number of times
 #[derive(Clone, Debug)]
 pub struct MeshPart {
     pub mesh: Handle<Mesh>,
     pub material: Handle<StandardMaterial>,
-    /// The mesh's node at rest, in the model's space (the identity for single-node models)
+    /// The mesh's node at rest, in the model's space (the identity for single-node models, and for a node
+    /// whose matrix shears, which [`prepare_parts`] bakes into the mesh because a `Transform` cannot hold it)
     pub transform: Transform,
 }
 
@@ -629,16 +794,34 @@ pub fn prepare_parts(
             continue;
         }
         let (node, material) = (mesh.node, mesh.material);
+        let (Some(&at), Some(material_handle)) = (globals.get(node), materials.get(material))
+        else {
+            warn!(
+                "{}: mesh {} uses node {node} and material {material}, which the model ({} nodes, {} materials) does not have; skipped",
+                model.name,
+                mesh.name,
+                globals.len(),
+                materials.len()
+            );
+            continue;
+        };
         let tangents_needed = normal_mapped.get(material).copied().unwrap_or(false);
-        let transform = if globals[node].abs_diff_eq(Mat4::IDENTITY, 1e-6) {
+        let mut mesh = mesh;
+        let transform = if at.abs_diff_eq(Mat4::IDENTITY, 1e-6) {
+            Transform::IDENTITY
+        } else if has_shear(&at) && bake_matrix(&mut mesh, at) {
+            // A `Transform` is translation, rotation and scale: a node under a non-uniformly scaled parent and
+            // turned itself is not (the matrix shears), and `Transform::from_matrix` would quietly draw
+            // another shape. `spawn_model` keeps the node hierarchy, whose global transforms are full matrices;
+            // here the matrix goes into the vertices instead, so both draw the same.
             Transform::IDENTITY
         } else {
-            Transform::from_matrix(globals[node])
+            Transform::from_matrix(at)
         };
         let bevy_mesh = into_bevy_mesh(mesh, tangents_needed, options.usage);
         parts.push(MeshPart {
             mesh: assets.meshes.add(bevy_mesh),
-            material: materials[material].clone(),
+            material: material_handle.clone(),
             transform,
         });
     }
@@ -677,7 +860,7 @@ pub fn mirrored_material(
 pub fn instance_transform(t: &rb::Transform) -> Transform {
     Transform {
         translation: Vec3::from(t.translation),
-        rotation: Quat::from_array(t.rotation).normalize(),
+        rotation: unit_rotation(t.rotation),
         scale: Vec3::from(t.scale),
     }
 }
@@ -1055,6 +1238,275 @@ mod tests {
             is_mirrored(Vec3::new(-1.0, 1.0, 1.0))
                 && !is_mirrored(Vec3::new(-1.0, -1.0, 1.0))
                 && is_mirrored(Vec3::NEG_ONE)
+        );
+    }
+
+    // ----------------------------------------------------------------- review fixes (H2, M13)
+
+    /// A parent scaled [2, 1, 1] over a child turned 45 degrees about +Z: the child's matrix shears
+    fn sheared_model() -> rb::Model {
+        let mut parent = rb::Node::new("parent", None);
+        parent.scale = [2.0, 1.0, 1.0];
+        let mut child = rb::Node::new("child", Some(0));
+        child.translation = [1.0, 0.5, 0.0];
+        let half = std::f32::consts::FRAC_PI_8; // 45 degrees is a half angle of 22.5
+        child.rotation = [0.0, 0.0, half.sin(), half.cos()];
+        rb::Model {
+            name: "sheared".into(),
+            nodes: vec![parent, child],
+            meshes: vec![rb::Mesh {
+                name: "m".into(),
+                node: 1,
+                positions: vec![
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [1.0, 1.0, 0.5],
+                ],
+                normals: vec![[0.0, 0.0, 1.0]; 4],
+                indices: vec![0, 1, 2, 1, 3, 2],
+                ..default()
+            }],
+            materials: vec![rb::Material::default()],
+            skins: vec![],
+        }
+    }
+
+    fn mesh_world_points(app: &App, e: Entity) -> Vec<Vec3> {
+        let world = app.world();
+        let mesh = world
+            .resource::<Assets<Mesh>>()
+            .get(&world.get::<Mesh3d>(e).unwrap().0)
+            .unwrap();
+        let positions = mesh
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .and_then(|v| v.as_float3())
+            .unwrap();
+        let g = world.get::<GlobalTransform>(e).unwrap();
+        positions
+            .iter()
+            .map(|&p| g.transform_point(Vec3::from(p)))
+            .collect()
+    }
+
+    /// M13: a model drawn through `spawn_scene` (parts) and through `spawn_model` (the node hierarchy) must put
+    /// every vertex in the same place. A parent scaled [2, 1, 1] over a child turned 45 degrees shears the child's
+    /// matrix, which `Transform::from_matrix` (a flattened part transform) cannot hold.
+    #[test]
+    fn spawn_scene_and_spawn_model_place_a_sheared_node_alike() {
+        use crate::scene::{spawn_scene, NoSource};
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            bevy::transform::TransformPlugin,
+        ));
+        app.init_asset::<Mesh>()
+            .init_asset::<StandardMaterial>()
+            .init_asset::<Image>()
+            .init_asset::<SkinnedMeshInverseBindposes>();
+        let model = sheared_model();
+        assert!(
+            has_shear(&rest_globals(&model)[1]),
+            "the test needs a shearing matrix"
+        );
+
+        let spawned = app
+            .world_mut()
+            .run_system_once({
+                let model = model.clone();
+                move |mut commands: Commands, mut assets: BridgeAssets| {
+                    spawn_model(&mut commands, &mut assets, &model, &SpawnOptions::default())
+                }
+            })
+            .unwrap();
+        let scene = rb::Scene {
+            name: "s".into(),
+            models: vec![rb::SceneModel::Inline(model.clone())],
+            instances: vec![rb::Instance::new(
+                0,
+                rb::Transform::from_translation([0.0; 3]),
+            )],
+            ..default()
+        };
+        let scene_spawned = app
+            .world_mut()
+            .run_system_once(move |mut commands: Commands, mut assets: BridgeAssets| {
+                spawn_scene(
+                    &mut commands,
+                    &mut assets,
+                    scene.clone(),
+                    &NoSource,
+                    &SpawnOptions::default(),
+                )
+                .unwrap()
+            })
+            .unwrap();
+        app.update();
+
+        let via_model = mesh_world_points(&app, spawned.meshes[0]);
+        let instance = scene_spawned.instances[0];
+        let part_entity = if app.world().get::<Mesh3d>(instance).is_some() {
+            instance
+        } else {
+            app.world().get::<Children>(instance).unwrap()[0]
+        };
+        let via_scene = mesh_world_points(&app, part_entity);
+        assert_eq!(via_model.len(), via_scene.len());
+        for (a, b) in via_model.iter().zip(&via_scene) {
+            assert!(a.distance(*b) < 1e-5, "{a} against {b}");
+        }
+        // The expected positions are the matrix product, not what a flattened Transform draws
+        let globals = rest_globals(&model);
+        let expected: Vec<Vec3> = model.meshes[0]
+            .positions
+            .iter()
+            .map(|&p| globals[1].transform_point3(Vec3::from(p)))
+            .collect();
+        for (a, b) in via_scene.iter().zip(&expected) {
+            assert!(a.distance(*b) < 1e-5, "{a} against {b}");
+        }
+        let flattened = Transform::from_matrix(globals[1]);
+        let off: f32 = model.meshes[0]
+            .positions
+            .iter()
+            .zip(&expected)
+            .map(|(&p, e)| flattened.transform_point(Vec3::from(p)).distance(*e))
+            .fold(0.0, f32::max);
+        assert!(
+            off > 0.05,
+            "a flattened Transform would be off by {off}: the test would not catch the bug"
+        );
+        // And a node without shear is still a part transform, not baked into the mesh
+        let mut plain = sheared_model();
+        plain.nodes[0].scale = [2.0, 2.0, 2.0];
+        let parts = app
+            .world_mut()
+            .run_system_once(move |mut assets: BridgeAssets| {
+                prepare_parts(&mut assets, plain.clone(), &SpawnOptions::default())
+            })
+            .unwrap();
+        assert_ne!(parts[0].transform, Transform::IDENTITY);
+    }
+
+    #[test]
+    fn baking_a_mirroring_matrix_turns_the_triangles_and_the_tangent_handedness() {
+        let mut mesh = rb::Mesh {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            tangents: vec![[1.0, 0.0, 0.0, 1.0]; 3],
+            indices: vec![0, 1, 2],
+            ..default()
+        };
+        // mirror x, scale y by 3, and turn: a mirror with shear
+        let m = Mat4::from_rotation_z(0.6) * Mat4::from_scale(Vec3::new(-2.0, 3.0, 1.0));
+        assert!(bake_matrix(&mut mesh, m));
+        assert_eq!(mesh.indices, vec![0, 2, 1]);
+        assert_eq!(mesh.tangents[0][3], -1.0);
+        let n = Vec3::from(mesh.normals[0]);
+        assert!(
+            (n.length() - 1.0).abs() < 1e-5 && n.dot(Vec3::Z) > 0.99,
+            "{n}"
+        );
+        // a matrix that cannot be inverted is left alone
+        let before = mesh.positions.clone();
+        assert!(!bake_matrix(
+            &mut mesh,
+            Mat4::from_scale(Vec3::new(1.0, 0.0, 1.0))
+        ));
+        assert_eq!(mesh.positions, before);
+    }
+
+    /// H2: the consumers never panic on a model `validate` would reject
+    #[test]
+    fn consumers_skip_what_validate_would_reject() {
+        // a joint node past the model
+        let mut m = model();
+        m.skins[0].joints[0] = 99;
+        assert!(m.validate().is_err());
+        let globals = rest_globals(&m);
+        assert!(rest_positions(&m, &m.meshes[1], &globals).is_empty());
+        let (lo, hi) = rest_bounds(&m).expect("the rigid mesh still has bounds");
+        assert!(lo.is_finite() && hi.is_finite());
+
+        // a vertex bound to a joint the skin does not have, joint and inverse-bind counts that differ, short weight arrays
+        let mut m = model();
+        m.meshes[1].joints[0] = [9, 0, 0, 0];
+        m.meshes[1].weights[0] = [1.0, 0.0, 0.0, 0.0];
+        assert!(rest_positions(&m, &m.meshes[1], &rest_globals(&m)).is_empty());
+        let mut m = model();
+        m.skins[0].inverse_bind.pop();
+        assert!(rest_positions(&m, &m.meshes[1], &rest_globals(&m)).is_empty());
+        let mut m = model();
+        m.meshes[1].weights.pop();
+        assert!(rest_positions(&m, &m.meshes[1], &rest_globals(&m)).is_empty());
+
+        // a rigid mesh on a node that is not there
+        let mut m = model();
+        m.meshes[0].node = 99;
+        assert!(rest_positions(&m, &m.meshes[0], &rest_globals(&m)).is_empty());
+        assert!(rest_bounds(&m).is_some());
+
+        // a zero (or NaN) rotation stays finite; a parent that does not come first is a root
+        let mut m = model();
+        m.nodes[1].rotation = [0.0; 4];
+        assert_eq!(node_transform(&m.nodes[1]).rotation, Quat::IDENTITY);
+        assert!(rest_globals(&m).iter().all(|g| g.is_finite()));
+        m.nodes[1].rotation = [f32::NAN, 0.0, 0.0, 1.0];
+        assert!(node_transform(&m.nodes[1]).rotation.is_finite());
+        m.nodes[0].parent = Some(1);
+        assert!(rest_globals(&m).iter().all(|g| g.is_finite()));
+        let inst = instance_transform(&rb::Transform {
+            rotation: [0.0; 4],
+            ..rb::Transform::from_translation([1.0, 2.0, 3.0])
+        });
+        assert_eq!(inst.rotation, Quat::IDENTITY);
+
+        // mip_chain on an empty image, and on pixels fewer than the size says
+        assert!(mip_chain(0, 4, &[], true).is_empty());
+        assert!(mip_chain(4, 0, &[], false).is_empty());
+        assert!(mip_chain(0, 0, &[], true).is_empty());
+        assert!(mip_chain(2, 2, &[0; 7], true).is_empty());
+        assert!(mip_chain(u32::MAX, u32::MAX, &[0; 4], true).is_empty());
+        let levels = mip_chain(2, 2, &[255; 16], true);
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0], vec![255; 4]);
+    }
+
+    #[test]
+    fn spawning_a_model_with_dangling_indices_does_not_panic() {
+        let mut world = World::new();
+        world.init_resource::<Assets<Mesh>>();
+        world.init_resource::<Assets<StandardMaterial>>();
+        world.init_resource::<Assets<Image>>();
+        world.init_resource::<Assets<SkinnedMeshInverseBindposes>>();
+        let mut m = model();
+        m.nodes[1].parent = Some(7); // a parent that is not there
+        m.meshes[0].node = 99;
+        m.meshes[1].material = 9;
+        m.skins[0].joints[1] = 50;
+        let n_meshes = m.meshes.len();
+        let for_parts = m.clone();
+        let spawned = world
+            .run_system_once(move |mut commands: Commands, mut assets: BridgeAssets| {
+                spawn_model(&mut commands, &mut assets, &m, &SpawnOptions::default())
+            })
+            .unwrap();
+        // one entity per mesh, as ever, the broken ones empty
+        assert_eq!(spawned.meshes.len(), n_meshes);
+        assert!(world.get::<Mesh3d>(spawned.meshes[0]).is_none());
+        assert!(world.get::<Mesh3d>(spawned.meshes[1]).is_none());
+        let mut only_rigid = for_parts;
+        only_rigid.meshes.truncate(1);
+        only_rigid.skins.clear();
+        let parts = world
+            .run_system_once(move |mut assets: BridgeAssets| {
+                prepare_parts(&mut assets, only_rigid.clone(), &SpawnOptions::default())
+            })
+            .unwrap();
+        assert!(
+            parts.is_empty(),
+            "the mesh on a node that is not there is skipped"
         );
     }
 }
