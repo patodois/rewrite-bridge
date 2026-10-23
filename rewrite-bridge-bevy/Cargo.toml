@@ -1,0 +1,43 @@
+[package]
+name = "rewrite-bridge-bevy"
+version = "0.1.0"
+edition = "2021"
+description = "Bevy plugin that spawns rewrite-bridge models, skins, animations and scenes from any game rewrite's provider"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/patodois/rewrite-bridge"
+keywords = ["bevy", "gamedev", "assets", "rewrite"]
+categories = ["game-development"]
+
+[dependencies]
+rewrite-bridge = { path = "..", version = "0.1.0" }
+
+[dependencies.bevy]
+version = "0.20"
+default-features = false
+features = [
+    "std",
+    "bevy_asset",
+    "bevy_log",
+    "bevy_color",
+    "bevy_image",
+    "bevy_mesh",
+    "bevy_mikktspace",
+    "bevy_animation",
+    "bevy_curve",
+    "bevy_camera",
+    "bevy_light",
+    "bevy_render",
+    "bevy_pbr",
+]
+
+[features]
+# What the viewer example needs to render off screen. The library itself needs none of it, so
+# depending on it pulls in no windowing, audio or gamepad code.
+viewer = ["bevy/bevy_core_pipeline", "bevy/bevy_window", "bevy/png", "bevy/multi_threaded", "bevy/async_executor"]
+# ... and to open a window
+window = ["viewer", "bevy/bevy_winit", "bevy/x11", "bevy/wayland"]
+
+[[example]]
+name = "viewer"
+required-features = ["viewer"]

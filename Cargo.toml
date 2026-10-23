@@ -6,6 +6,11 @@ description = "Common model types and a provider trait so game rewrites can load
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 
+[workspace]
+# The core crate stays the root package, so `cargo test` here (and a git dependency on this repo)
+# still sees only it; the Bevy plugin is a separate member with its own, much larger, dependencies.
+members = ["rewrite-bridge-bevy"]
+
 [dependencies]
 memmap2 = { version = "0.9", optional = true }
 serde_json = { version = "1", optional = true }
