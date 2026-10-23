@@ -2600,13 +2600,14 @@ mod tests {
             std::fs::write(&path, &junk).unwrap();
             assert!(FrameReader::open(&path).is_err());
         }
-        // A valid header that claims more slots than the file holds.
-        {
+        // A valid header that claims more slots than the file holds. The writer's file is copied
+        // and cut short, since Windows refuses to resize a file while it is mapped.
+        let valid = {
             let w = FrameWriter::create(&path, 4, 4, 2).unwrap();
-            let f = OpenOptions::new().write(true).open(w.path()).unwrap();
-            f.set_len(100).unwrap();
-            assert!(FrameReader::open(w.path()).is_err());
-        }
+            std::fs::read(w.path()).unwrap()
+        };
+        std::fs::write(&path, &valid[..100]).unwrap();
+        assert!(FrameReader::open(&path).is_err());
         let _ = std::fs::remove_file(&path);
     }
 }
