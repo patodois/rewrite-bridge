@@ -19,7 +19,8 @@ its own mistakes before a renderer does. Animation, scenes and attachment points
 [below](#animation-scenes-and-attachment-points).
 
 The crate has no dependencies and reads no game files. Providers read the player's own
-installation, and no game data is ever part of this project.
+installation, and no game data is ever part of this project. Renderers get their own crates: the
+Bevy plugin is [`rewrite-bridge-bevy`](rewrite-bridge-bevy), described [below](#using-it-in-bevy).
 
 ## Adding your game
 
@@ -128,6 +129,49 @@ impl Provider for MyGame {
         Ok(scene)
     }
 }
+```
+
+## Using it in Bevy
+
+[`rewrite-bridge-bevy`](rewrite-bridge-bevy) is a Bevy 0.20 plugin that loads what any provider returns:
+models with skins, animations with sockets, and scenes. A Rust game rewrite needs a few lines:
+
+```toml
+[dependencies]
+rewrite-bridge = { git = "https://github.com/patodois/rewrite-bridge" }
+rewrite-bridge-bevy = { git = "https://github.com/patodois/rewrite-bridge" }
+```
+
+```rust
+use bevy::prelude::*;
+use rewrite_bridge::Provider;
+use rewrite_bridge_bevy::*;
+
+fn setup(mut bridge: Bridge, game: Res<Game>) {   // `Game` wraps any `Provider`
+    // A character: entities per node, skinned meshes, PBR materials, clips and sockets
+    let robot = bridge.spawn_animated(game.0.load_animated("robot").unwrap());
+    // A level: instances share one mesh and one material per model, lights are physical
+    let yard = bridge.spawn_scene(
+        game.0.load_scene("yard").unwrap(),
+        &Providers::new(game.0.as_ref()), // loads the scene's `SceneModel::Asset` references
+    ).unwrap();
+}
+
+fn play(mut players: Query<(&BridgeAnimations, &mut AnimationPlayer), Added<BridgeAnimations>>) {
+    for (clips, mut player) in &mut players {
+        clips.play(&mut player, "walk").unwrap().repeat();
+    }
+}
+```
+
+Add `RewriteBridgePlugin::default()` next to `DefaultPlugins`. Nothing is converted on the way in, as
+Bevy follows glTF too. Lux and candela become Bevy's lux and lumens (candela times 4π), emissive is
+`factor * strength`, and the sky goes through the camera's exposure; the
+[crate's README](rewrite-bridge-bevy/README.md) has the formulas, the Bevy features it asks for (no audio,
+no gamepad) and a viewer example that runs off screen with no game files:
+
+```sh
+cargo run --release -p rewrite-bridge-bevy --example viewer --features viewer -- --screenshot out.png
 ```
 
 ## Passthrough link
