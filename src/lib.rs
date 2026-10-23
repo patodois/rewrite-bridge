@@ -12,14 +12,92 @@
 //!
 //! Nothing here reads game files, and no game data belongs in this crate.
 //!
+//! Beyond static models there are, all additive and all in the same conventions (seconds for time,
+//! quaternions as x, y, z, w):
+//!
+//! - [`Animation`] clips, kept next to a model in an [`AnimatedModel`] together with its
+//!   [`Socket`]s (named attachment points) and optional per-material emissive strengths;
+//! - a [`Scene`]: models (inline, or by asset id to load lazily) placed many times as
+//!   [`Instance`]s, with optional [`Light`]s and an [`Environment`].
+//!
+//! A provider returns them from [`Provider::load_animated`] and [`Provider::load_scene`], which
+//! have defaults so providers written before they existed keep compiling and working:
+//!
+//! ```
+//! use rewrite_bridge::{
+//!     Animation, AnimatedModel, AssetInfo, AssetKind, AssetRef, BoxError, Channel, Instance,
+//!     Interpolation, Model, Node, Provider, Scene, SceneModel, Socket, Target, Transform,
+//! };
+//!
+//! struct MyGame;
+//!
+//! impl Provider for MyGame {
+//!     fn game(&self) -> &str { "My Game" }
+//!     fn list(&self, _filter: &str) -> Result<Vec<AssetInfo>, BoxError> {
+//!         Ok(vec![AssetInfo { id: "robot".into(), name: "Robot".into(), kind: AssetKind::Character }])
+//!     }
+//!     // The plain model keeps working for consumers that know nothing about clips.
+//!     fn load(&self, id: &str) -> Result<Model, BoxError> {
+//!         Ok(self.load_animated(id)?.model)
+//!     }
+//!     fn load_animated(&self, _id: &str) -> Result<AnimatedModel, BoxError> {
+//!         let mut robot = AnimatedModel::new(Model {
+//!             name: "robot".into(),
+//!             nodes: vec![Node::new("root", None), Node::new("hand", Some(0))],
+//!             ..Model::default()
+//!         });
+//!         robot.animations.push(Animation {
+//!             name: "reach".into(),
+//!             duration_s: 1.0,
+//!             channels: vec![Channel::new(
+//!                 1, Target::Translation, Interpolation::Linear,
+//!                 vec![0.0, 1.0],                   // seconds
+//!                 vec![0.0, 0.0, 0.0, 0.0, 0.5, 0.0], // x, y, z in metres per keyframe
+//!             )],
+//!         });
+//!         robot.sockets.push(Socket::new("grip", 1, Transform::IDENTITY));
+//!         robot.validate()?;
+//!         Ok(robot)
+//!     }
+//!     fn load_scene(&self, _id: &str) -> Result<Scene, BoxError> {
+//!         let scene = Scene {
+//!             name: "yard".into(),
+//!             models: vec![SceneModel::Asset(AssetRef::local("robot"))],
+//!             // Two robots, one model: loaded once, drawn twice.
+//!             instances: vec![
+//!                 Instance::new(0, Transform::from_translation([0.0, 0.0, 0.0])),
+//!                 Instance::new(0, Transform::from_translation([3.0, 0.0, 0.0])),
+//!             ],
+//!             ..Scene::default()
+//!         };
+//!         scene.validate()?;
+//!         Ok(scene)
+//!     }
+//! }
+//!
+//! let game = MyGame;
+//! assert_eq!(game.load_animated("robot").unwrap().animations.len(), 1);
+//! assert_eq!(game.load_scene("yard").unwrap().instances.len(), 2);
+//! ```
+//!
 //! With the `link` feature, the `link` module adds a passthrough channel: two processes on
 //! 127.0.0.1 exchange camera, poses, collision and frames as described in `docs/CONTRACT.md`.
 
 use std::error::Error;
 use std::fmt;
 
+pub mod animated;
+pub mod animation;
+pub mod scene;
+pub mod transform;
+
 #[cfg(feature = "link")]
 pub mod link;
+
+pub use animated::{AnimatedModel, Socket};
+pub use animation::{Animation, Channel, Interpolation, Target};
+pub use scene::{AssetRef, Environment, Instance, Light, LightKind, Scene, SceneModel};
+pub use transform::{Transform, QUATERNION_TOLERANCE};
 
 /// Errors from providers, boxed so each game reader can keep its own error type.
 pub type BoxError = Box<dyn Error + Send + Sync>;
@@ -34,7 +112,46 @@ pub trait Provider {
 
     /// Loads one asset by the id [`Provider::list`] gave for it.
     fn load(&self, id: &str) -> Result<Model, BoxError>;
+
+    /// Loads one asset with its animation clips, attachment points and emissive strengths.
+    ///
+    /// The default wraps [`Provider::load`] with none of those, so existing providers need not
+    /// change. A provider that overrides this should keep `load(id)` equal to
+    /// `load_animated(id)?.model`, so consumers that only know about models see the same asset.
+    fn load_animated(&self, id: &str) -> Result<AnimatedModel, BoxError> {
+        self.load(id).map(AnimatedModel::from)
+    }
+
+    /// Loads a scene (a level) by id. Ids of levels are the ones [`Provider::list`] gives, usually
+    /// with [`AssetKind::Level`]; the provider decides which of its assets are scenes.
+    ///
+    /// The default returns [`NotSupported`], which callers can find with
+    /// `err.downcast_ref::<NotSupported>()` to tell "this game has no scenes" from a real failure.
+    fn load_scene(&self, id: &str) -> Result<Scene, BoxError> {
+        let _ = id;
+        Err(Box::new(NotSupported {
+            game: self.game().to_string(),
+            what: "scenes".to_string(),
+        }))
+    }
 }
+
+/// What the default [`Provider::load_scene`] returns: the provider does not offer this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotSupported {
+    /// [`Provider::game`] of the provider that said no.
+    pub game: String,
+    /// What was asked for, e.g. "scenes".
+    pub what: String,
+}
+
+impl fmt::Display for NotSupported {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {} not supported", self.game, self.what)
+    }
+}
+
+impl Error for NotSupported {}
 
 /// One entry of a provider's listing.
 #[derive(Clone, Debug, PartialEq)]
@@ -57,7 +174,10 @@ pub enum AssetKind {
 }
 
 /// A model: a node hierarchy with meshes hung on it, their materials, and optional skins.
-#[derive(Clone, Debug, Default)]
+///
+/// Animation clips, attachment points and emissive strengths are not here but in
+/// [`AnimatedModel`], next to the model, so this struct can stay as it is.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Model {
     pub name: String,
     /// Parents always come before their children.
@@ -92,7 +212,7 @@ impl Node {
 
 /// A triangle list with one material. Optional attributes are empty when the source has none;
 /// when present they have one entry per position.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Mesh {
     pub name: String,
     /// The node the mesh is attached to. Ignored for skinned meshes, which follow their joints.
@@ -111,7 +231,7 @@ pub struct Mesh {
 }
 
 /// Bones of a skinned mesh: the nodes it follows and their inverse bind matrices.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Skin {
     pub joints: Vec<usize>,
     /// Column-major 4x4 matrices, one per joint.
@@ -119,7 +239,7 @@ pub struct Skin {
 }
 
 /// A metallic-roughness PBR material.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Material {
     pub name: String,
     pub base_color: Option<Image>,
@@ -131,6 +251,15 @@ pub struct Material {
     pub normal: Option<Image>,
     pub emissive: Option<Image>,
     /// Multiplies `emissive`, linear RGB; may exceed 1.
+    ///
+    /// Units: relative, scene-referred radiance, the way glTF leaves it. 1.0 is reference white,
+    /// i.e. as bright as an unlit white surface looks on an SDR display; values above 1 are the
+    /// HDR range that bloom and tone mapping work with. It is not photometric: a renderer in
+    /// physical units picks its own nits per 1.0 (HDR reference white is 203 cd/m² in ITU-R
+    /// BT.2408), and lights, which are photometric (see [`Scene`]), are balanced against it by
+    /// the renderer's exposure. The emissive image is sRGB; the light out is
+    /// `emissive_factor * image` (times `emissive_strength`, if the model has one, see
+    /// [`AnimatedModel::emissive_strength`]).
     pub emissive_factor: [f32; 3],
     pub alpha: AlphaMode,
     pub double_sided: bool,
