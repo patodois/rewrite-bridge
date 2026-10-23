@@ -11,9 +11,15 @@
 //! - normal maps are tangent-space with +Y (green) pointing up the texture, OpenGL style.
 //!
 //! Nothing here reads game files, and no game data belongs in this crate.
+//!
+//! With the `link` feature, the `link` module adds a passthrough channel: two processes on
+//! 127.0.0.1 exchange camera, poses, collision and frames as described in `docs/CONTRACT.md`.
 
 use std::error::Error;
 use std::fmt;
+
+#[cfg(feature = "link")]
+pub mod link;
 
 /// Errors from providers, boxed so each game reader can keep its own error type.
 pub type BoxError = Box<dyn Error + Send + Sync>;

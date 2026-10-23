@@ -7,3 +7,21 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 
 [dependencies]
+memmap2 = { version = "0.9", optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+# The passthrough link (docs/CONTRACT.md): UDP + TCP on 127.0.0.1 and a memory-mapped pixel file.
+link = ["dep:memmap2", "dep:serde_json"]
+
+[[example]]
+name = "fake_host"
+required-features = ["link"]
+
+[[example]]
+name = "fake_guest"
+required-features = ["link"]
+
+[[test]]
+name = "link_loopback"
+required-features = ["link"]
