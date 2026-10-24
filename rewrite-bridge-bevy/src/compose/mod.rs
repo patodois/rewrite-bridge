@@ -40,7 +40,8 @@
 //!                                          | extract (Arc clones)
 //!                                          v
 //!                                       upload colour (Rgba8Uint) + depth (R32Float) textures once per frame
-//!                                       per camera with GuestCompose, after the main pass and tonemapping:
+//!                                       for the one camera with GuestCompose, after the main pass, before
+//!                                       tonemapping, FXAA, SMAA and sharpening:
 //!                                         [reproject: 3 compute passes]  warp the frame from the camera
 //!                                                                        named by camera_seq to this view
 //!                                         [composite: 1 fullscreen pass] guest vs the camera's own depth
@@ -49,9 +50,10 @@
 //! # What the host's camera has to be
 //!
 //! - **A perspective camera whose projection is a plain `clip_from_view`** (Bevy's default reversed,
-//!   infinite or finite). An orthographic camera is left alone with a warning, since the host depth
-//!   buffer cannot be turned into the linear metres the contract compares (it says the host does that
-//!   with its own matrix).
+//!   infinite or finite). An orthographic camera, and a perspective one with an oblique near plane
+//!   (`near_clip_plane`, whose depth row varies across the picture), are left alone with a warning:
+//!   the host depth buffer cannot be turned into the linear metres the contract compares by one
+//!   formula (the contract says an orthographic host does that with its own matrix).
 //! - **`Msaa::Off`.** With MSAA the camera's depth buffer has several samples per pixel, and which to
 //!   compare against is not something the contract settles.
 //! - **A low-dynamic-range camera** (no [`Hdr`](bevy::camera::Hdr)): the target holds display values and
@@ -62,8 +64,41 @@
 //! - Anything that does not write depth (alpha-blended materials, for instance) neither hides the guest
 //!   nor is hidden by it where it is in front: only what is in the depth buffer takes part.
 //!
+//! - **One composited camera.** See [`GuestCompose`]: with several, the one with the lowest `order`.
+//!
 //! [`GuestCompose`] adds the one thing Bevy needs to make the depth buffer readable
 //! (`TextureUsages::TEXTURE_BINDING`) to the camera's `Camera3d` by itself.
+//!
+//! # Where in the frame, and what it does to the guest
+//!
+//! The pass runs in `Core3dSystems::EarlyPostProcess`: after the main pass, before tonemapping (a no-op
+//! for the low-dynamic-range cameras this accepts), and so before FXAA, SMAA and contrast-adaptive
+//! sharpening, which run after tonemapping. That treats the guest as scene content, like the host's own
+//! geometry: its edges are anti-aliased against the host's and sharpening sees both. The contract does
+//! not say either way (it composites into "the host's own image"); the other choice would leave the
+//! guest's hard edges aliased and its bytes untouched. The reference's byte arithmetic is exact for what
+//! this pass writes; those later passes are the host's own image processing on top.
+//!
+//! # Numbers and limits worth knowing
+//!
+//! - **No maximum age.** A guest frame stays until the next one replaces it or the guest is lost
+//!   ([`GuestFrames::frame`]); the contract names no maximum age while the link is up, only how to
+//!   measure it ([`GuestFrame::age`]).
+//! - **Camera ring.** One host camera goes out per rendered frame (contract section 9.3), and a late frame
+//!   needs the camera it was rendered with for at least the last half second (section 9.7), so the ring is
+//!   counted in frames: [`DEFAULT_RING_CAPACITY`] is 256, half a second at 500 Hz (32 cover 133 ms at 240 Hz).
+//! - **Viewport sides up to 65535 pixels.** The reprojection packs a footprint's bounds as two 16-bit
+//!   numbers per axis; a larger viewport is skipped (the guest's frames are at most 16384 a side by the
+//!   contract). Frames and viewports that exceed the device's limits (texture size, storage buffer size,
+//!   workgroups) are skipped with a warning rather than resized, which would invent pixels; a device
+//!   without compute shaders or storage buffers turns compositing off with a warning at start.
+//! - **Infinite far plane.** [`host_camera`] reads a projection whose depth row has `|a| < 1e-12` (the
+//!   `a` of `z_clip = a * z_view + b`) as an infinite far plane, `near = b`: Bevy's default builds `a`
+//!   as exactly 0.
+//! - **Stand-in depth.** A frame without a depth plane that has to be resampled (its size differs from the
+//!   view's) is warped as if every pixel were 1.0 m away, in the shaders and in the reference's terms
+//!   (`depth = 1`); the number only has to be finite and positive because the render camera is the
+//!   present camera, where depth cancels, and the depth test is off for such a frame.
 //!
 //! # What is left out
 //!
@@ -74,7 +109,8 @@
 //! - **A frame without depth into a differently sized view.** The contract pastes such a frame over the
 //!   host's image; for a size that does not match it says nothing, so the frame is resampled with the
 //!   reference's own rule for unmatched frames (render camera = present camera, see
-//!   `rewrite_bridge::link::compose::reproject`), with a stand-in depth that is never tested.
+//!   `rewrite_bridge::link::compose::reproject`), with the stand-in depth above.
+//! - **Several composited cameras at once**, since the link carries one host camera.
 
 #[cfg(all(test, feature = "viewer"))]
 mod app_tests;
@@ -88,20 +124,23 @@ use std::time::Duration;
 
 use bevy::camera::{Camera3d, Camera3dDepthTextureUsage};
 use bevy::core_pipeline::schedule::{Core3d, Core3dSystems};
-use bevy::core_pipeline::tonemapping::tonemapping;
 use bevy::log::warn_once;
 use bevy::math::{DMat4, Mat4};
 use bevy::prelude::*;
 use bevy::render::camera::ExtractedCamera;
 use bevy::render::extract_component::{ExtractComponent, ExtractComponentPlugin};
-use bevy::render::render_resource::{TextureFormat, TextureUsages};
-use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery};
+use bevy::render::render_resource::{DownlevelFlags, TextureFormat, TextureUsages};
+use bevy::render::renderer::{RenderAdapter, RenderContext, RenderDevice, RenderQueue, ViewQuery};
+use bevy::render::sync_world::MainEntity;
 use bevy::render::view::{ExtractedView, Msaa, ViewDepthStencilTexture, ViewTarget};
 use bevy::render::{Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems};
 use rewrite_bridge::link::compose::CameraRing;
 use rewrite_bridge::link::{now_us, Camera as HostCamera, DepthRange};
 
-pub use gpu::{host_depth_terms, ComposeParams, Engine, GuestGpu, WarpBuffers, WarpMatrices};
+pub use gpu::{
+    check_device, check_sizes, host_depth_terms, ComposeParams, Engine, GuestGpu, WarpBuffers,
+    WarpMatrices, MAX_VIEWPORT_SIDE,
+};
 pub use host_link::{HostLink, HostLinkPlugin, HostLinkStats};
 
 // ---------------------------------------------------------------------------------------------
@@ -163,6 +202,12 @@ impl GuestFrame {
     }
 }
 
+/// How many host cameras [`GuestFrames`] remembers by default: half a second (the least the contract
+/// asks for, section 9.7) at 500 Hz. The host sends one camera per rendered frame (section 9.3), so the
+/// ring has to be counted in frames, and 32 of them (the contract's figure for 60 Hz) cover only 222 ms
+/// at 144 Hz and 133 ms at 240 Hz. A camera is about 170 bytes; a lookup scans the ring once per frame.
+pub const DEFAULT_RING_CAPACITY: usize = 256;
+
 /// The main-world side: the newest guest frame and the ring of cameras the host sent, so a frame's
 /// `camera_seq` can be turned back into the camera it was rendered with.
 #[derive(Resource, Debug)]
@@ -170,21 +215,25 @@ pub struct GuestFrames {
     cameras: CameraRing,
     frame: Option<GuestFrame>,
     next_id: u64,
+    camera_entity: Option<Entity>,
 }
 
 impl Default for GuestFrames {
     fn default() -> Self {
-        Self::new(CameraRing::DEFAULT_CAPACITY)
+        Self::new(DEFAULT_RING_CAPACITY)
     }
 }
 
 impl GuestFrames {
-    /// Keeps the last `ring_capacity` cameras (the contract wants at least half a second: 32 at 60 Hz).
+    /// Keeps the last `ring_capacity` cameras. The contract wants at least the last half second, and the
+    /// host sends one per frame, so use at least half the refresh rate in frames
+    /// ([`DEFAULT_RING_CAPACITY`] covers 500 Hz).
     pub fn new(ring_capacity: usize) -> Self {
         Self {
             cameras: CameraRing::new(ring_capacity),
             frame: None,
             next_id: 1,
+            camera_entity: None,
         }
     }
 
@@ -196,12 +245,16 @@ impl GuestFrames {
 
     /// Makes `frame` the one to show, if it is newer than the current one *within its pixel file*; the
     /// caller decides that (frame numbers restart in a new file). Returns the stored frame's id.
-    pub fn set_frame(&mut self, mut frame: GuestFrame) -> u64 {
+    pub fn set_frame(&mut self, frame: GuestFrame) -> u64 {
+        self.replace_frame(frame).0
+    }
+
+    /// [`set_frame`](Self::set_frame), also handing back the frame it replaced (so its buffers can be reused).
+    pub fn replace_frame(&mut self, mut frame: GuestFrame) -> (u64, Option<GuestFrame>) {
         frame.id = self.next_id;
         self.next_id += 1;
         let id = frame.id;
-        self.frame = Some(frame);
-        id
+        (id, self.frame.replace(frame))
     }
 
     /// Stops showing a guest (it left, or its pixel file went away).
@@ -209,7 +262,9 @@ impl GuestFrames {
         self.frame = None;
     }
 
-    /// The frame being shown.
+    /// The frame being shown. It stays until another replaces it or the guest is lost: the contract names
+    /// no maximum age, so a guest that stops sending frames while the link is up leaves its last one on
+    /// screen (compare [`GuestFrame::age`] if you want to drop old ones with [`clear_frame`](Self::clear_frame)).
     pub fn frame(&self) -> Option<&GuestFrame> {
         self.frame.as_ref()
     }
@@ -222,6 +277,12 @@ impl GuestFrames {
     /// The cameras sent so far.
     pub fn cameras(&self) -> &CameraRing {
         &self.cameras
+    }
+
+    /// The one camera with [`GuestCompose`] that composites and whose view goes out to the guest (see
+    /// [`GuestCompose`] for how it is chosen when there are several). `None` until a frame has run.
+    pub fn compose_camera(&self) -> Option<Entity> {
+        self.camera_entity
     }
 }
 
@@ -262,7 +323,8 @@ pub fn view_matrix(world_from_view: &GlobalTransform) -> [f32; 16] {
 
 /// A Bevy camera as the contract's `Camera` (section 9.3): its view, its projection (Bevy's, reversed
 /// clip depth, `depth_range` 2, +y up in NDC as the contract requires), field of view, near and far,
-/// and the viewport in pixels. `far` is `+inf` for the infinite projection Bevy uses by default.
+/// and the viewport in pixels. `far` is `+inf` for the infinite projection Bevy uses by default (a depth
+/// row whose `a` is below 1e-12 in magnitude counts as infinite; Bevy's has exactly 0).
 pub fn host_camera(
     world_from_view: &GlobalTransform,
     clip_from_view: Mat4,
@@ -304,6 +366,12 @@ pub fn host_camera(
 
 /// On a [`Camera3d`]: composite the guest's frames into this camera's image. The camera should be
 /// `Msaa::Off` and not `Hdr` (see the module docs).
+///
+/// **One camera at a time.** The link carries a single host camera, so the guest renders for one view and
+/// a frame can be reprojected for that view only. With several `GuestCompose` cameras the plugin picks
+/// the active one with the lowest [`Camera::order`](bevy::camera::Camera::order) (the lowest entity on a
+/// tie), sends that one's view, composites into it, and leaves the others alone, with a warning once.
+/// The choice is [`GuestFrames::compose_camera`].
 #[derive(Component, ExtractComponent, Clone, Copy, Debug, PartialEq, Eq)]
 #[extract_app(RenderApp)]
 pub struct GuestCompose {
@@ -323,24 +391,26 @@ impl Default for GuestCompose {
 /// `DefaultPlugins` (it needs the render app).
 #[derive(Clone, Debug)]
 pub struct GuestComposePlugin {
-    /// How many host cameras to remember; see [`GuestFrames::new`].
+    /// How many host cameras to remember; see [`GuestFrames::new`] (default [`DEFAULT_RING_CAPACITY`]).
     pub ring_capacity: usize,
 }
 
 impl Default for GuestComposePlugin {
     fn default() -> Self {
         Self {
-            ring_capacity: CameraRing::DEFAULT_CAPACITY,
+            ring_capacity: DEFAULT_RING_CAPACITY,
         }
     }
 }
 
 impl Plugin for GuestComposePlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<GuestFrames>()
-            .insert_resource(GuestFrames::new(self.ring_capacity))
+        app.insert_resource(GuestFrames::new(self.ring_capacity))
             .add_plugins(ExtractComponentPlugin::<GuestCompose>::default())
-            .add_systems(PostUpdate, make_depth_readable);
+            .add_systems(
+                PostUpdate,
+                (make_depth_readable, choose_compose_camera).in_set(ComposeCameraSystems),
+            );
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
@@ -354,14 +424,16 @@ impl Plugin for GuestComposePlugin {
                     .chain()
                     .in_set(RenderSystems::Prepare),
             )
-            .add_systems(
-                Core3d,
-                compose_pass
-                    .in_set(Core3dSystems::PostProcess)
-                    .after(tonemapping),
-            );
+            // Before tonemapping, FXAA, SMAA and sharpening (all of which are in `PostProcess`, after
+            // tonemapping), so the guest is scene content for them: see the module docs.
+            .add_systems(Core3d, compose_pass.in_set(Core3dSystems::EarlyPostProcess));
     }
 }
+
+/// The systems that decide which camera composites ([`GuestFrames::compose_camera`]); anything that
+/// sends the camera to the guest runs after them (the [`HostLinkPlugin`] does).
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ComposeCameraSystems;
 
 /// The depth buffer of a [`Camera3d`] is only bindable (for the compositing pass to read it) if the
 /// camera asks for that.
@@ -375,6 +447,34 @@ fn make_depth_readable(mut cameras: Query<&mut Camera3d, With<GuestCompose>>) {
     }
 }
 
+/// Which of several `(entity, order)` candidates composites: the lowest `order`, the lowest entity index on
+/// a tie (the spawned-first one, in an app that does not recycle entities).
+pub fn pick_compose_camera(
+    candidates: impl IntoIterator<Item = (Entity, isize)>,
+) -> Option<Entity> {
+    candidates
+        .into_iter()
+        .min_by_key(|&(entity, order)| (order, entity.index_u32(), entity.generation().to_bits()))
+        .map(|(entity, _)| entity)
+}
+
+fn choose_compose_camera(
+    mut frames: ResMut<GuestFrames>,
+    cameras: Query<(Entity, &Camera), With<GuestCompose>>,
+) {
+    let active = || cameras.iter().filter(|(_, c)| c.is_active);
+    let chosen = pick_compose_camera(active().map(|(e, c)| (e, c.order)));
+    if active().count() > 1 {
+        warn_once!(
+            "GuestCompose is on several cameras; only the one with the lowest order composites and \
+             is sent to the guest (the link carries one host camera)"
+        );
+    }
+    if frames.camera_entity != chosen {
+        frames.camera_entity = chosen;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Render world
 
@@ -383,6 +483,8 @@ fn make_depth_readable(mut cameras: Query<&mut Camera3d, With<GuestCompose>>) {
 struct ComposeInput {
     frame: Option<GuestFrame>,
     render_camera: Option<HostCamera>,
+    /// The main-world entity of the camera that composites
+    camera: Option<Entity>,
 }
 
 fn extract_input(mut input: ResMut<ComposeInput>, frames: Extract<Res<GuestFrames>>) {
@@ -396,6 +498,7 @@ fn extract_input(mut input: ResMut<ComposeInput>, frames: Extract<Res<GuestFrame
         input.frame = frames.frame().cloned();
     }
     input.render_camera = frames.render_camera().copied();
+    input.camera = frames.compose_camera();
 }
 
 #[derive(Resource)]
@@ -404,7 +507,20 @@ struct ComposeGpu {
     guest: Option<GuestGpu>,
 }
 
-fn init_gpu(mut commands: Commands, device: Res<RenderDevice>) {
+/// Builds the pipelines, unless the device cannot run them: then compositing is off, with a warning, and
+/// the app runs on without it.
+fn init_gpu(
+    mut commands: Commands,
+    device: Res<RenderDevice>,
+    adapter: Option<Res<RenderAdapter>>,
+) {
+    let downlevel = adapter.map_or(DownlevelFlags::all(), |a| {
+        a.get_downlevel_capabilities().flags
+    });
+    if let Err(why) = check_device(&device.limits(), downlevel) {
+        warn!("GuestCompose is off: {why}");
+        return;
+    }
     commands.insert_resource(ComposeGpu {
         engine: Engine::new(&device),
         guest: None,
@@ -423,6 +539,12 @@ fn prepare_guest(
         gpu.guest = None;
         return;
     };
+    // The frame as it is or not at all: shrinking it to fit would invent pixels
+    if let Err(why) = check_sizes(&device.limits(), (frame.width, frame.height), (1, 1), false) {
+        warn_once!("GuestCompose: a guest frame is skipped: {why}");
+        gpu.guest = None;
+        return;
+    }
     if !gpu.guest.as_ref().is_some_and(|g| g.fits(frame)) {
         gpu.guest = Some(GuestGpu::new(
             &device,
@@ -455,6 +577,7 @@ fn prepare_views(
     device: Res<RenderDevice>,
     views: Query<(
         Entity,
+        &MainEntity,
         &GuestCompose,
         &ExtractedView,
         &ExtractedCamera,
@@ -470,7 +593,7 @@ fn prepare_views(
     }
     let Some(mut gpu) = gpu else { return };
     let gpu = &mut *gpu;
-    for (entity, settings, view, camera, target, depth, msaa, warp) in &views {
+    for (entity, main, settings, view, camera, target, depth, msaa, warp) in &views {
         let skip = |commands: &mut Commands| {
             commands.entity(entity).remove::<(ViewCompose, ViewWarp)>();
         };
@@ -478,6 +601,11 @@ fn prepare_views(
             skip(&mut commands);
             continue;
         };
+        // One camera composites (see `GuestCompose`): the one whose view the guest rendered for
+        if Some(main.id()) != input.camera {
+            skip(&mut commands);
+            continue;
+        }
         if camera.hdr {
             warn_once!("GuestCompose: an Hdr camera is left alone (see the compose module docs)");
             skip(&mut commands);
@@ -542,9 +670,17 @@ fn prepare_views(
             .filter(|_| settings.reproject && guest.has_depth());
         let same_camera =
             render_camera.is_none_or(|c| c.view == present_view && c.proj == present_proj);
-        let warp_matrices = if same_camera && guest_size == dst_size {
-            None
-        } else {
+        let needs_warp = !(same_camera && guest_size == dst_size);
+
+        // What the device can hold, for this frame in this viewport (shrinking a frame to fit would
+        // invent pixels, so a frame that does not fit is skipped)
+        if let Err(why) = check_sizes(&device.limits(), guest_size, dst_size, needs_warp) {
+            warn_once!("GuestCompose: a view is skipped: {why}");
+            skip(&mut commands);
+            continue;
+        }
+
+        let warp_matrices = if needs_warp {
             let (render_view, render_proj) = match render_camera {
                 Some(c) => (c.view, c.proj),
                 None => (present_view, present_proj),
@@ -559,6 +695,8 @@ fn prepare_views(
                 continue;
             };
             Some(m)
+        } else {
+            None
         };
 
         let params = ComposeParams {

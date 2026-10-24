@@ -10,13 +10,13 @@ use bevy::render::render_resource::{
     BindGroupEntry, BindGroupLayout, BindGroupLayoutEntry, BindingResource, BindingType, Buffer,
     BufferBinding, BufferBindingType, BufferDescriptor, BufferInitDescriptor, BufferUsages,
     ColorTargetState, ColorWrites, CommandEncoder, CommandEncoderDescriptor, ComputePassDescriptor,
-    ComputePipeline, Extent3d, LoadOp, Operations, Origin3d, PipelineLayoutDescriptor,
-    PrimitiveState, RawComputePipelineDescriptor, RawFragmentState, RawRenderPipelineDescriptor,
-    RawVertexState, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
-    ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, TexelCopyBufferLayout,
-    TexelCopyTextureInfo, Texture, TextureAspect, TextureDescriptor, TextureDimension,
-    TextureFormat, TextureSampleType, TextureUsages, TextureView, TextureViewDescriptor,
-    TextureViewDimension,
+    ComputePipeline, DownlevelFlags, Extent3d, LoadOp, Operations, Origin3d,
+    PipelineLayoutDescriptor, PrimitiveState, RawComputePipelineDescriptor, RawFragmentState,
+    RawRenderPipelineDescriptor, RawVertexState, RenderPassColorAttachment, RenderPassDescriptor,
+    RenderPipeline, ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp,
+    TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView,
+    TextureViewDescriptor, TextureViewDimension, WgpuLimits,
 };
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use rewrite_bridge::link::Camera;
@@ -651,8 +651,123 @@ fn params_buffer(device: &RenderDevice, params: &ComposeParams) -> Buffer {
 /// `d = b / t - a`, that is `t = b / (d + a)`. They are the depth row of a perspective
 /// `clip_from_view` (column-major, `w_clip = -z_view`): `z_clip = a * z_view + b`, so
 /// `d = z_clip / w_clip = -a + b / t`. For Bevy's reversed, infinite projection `a = 0` and
-/// `b = near`. `None` for a projection that is not perspective.
+/// `b = near`.
+///
+/// `None` unless the projection is a plain perspective one: `w_clip` must be `-z_view` (rows 3: elements
+/// 3, 7, 11 and 15), and the depth row must not depend on `x` or `y` (elements 2 and 6). An orthographic
+/// projection fails the first test; an oblique near-plane projection (Bevy's `near_clip_plane`, used for
+/// mirrors and portals) fails the second, since its depth then varies across the picture and no single
+/// `t = b / (d + a)` inverts it.
 pub fn host_depth_terms(proj: &[f32; 16]) -> Option<(f32, f32)> {
     let perspective = proj[3] == 0.0 && proj[7] == 0.0 && proj[11] == -1.0 && proj[15] == 0.0;
-    perspective.then(|| (proj[10], proj[14]))
+    let plain_depth_row = proj[2] == 0.0 && proj[6] == 0.0;
+    (perspective && plain_depth_row).then(|| (proj[10], proj[14]))
+}
+
+// ---------------------------------------------------------------------------------------------
+// What the device can do
+
+/// The largest side, in pixels, of the host viewport: reprojection packs a footprint's bounds as two
+/// 16-bit numbers per axis.
+pub const MAX_VIEWPORT_SIDE: u32 = 65535;
+
+/// Whether the device can run the compositing at all: three read-write and two read-only storage buffers
+/// in a shader stage, 8 x 8 compute workgroups, and compute shaders. `Err` says what is missing.
+pub fn check_device(limits: &WgpuLimits, downlevel: DownlevelFlags) -> Result<(), String> {
+    if !downlevel.contains(DownlevelFlags::COMPUTE_SHADERS) {
+        return Err("the adapter has no compute shaders".into());
+    }
+    if limits.max_storage_buffers_per_shader_stage < 3 {
+        return Err(format!(
+            "the device allows {} storage buffers per shader stage, the reprojection needs 3",
+            limits.max_storage_buffers_per_shader_stage
+        ));
+    }
+    if limits.max_compute_workgroup_size_x < GROUP
+        || limits.max_compute_workgroup_size_y < GROUP
+        || limits.max_compute_invocations_per_workgroup < GROUP * GROUP
+    {
+        return Err("the device's compute workgroups are smaller than 8 x 8".into());
+    }
+    Ok(())
+}
+
+/// Whether textures and buffers for a guest frame of `guest` pixels composited into a viewport of `dst`
+/// pixels fit the device's limits. `Err` says which limit; the caller skips the frame (resizing it to fit
+/// would invent pixels).
+pub fn check_sizes(
+    limits: &WgpuLimits,
+    guest: (u32, u32),
+    dst: (u32, u32),
+    warp: bool,
+) -> Result<(), String> {
+    let too_big = |what: &str, got: u64, max: u64| {
+        (got > max).then(|| format!("{what} is {got}, the device allows {max}"))
+    };
+    let side = u64::from(limits.max_texture_dimension_2d);
+    let mut problems = [
+        too_big("the guest frame's width", guest.0.into(), side),
+        too_big("the guest frame's height", guest.1.into(), side),
+        too_big("the viewport's width", dst.0.into(), side),
+        too_big("the viewport's height", dst.1.into(), side),
+        too_big(
+            "the viewport's width",
+            dst.0.into(),
+            MAX_VIEWPORT_SIDE.into(),
+        ),
+        too_big(
+            "the viewport's height",
+            dst.1.into(),
+            MAX_VIEWPORT_SIDE.into(),
+        ),
+    ]
+    .into_iter()
+    .flatten();
+    if let Some(p) = problems.next() {
+        return Err(p);
+    }
+    if warp {
+        let guest_px = u64::from(guest.0) * u64::from(guest.1);
+        let dst_px = u64::from(dst.0) * u64::from(dst.1);
+        let binding = limits.max_storage_buffer_binding_size;
+        let buffer = limits.max_buffer_size;
+        let groups = u64::from(limits.max_compute_workgroups_per_dimension);
+        let groups_of = |n: u32| u64::from(n.div_ceil(GROUP));
+        let checks = [
+            too_big(
+                "the footprint buffer (16 bytes per guest pixel)",
+                guest_px * 16,
+                binding,
+            ),
+            too_big(
+                "the footprint buffer (16 bytes per guest pixel)",
+                guest_px * 16,
+                buffer,
+            ),
+            too_big(
+                "a reprojection buffer (4 bytes per viewport pixel)",
+                dst_px * 4,
+                binding,
+            ),
+            too_big(
+                "a reprojection buffer (4 bytes per viewport pixel)",
+                dst_px * 4,
+                buffer,
+            ),
+            too_big(
+                "the workgroups across the guest frame",
+                groups_of(guest.0.max(guest.1)),
+                groups,
+            ),
+            too_big(
+                "the workgroups across the viewport",
+                groups_of(dst.0.max(dst.1)),
+                groups,
+            ),
+        ];
+        if let Some(p) = checks.into_iter().flatten().next() {
+            return Err(p);
+        }
+    }
+    Ok(())
 }

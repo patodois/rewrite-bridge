@@ -1,6 +1,6 @@
 [package]
 name = "rewrite-bridge-bevy"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Bevy plugin that spawns rewrite-bridge models, skins, animations and scenes from any game rewrite's provider"
 license = "MIT OR Apache-2.0"
@@ -44,6 +44,10 @@ window = ["viewer", "bevy/bevy_winit", "bevy/x11", "bevy/wayland"]
 # passthrough link's types and the render-graph node it adds to a camera.
 compose = ["rewrite-bridge/link", "bevy/bevy_core_pipeline", "dep:bytemuck"]
 
+[package.metadata.docs.rs]
+# docs.rs has no display or GPU: it only needs to compile, and the compose module is what is worth reading
+features = ["compose"]
+
 [[example]]
 name = "viewer"
 required-features = ["viewer"]
@@ -51,3 +55,10 @@ required-features = ["viewer"]
 [[example]]
 name = "guest_compose"
 required-features = ["compose", "viewer"]
+
+# The FXAA component, for the test that the compositing runs before the anti-aliasing passes. Dev
+# dependencies do not change what the crate itself asks of Bevy.
+[dev-dependencies.bevy]
+version = "0.20"
+default-features = false
+features = ["bevy_anti_alias"]

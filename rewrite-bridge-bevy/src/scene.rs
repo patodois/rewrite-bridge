@@ -35,13 +35,13 @@
 //!
 //! # Exposure
 //!
-//! Lights are in photometric units and Bevy exposes them with the camera's [`Exposure`]: put an
+//! Lights are in photometric units and Bevy exposes them with the camera's [`Exposure`](bevy::camera::Exposure): put an
 //! `Exposure` on your camera that suits the scene (`Exposure::SUNLIGHT` for a day scene lit by tens of
 //! thousands of lux, `Exposure::INDOOR` for lamps; the default is Blender's). This crate does not pick
 //! one and has no exposure scale of its own. What is relative in the bridge (emissive materials, the
 //! sky) is handled so that 1.0 reads as white: emissive colours are not exposed by default, so they
 //! need nothing, and the sky takes [`SpawnOptions::environment_scale`], which you set to
-//! [`white_luminance`] of your camera's exposure.
+//! [`white_luminance`](crate::white_luminance) of your camera's exposure.
 //!
 //! # Sky
 //!

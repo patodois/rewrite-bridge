@@ -3,7 +3,10 @@
 //! `reproject` + `composite` on the CPU and through the shaders on the GPU, and the two images are
 //! compared pixel by pixel.
 //!
-//! Without a usable GPU adapter (a CI machine, say) the tests print `SKIP` and pass.
+//! Without a usable GPU adapter (a CI machine, say) the tests print `SKIP` and pass, unless `RB_REQUIRE_GPU`
+//! is set; `gpu_report` says which it was. On a *software* adapter (llvmpipe, WARP) the comparisons that are
+//! exact on a hardware GPU (below) allow the reprojection's share of differing pixels instead, because the
+//! shaders' `f32` division and `pow` may round differently there (see [`exact_share`]).
 //!
 //! The tolerances, and why:
 //!
@@ -42,21 +45,102 @@ use super::{host_depth_terms, GuestFrame};
 // ---------------------------------------------------------------------------------------------
 // A headless GPU
 
+/// What the headless adapter is, for the report and for how strict the comparisons are.
+struct AdapterReport {
+    name: String,
+    backend: String,
+    software: bool,
+}
+
+static REPORT: OnceLock<AdapterReport> = OnceLock::new();
+
+/// A headless device, or `None` (printing why, once; and failing instead if `RB_REQUIRE_GPU` is set, for a
+/// machine that is known to have a GPU and must not skip silently).
 pub(super) fn gpu() -> Option<&'static (RenderDevice, RenderQueue)> {
     static GPU: OnceLock<Option<(RenderDevice, RenderQueue)>> = OnceLock::new();
-    GPU.get_or_init(|| {
-        std::panic::catch_unwind(|| {
+    let got = GPU.get_or_init(|| {
+        let made = std::panic::catch_unwind(|| {
             let settings = WgpuSettings {
                 backends: Some(Backends::all()),
                 ..Default::default()
             };
             let resources =
                 bevy::tasks::block_on(initialize_renderer(Backends::all(), None, &settings));
-            (resources.0, resources.1)
-        })
-        .ok()
-    })
-    .as_ref()
+            let info = &*resources.2;
+            let report = AdapterReport {
+                name: info.name.clone(),
+                backend: format!("{:?}", info.backend),
+                software: format!("{:?}", info.device_type) == "Cpu",
+            };
+            ((resources.0, resources.1), report)
+        });
+        let (device, report) = made.ok()?;
+        let _ = REPORT.set(report);
+        Some(device)
+    });
+    if got.is_none() {
+        let message = "no GPU adapter: the GPU compositing tests were SKIPPED \
+                       (set RB_REQUIRE_GPU=1 to make that a failure)";
+        eprintln!("SKIP: {message}");
+        if std::env::var_os("GITHUB_ACTIONS").is_some() {
+            eprintln!("::warning title=compose GPU tests skipped::{message}");
+        }
+        assert!(std::env::var_os("RB_REQUIRE_GPU").is_none(), "{message}");
+    }
+    got.as_ref()
+}
+
+/// Whether the adapter is a software one (llvmpipe, WARP, SwiftShader), whose division and `pow` are not
+/// a hardware GPU's: see [`assert_exact`].
+fn software() -> bool {
+    gpu();
+    REPORT.get().is_some_and(|r| r.software)
+}
+
+/// The share of pixels that may differ where the comparison is exact on a hardware adapter: nothing. On a
+/// software adapter the shaders' `f32` division can round a depth in the last bit differently from the
+/// reference, flipping a pixel where a guest and a host surface are within that bit of each other
+/// (a crossing line, in these scenes), so up to as many pixels as a warp may move are tolerated.
+fn exact_share() -> f64 {
+    if software() {
+        MAX_WARP_DIFF_SHARE
+    } else {
+        0.0
+    }
+}
+
+fn assert_exact(name: &str, d: &Diff) {
+    let share = d.differing as f64 / d.pixels as f64;
+    assert!(
+        share <= exact_share(),
+        "{name}: {} of {} pixels differ (allowed share {}): {:?}",
+        d.differing,
+        d.pixels,
+        exact_share(),
+        d.first
+    );
+}
+
+/// Says in the log whether the GPU tests have an adapter, so a CI log shows it clearly (run with
+/// `--nocapture`). Always passes.
+#[test]
+fn gpu_report() {
+    match gpu() {
+        Some(_) => {
+            let r = REPORT.get().unwrap();
+            eprintln!(
+                "GPU REPORT: {} ({}){}: the GPU compositing tests RAN",
+                r.name,
+                r.backend,
+                if r.software {
+                    ", a software adapter, so the exact comparisons allow the warp tolerance"
+                } else {
+                    ""
+                }
+            );
+        }
+        None => eprintln!("GPU REPORT: no adapter, the GPU compositing tests SKIPPED"),
+    }
 }
 
 macro_rules! gpu_or_skip {
@@ -720,7 +804,7 @@ fn composite_without_a_warp_matches_the_reference_exactly() {
         )
         .unwrap();
         assert!(reference.guest_in_front > 500 && reference.guest_hidden > 500);
-        assert_eq!(df.differing, 0, "{:?}", df.first);
+        assert_exact("composite", &df);
     }
 }
 
@@ -782,7 +866,7 @@ fn a_frame_without_depth_is_pasted_over_the_host() {
     );
     // the host's wall is nearer than the sphere, and the pasted guest still covers it
     let df = diff(&cpu, &gpu_out, SIZE.0);
-    assert_eq!(df.differing, 0, "{:?}", df.first);
+    assert_exact("composite", &df);
 }
 
 #[test]
@@ -882,9 +966,10 @@ fn a_frame_of_another_size_is_resampled_like_the_reference() {
     let (device, queue) = gpu_or_skip!();
     let host_size = SIZE;
     let present = camera([0.0, 1.5, 2.0], [0.0, 1.0, -4.0], host_size, f32::INFINITY);
-    // 1.7 times smaller; 5 times (every footprint is 5 pixels across); 20 times (past the 16 pixel
-    // limit, so every pixel falls back to a single destination pixel)
-    for guest_size in [(96, 72), (32, 24), (8, 6)] {
+    // 1.7 times smaller; 5 times (every footprint is 5 pixels across); 12 times (between 8 and 16, which
+    // tells the 16 pixel limit from a smaller one); 20 times (past the limit, so every pixel falls back to a
+    // single destination pixel)
+    for guest_size in [(96, 72), (32, 24), (13, 10), (8, 6)] {
         let guest_cam = camera([0.0, 1.5, 2.0], [0.0, 1.0, -4.0], guest_size, f32::INFINITY);
         let (g_rgba, g_depth) = render_guest(&guest_cam, guest_size, true);
         let guest = frame(g_rgba, Some(g_depth), guest_size);
@@ -958,7 +1043,7 @@ fn a_late_frame_with_the_cameras_equal_is_the_identity() {
         "identity warp vs direct: {} differ of {}",
         df.differing, df.pixels
     );
-    assert_eq!(df.differing, 0, "{:?}", df.first);
+    assert_exact("composite", &df);
 }
 
 #[test]
@@ -1015,7 +1100,7 @@ fn a_viewport_inside_a_larger_target_leaves_the_rest_alone() {
         }
     }
     let df = diff(&cpu, &gpu_in, vp.0);
-    assert_eq!(df.differing, 0, "{:?}", df.first);
+    assert_exact("composite", &df);
 }
 
 /// Frame times of the GPU path, upload included, waiting for the GPU to finish each frame. Not a
@@ -1159,4 +1244,418 @@ fn frame_times() {
         "CPU reference (compose.rs), host 1280x720, guest 640x360, reproject + composite: {:.0} ms",
         began.elapsed().as_secs_f64() * 1000.0
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rules that a mutated shader or plugin would break
+
+/// A camera with a power-of-two near plane, so that `d = near / t` and `t = near / d` are exact in `f32`
+/// for `t = 4` and the host's converted depth can be made equal to a guest's, bit for bit.
+fn exact_camera(size: (u32, u32)) -> Camera {
+    Camera::look_at(
+        [0.0; 3],
+        [0.0, 0.0, -1.0],
+        60.0f32.to_radians(),
+        0.125,
+        f32::INFINITY,
+        [size.0, size.1],
+    )
+    .with_depth_range(DepthRange::Reversed)
+}
+
+#[test]
+fn equal_depths_go_to_the_host_and_a_hair_nearer_goes_to_the_guest() {
+    let (device, queue) = gpu_or_skip!();
+    let size = (16, 8);
+    let cam = exact_camera(size);
+    let n = (size.0 * size.1) as usize;
+    let host_rgba: Vec<u8> = [10u8, 20, 30, 255].repeat(n);
+    let host_t = vec![4.0f32; n];
+    let d = to_buffer(&host_t, &cam);
+    assert_eq!(
+        linearize_buffer(&d, &cam),
+        host_t,
+        "the host's depth is exactly 4 m"
+    );
+    let hair = f32::from_bits(4.0f32.to_bits() - 1);
+    let depth: Vec<f32> = (0..n)
+        .map(|i| {
+            if (i as u32 % size.0) < size.0 / 2 {
+                4.0
+            } else {
+                hair
+            }
+        })
+        .collect();
+    let guest = frame([250u8, 10, 10, 255].repeat(n), Some(depth), size);
+    let cpu = cpu_result(&host_rgba, &host_t, &guest, &cam, &cam, size, false);
+    let gpu_out = run_gpu(
+        device,
+        queue,
+        &Run {
+            host: Host {
+                rgba: &host_rgba,
+                d: &d,
+                size,
+                format: TextureFormat::Rgba8Unorm,
+            },
+            guest: &guest,
+            params: params(&guest, size, &cam, None, false),
+        },
+    );
+    // the reference itself: equal goes to the host, the hair nearer to the guest
+    assert_eq!(&cpu[0..4], &[10, 20, 30, 255]);
+    assert_eq!(&cpu[(size.0 as usize - 1) * 4..][..4], &[250, 10, 10, 255]);
+    let df = diff(&cpu, &gpu_out, size.0);
+    assert_eq!(df.differing, 0, "{:?}", df.first);
+}
+
+#[test]
+fn blending_rounds_the_way_the_reference_does_over_every_alpha() {
+    let (device, queue) = gpu_or_skip!();
+    let size = (64, 64);
+    let cam = camera([0.0, 1.5, 2.0], [0.0, 1.0, -4.0], size, f32::INFINITY);
+    let n = (size.0 * size.1) as usize;
+    // guest alpha runs along x, host alpha along y, so a translucent guest pixel lies over every
+    // translucent host pixel; the colours vary too
+    let (mut host_rgba, mut guest_rgba) = (Vec::new(), Vec::new());
+    for y in 0..size.1 {
+        for x in 0..size.0 {
+            host_rgba.extend_from_slice(&[
+                (x * 3) as u8,
+                255 - (y * 4) as u8,
+                77,
+                (y * 4 + 1) as u8,
+            ]);
+            guest_rgba.extend_from_slice(&[
+                255 - (x * 4) as u8,
+                (y * 4) as u8,
+                (x * 2 + y) as u8,
+                (x * 4 + 1) as u8,
+            ]);
+        }
+    }
+    let host_t = vec![f32::INFINITY; n];
+    let d = to_buffer(&host_t, &cam);
+    let guest = frame(guest_rgba.clone(), Some(vec![2.0; n]), size);
+    let cpu = cpu_result(&host_rgba, &host_t, &guest, &cam, &cam, size, false);
+    let gpu_out = run_gpu(
+        device,
+        queue,
+        &Run {
+            host: Host {
+                rgba: &host_rgba,
+                d: &d,
+                size,
+                format: TextureFormat::Rgba8Unorm,
+            },
+            guest: &guest,
+            params: params(&guest, size, &cam, None, false),
+        },
+    );
+    // this scene tells the right rounding from a truncating one: blending with "+ 0" instead of "+ 127"
+    // would change the output alpha and the colours of a large share of the pixels
+    let truncating: Vec<u8> = host_rgba
+        .chunks(4)
+        .zip(guest_rgba.chunks(4))
+        .flat_map(|(h, g)| {
+            let a = u32::from(g[3]);
+            let mut px = [0u8; 4];
+            for c in 0..3 {
+                px[c] = ((u32::from(g[c]) * a + u32::from(h[c]) * (255 - a)) / 255) as u8;
+            }
+            px[3] = (a + u32::from(h[3]) * (255 - a) / 255).min(255) as u8;
+            px
+        })
+        .collect();
+    let would_differ = diff(&cpu, &truncating, size.0).differing;
+    assert!(would_differ > n / 3, "{would_differ} of {n}");
+    let df = diff(&cpu, &gpu_out, size.0);
+    assert_eq!(df.differing, 0, "{:?}", df.first);
+}
+
+/// A guest frame whose empty pixels (alpha 0) still carry a finite depth: the contract says they are empty
+/// whatever their depth.
+fn with_ghosts(rgba: &[u8], depth: &[f32], ghost: f32) -> Vec<f32> {
+    rgba.chunks(4)
+        .zip(depth)
+        .map(|(p, &d)| if p[3] == 0 { ghost } else { d })
+        .collect()
+}
+
+#[test]
+fn guest_pixels_with_no_alpha_are_empty_whatever_their_depth() {
+    let (device, queue) = gpu_or_skip!();
+    let render = camera([0.0, 1.5, 2.0], [0.0, 1.0, -4.0], SIZE, f32::INFINITY);
+    let present = camera([0.35, 1.5, 2.0], [0.2, 1.0, -4.0], SIZE, f32::INFINITY);
+    let (g_rgba, g_depth) = render_guest(&render, SIZE, true);
+    // 1 m for the sky: nearer than anything, and 4 m, which is within 10% of surfaces around the sphere
+    for ghost in [1.0f32, 4.0] {
+        let guest = frame(
+            g_rgba.clone(),
+            Some(with_ghosts(&g_rgba, &g_depth, ghost)),
+            SIZE,
+        );
+        let (h_rgba, h_t) = render_host(SIZE);
+        let d = to_buffer(&h_t, &present);
+        let t_from_buffer = linearize_buffer(&d, &present);
+        let cpu = cpu_result(
+            &h_rgba,
+            &t_from_buffer,
+            &guest,
+            &render,
+            &present,
+            SIZE,
+            true,
+        );
+        let gpu_out = run_gpu(
+            device,
+            queue,
+            &Run {
+                host: Host {
+                    rgba: &h_rgba,
+                    d: &d,
+                    size: SIZE,
+                    format: TextureFormat::Rgba8Unorm,
+                },
+                guest: &guest,
+                params: params(&guest, SIZE, &present, Some(&render), false),
+            },
+        );
+        compare_warp(
+            &format!("ghosts at {ghost} m"),
+            &cpu,
+            &gpu_out,
+            SIZE,
+            MAX_WARP_DIFF_SHARE,
+        );
+        // and with no warp
+        let cpu = cpu_result(
+            &h_rgba,
+            &t_from_buffer,
+            &guest,
+            &present,
+            &present,
+            SIZE,
+            false,
+        );
+        let gpu_out = run_gpu(
+            device,
+            queue,
+            &Run {
+                host: Host {
+                    rgba: &h_rgba,
+                    d: &d,
+                    size: SIZE,
+                    format: TextureFormat::Rgba8Unorm,
+                },
+                guest: &guest,
+                params: params(&guest, SIZE, &present, None, false),
+            },
+        );
+        let df = diff(&cpu, &gpu_out, SIZE.0);
+        assert_exact("ghosts, direct", &df);
+    }
+}
+
+#[test]
+fn an_empty_neighbour_does_not_pull_a_corner_to_its_depth() {
+    // A corner of a source pixel is warped at the average depth of the neighbours within 10% of it that
+    // are not empty. Here the right half is empty (alpha 0) but carries a depth 9.8% away from the
+    // surface on the left; if those pixels were averaged in, the boundary's corners would move.
+    let (device, queue) = gpu_or_skip!();
+    let size = (64, 48);
+    let render = camera([0.0, 1.5, 2.0], [0.0, 1.5, -4.0], size, f32::INFINITY);
+    let present = camera([3.0, 1.5, 2.0], [3.0, 1.5, -4.0], size, f32::INFINITY);
+    let (mut rgba, mut depth) = (Vec::new(), Vec::new());
+    for y in 0..size.1 {
+        for x in 0..size.0 {
+            if x < size.0 / 2 {
+                rgba.extend_from_slice(&[(x * 4) as u8, (y * 5) as u8, 200, 255]);
+                depth.push(6.0);
+            } else {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+                depth.push(6.0 * 1.098);
+            }
+        }
+    }
+    let guest = frame(rgba, Some(depth), size);
+    let n = (size.0 * size.1) as usize;
+    let h_rgba = vec![0u8; n * 4];
+    let h_t = vec![f32::INFINITY; n];
+    let d = to_buffer(&h_t, &present);
+    let cpu = cpu_result(&h_rgba, &h_t, &guest, &render, &present, size, true);
+    let gpu_out = run_gpu(
+        device,
+        queue,
+        &Run {
+            host: Host {
+                rgba: &h_rgba,
+                d: &d,
+                size,
+                format: TextureFormat::Rgba8Unorm,
+            },
+            guest: &guest,
+            params: params(&guest, size, &present, Some(&render), false),
+        },
+    );
+    assert!(cpu.chunks(4).filter(|p| p[3] != 0).count() > 400);
+    compare_warp(
+        "empty neighbours",
+        &cpu,
+        &gpu_out,
+        size,
+        MAX_WARP_DIFF_SHARE,
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Things that need no GPU
+
+#[test]
+fn the_camera_ring_covers_half_a_second_at_any_refresh_rate() {
+    use super::{GuestFrames, DEFAULT_RING_CAPACITY};
+    let cam = camera([0.0, 1.5, 2.0], [0.0, 1.0, -4.0], SIZE, f32::INFINITY);
+    // One camera goes out per rendered frame. A frame rendered 150 ms ago at 240 Hz and one rendered
+    // half a second ago at 500 Hz have to find their cameras.
+    for (hz, age_ms) in [
+        (60u32, 500u32),
+        (144, 500),
+        (240, 150),
+        (240, 500),
+        (500, 500),
+    ] {
+        let mut frames = GuestFrames::default();
+        let total = hz; // one second of sending
+        let behind = hz * age_ms / 1000;
+        for seq in 1..=total {
+            let mut c = cam;
+            c.near = seq as f32; // tells the cameras apart
+            frames.push_camera(seq, c);
+        }
+        let wanted = total - behind;
+        let mut f = GuestFrame::new(1, 0, wanted, (1, 1), vec![0; 4], None).unwrap();
+        f.id = 1;
+        frames.set_frame(f);
+        let found = frames.render_camera().unwrap_or_else(|| {
+            panic!("at {hz} Hz a camera {age_ms} ms old was forgotten (ring of {DEFAULT_RING_CAPACITY})")
+        });
+        assert_eq!(found.near, wanted as f32);
+    }
+    // the contract's 32 would not have: 150 ms at 240 Hz is 36 cameras back
+    let mut small = GuestFrames::new(32);
+    for seq in 1..=240u32 {
+        small.push_camera(seq, cam);
+    }
+    small.set_frame(GuestFrame::new(1, 0, 240 - 36, (1, 1), vec![0; 4], None).unwrap());
+    assert!(small.render_camera().is_none());
+}
+
+#[test]
+fn of_several_candidates_the_lowest_order_then_the_lowest_entity_composites() {
+    use super::pick_compose_camera;
+    use bevy::prelude::Entity;
+    let e = |i: u32| Entity::from_raw_u32(i).unwrap();
+    assert_eq!(pick_compose_camera([]), None);
+    assert_eq!(pick_compose_camera([(e(5), 0)]), Some(e(5)));
+    assert_eq!(
+        pick_compose_camera([(e(5), 0), (e(2), 0), (e(9), 0)]),
+        Some(e(2))
+    );
+    assert_eq!(
+        pick_compose_camera([(e(2), 1), (e(9), -3), (e(5), 0)]),
+        Some(e(9))
+    );
+}
+
+#[test]
+fn an_oblique_or_orthographic_projection_is_not_a_plain_perspective_one() {
+    use super::{host_camera, UnsupportedCamera};
+    use bevy::camera::{CameraProjection, PerspectiveProjection};
+    use bevy::prelude::*;
+    let plain = PerspectiveProjection::default();
+    let m = plain.get_clip_from_view();
+    assert_eq!(
+        host_depth_terms(&m.to_cols_array()),
+        Some((0.0, plain.near))
+    );
+    // Bevy's oblique near plane (mirrors, portals) puts x and y into the depth row
+    let oblique = PerspectiveProjection {
+        near_clip_plane: vec4(0.3, -0.2, -1.0, -0.5),
+        ..default()
+    }
+    .get_clip_from_view();
+    let (view, size) = (GlobalTransform::default(), UVec2::new(160, 120));
+    assert!(oblique.to_cols_array()[2] != 0.0 || oblique.to_cols_array()[6] != 0.0);
+    assert_eq!(host_depth_terms(&oblique.to_cols_array()), None);
+    assert_eq!(
+        host_camera(&view, oblique, size).unwrap_err(),
+        UnsupportedCamera::NotPerspective
+    );
+    assert!(host_camera(&view, m, size).is_ok());
+    let ortho = Mat4::from_cols_array(&[
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, -0.1, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]);
+    assert_eq!(
+        host_camera(&view, ortho, size).unwrap_err(),
+        UnsupportedCamera::NotPerspective
+    );
+}
+
+#[test]
+fn what_does_not_fit_the_device_is_skipped_not_shrunk() {
+    use super::gpu::{check_device, check_sizes, MAX_VIEWPORT_SIDE};
+    use bevy::render::render_resource::{DownlevelFlags, WgpuLimits};
+    let roomy = WgpuLimits::default();
+    assert!(check_sizes(&roomy, (640, 360), (1920, 1080), true).is_ok());
+    assert!(check_sizes(&roomy, (16384, 4096), (1920, 1080), false).is_err()); // wider than 8192
+    let small = WgpuLimits {
+        max_texture_dimension_2d: 512,
+        ..roomy.clone()
+    };
+    assert!(check_sizes(&small, (640, 360), (320, 180), false)
+        .unwrap_err()
+        .contains("width"));
+    assert!(check_sizes(&small, (320, 180), (1920, 1080), false).is_err());
+    // a 4096 x 4096 guest frame needs 268 MB of footprints; the default binding limit is 128 MiB
+    assert!(check_sizes(&roomy, (4096, 4096), (1920, 1080), true)
+        .unwrap_err()
+        .contains("footprint"));
+    let tiny_buffers = WgpuLimits {
+        max_storage_buffer_binding_size: 1 << 20,
+        ..roomy.clone()
+    };
+    assert!(check_sizes(&tiny_buffers, (640, 360), (1920, 1080), true).is_err());
+    assert!(
+        check_sizes(&tiny_buffers, (640, 360), (640, 360), false).is_ok(),
+        "no warp, no buffers"
+    );
+    let few_groups = WgpuLimits {
+        max_compute_workgroups_per_dimension: 16,
+        ..roomy.clone()
+    };
+    assert!(check_sizes(&few_groups, (640, 360), (320, 180), true)
+        .unwrap_err()
+        .contains("workgroups"));
+    // the viewport's packing limit, whatever the device allows
+    let huge = WgpuLimits {
+        max_texture_dimension_2d: 1 << 20,
+        ..roomy.clone()
+    };
+    assert!(check_sizes(&huge, (64, 64), (MAX_VIEWPORT_SIDE + 1, 8), false).is_err());
+    assert!(check_sizes(&huge, (64, 64), (MAX_VIEWPORT_SIDE, 8), false).is_ok());
+
+    // a device that cannot run the passes turns compositing off instead of panicking at start
+    assert!(check_device(&roomy, DownlevelFlags::all()).is_ok());
+    let none = WgpuLimits {
+        max_storage_buffers_per_shader_stage: 0,
+        ..roomy.clone()
+    };
+    assert!(check_device(&none, DownlevelFlags::all()).is_err());
+    assert!(check_device(&roomy, DownlevelFlags::empty()).is_err());
+    let narrow = WgpuLimits {
+        max_compute_workgroup_size_x: 4,
+        ..roomy
+    };
+    assert!(check_device(&narrow, DownlevelFlags::all()).is_err());
 }

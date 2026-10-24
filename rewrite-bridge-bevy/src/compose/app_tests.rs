@@ -9,8 +9,9 @@
 
 use std::sync::{Arc, Mutex};
 
+use bevy::anti_alias::fxaa::Fxaa;
 use bevy::asset::RenderAssetUsages;
-use bevy::camera::RenderTarget;
+use bevy::camera::{Hdr, RenderTarget, Viewport};
 use bevy::core_pipeline::tonemapping::{DebandDither, Tonemapping};
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
@@ -22,15 +23,43 @@ use super::{GuestCompose, GuestComposePlugin, GuestFrame, GuestFrames};
 
 const SIZE: (u32, u32) = (160, 120);
 
-#[derive(Resource)]
-struct Target(Handle<Image>);
-
-/// Where the camera stands and whether the host scene is spawned.
-#[derive(Resource, Clone, Copy)]
-struct Setup {
-    camera: Transform,
-    scene: bool,
+/// One camera of a scenario, with its own render target of `SIZE`.
+#[derive(Clone)]
+struct Cam {
+    transform: Transform,
     reproject: bool,
+    msaa: Msaa,
+    hdr: bool,
+    fxaa: bool,
+    /// Position and size of the camera's viewport in its target
+    viewport: Option<(UVec2, UVec2)>,
+    order: isize,
+}
+
+impl Default for Cam {
+    fn default() -> Self {
+        Self {
+            transform: Transform::default(),
+            reproject: true,
+            msaa: Msaa::Off,
+            hdr: false,
+            fxaa: false,
+            viewport: None,
+            order: 0,
+        }
+    }
+}
+
+#[derive(Resource, Clone)]
+struct Scenario {
+    scene: bool,
+    cams: Vec<Cam>,
+}
+
+#[derive(Resource, Default)]
+struct Spawned {
+    targets: Vec<Handle<Image>>,
+    cameras: Vec<Entity>,
 }
 
 fn unlit(materials: &mut Assets<StandardMaterial>, c: Color) -> MeshMaterial3d<StandardMaterial> {
@@ -42,32 +71,49 @@ fn unlit(materials: &mut Assets<StandardMaterial>, c: Color) -> MeshMaterial3d<S
 }
 
 fn setup(
-    setup: Res<Setup>,
+    scenario: Res<Scenario>,
+    mut spawned: ResMut<Spawned>,
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let mut target = Image::new_target_texture(SIZE.0, SIZE.1, TextureFormat::Rgba8UnormSrgb, None);
-    target.asset_usage = RenderAssetUsages::RENDER_WORLD;
-    let target = images.add(target);
-    commands.insert_resource(Target(target.clone()));
-    commands.spawn((
-        Camera3d::default(),
-        RenderTarget::from(target),
-        Msaa::Off,
-        Tonemapping::None,
-        DebandDither::Disabled,
-        Camera {
-            clear_color: ClearColorConfig::Custom(Color::srgb_u8(20, 20, 20)),
-            ..default()
-        },
-        setup.camera,
-        GuestCompose {
-            reproject: setup.reproject,
-        },
-    ));
-    if !setup.scene {
+    for cam in &scenario.cams {
+        let mut target =
+            Image::new_target_texture(SIZE.0, SIZE.1, TextureFormat::Rgba8UnormSrgb, None);
+        target.asset_usage = RenderAssetUsages::RENDER_WORLD;
+        let target = images.add(target);
+        let mut entity = commands.spawn((
+            Camera3d::default(),
+            RenderTarget::from(target.clone()),
+            cam.msaa,
+            Tonemapping::None,
+            DebandDither::Disabled,
+            Camera {
+                clear_color: ClearColorConfig::Custom(Color::srgb_u8(20, 20, 20)),
+                order: cam.order,
+                viewport: cam.viewport.map(|(position, size)| Viewport {
+                    physical_position: position,
+                    physical_size: size,
+                    ..default()
+                }),
+                ..default()
+            },
+            cam.transform,
+            GuestCompose {
+                reproject: cam.reproject,
+            },
+        ));
+        if cam.hdr {
+            entity.insert(Hdr);
+        }
+        if cam.fxaa {
+            entity.insert(Fxaa::default());
+        }
+        spawned.cameras.push(entity.id());
+        spawned.targets.push(target);
+    }
+    if !scenario.scene {
         return;
     }
     // The wall, 5 m ahead, whose top edge is above the middle of the picture; pillars 4 m and 2.5 m ahead.
@@ -98,8 +144,8 @@ fn setup(
 }
 
 /// A frame that is red everywhere, 3 m away on the left half and 8 m on the right.
-fn guest() -> GuestFrame {
-    let (w, h) = SIZE;
+fn guest_of(size: (u32, u32)) -> GuestFrame {
+    let (w, h) = size;
     let mut rgba = Vec::new();
     let mut depth = Vec::new();
     for _y in 0..h {
@@ -108,17 +154,23 @@ fn guest() -> GuestFrame {
             depth.push(if x < w / 2 { 3.0 } else { 8.0 });
         }
     }
-    GuestFrame::new(1, 0, 0, SIZE, rgba, Some(depth)).unwrap()
+    GuestFrame::new(1, 0, 0, size, rgba, Some(depth)).unwrap()
 }
 
-/// Runs the app with `camera`, lets `after_start` put frames in, and returns the camera's picture, or `None`
-/// without a GPU. `after_start` also gets to read what the camera looks like by then.
-fn render(
-    camera: Transform,
-    scene: bool,
-    reproject: bool,
-    after_start: impl FnOnce(&mut World),
-) -> Option<Image> {
+fn guest() -> GuestFrame {
+    guest_of(SIZE)
+}
+
+/// What a run leaves: one picture per camera, in order, the cameras' entities and the one the plugin
+/// chose.
+struct Out {
+    images: Vec<Image>,
+    cameras: Vec<Entity>,
+    chosen: Option<Entity>,
+}
+
+/// Runs the app, lets `after_start` put frames in, and returns the pictures, or `None` without a GPU.
+fn run_scenario(scenario: Scenario, after_start: impl FnOnce(&mut World)) -> Option<Out> {
     super::tests::gpu()?;
     // Two Bevy apps starting at once in one process trip over each other's shader loading
     static ONE_APP_AT_A_TIME: Mutex<()> = Mutex::new(());
@@ -136,11 +188,8 @@ fn render(
                 ..default()
             }),
     )
-    .insert_resource(Setup {
-        camera,
-        scene,
-        reproject,
-    })
+    .insert_resource(scenario)
+    .init_resource::<Spawned>()
     .add_plugins(GuestComposePlugin::default())
     .add_systems(Startup, setup);
     app.finish();
@@ -152,22 +201,54 @@ fn render(
     for _ in 0..4 {
         app.update();
     }
-    let captured: Arc<Mutex<Option<Image>>> = Arc::default();
-    let target = app.world().resource::<Target>().0.clone();
-    let sink = captured.clone();
-    app.world_mut().spawn(Screenshot::image(target)).observe(
-        move |event: On<ScreenshotCaptured>| {
-            *sink.lock().unwrap() = Some(event.image.clone());
-        },
-    );
+    let targets = app.world().resource::<Spawned>().targets.clone();
+    let captured: Arc<Mutex<Vec<Option<Image>>>> = Arc::new(Mutex::new(vec![None; targets.len()]));
+    for (i, target) in targets.into_iter().enumerate() {
+        let sink = captured.clone();
+        app.world_mut().spawn(Screenshot::image(target)).observe(
+            move |event: On<ScreenshotCaptured>| {
+                sink.lock().unwrap()[i] = Some(event.image.clone());
+            },
+        );
+    }
     for _ in 0..30 {
         app.update();
-        if captured.lock().unwrap().is_some() {
+        if captured.lock().unwrap().iter().all(Option::is_some) {
             break;
         }
     }
-    let image = captured.lock().unwrap().take();
-    image
+    let images = captured
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .map(|i| i.take().expect("a picture"))
+        .collect();
+    Some(Out {
+        images,
+        cameras: app.world().resource::<Spawned>().cameras.clone(),
+        chosen: app.world().resource::<GuestFrames>().compose_camera(),
+    })
+}
+
+/// One camera, one picture.
+fn render(
+    camera: Transform,
+    scene: bool,
+    reproject: bool,
+    after_start: impl FnOnce(&mut World),
+) -> Option<Image> {
+    run_scenario(
+        Scenario {
+            scene,
+            cams: vec![Cam {
+                transform: camera,
+                reproject,
+                ..default()
+            }],
+        },
+        after_start,
+    )
+    .map(|mut out| out.images.remove(0))
 }
 
 fn pixel(image: &Image, x: u32, y: u32) -> [u8; 3] {
@@ -351,4 +432,218 @@ fn a_late_frame_is_reprojected_to_the_camera_the_view_presents() {
         .unwrap()
         .rgba;
     compare("pasted, no depth plane", &pasted, expected);
+}
+
+const RED: [u8; 3] = [255, 0, 0];
+const WALL: [u8; 3] = [30, 200, 60];
+const CLEAR: [u8; 3] = [20, 20, 20];
+
+fn put_guest(world: &mut World) {
+    world.resource_mut::<GuestFrames>().set_frame(guest());
+}
+
+#[test]
+fn a_camera_with_msaa_or_hdr_is_left_alone() {
+    // (60, 100) is where the guest (3 m) covers the wall (5 m): red when composited, wall green when not
+    for (name, cam) in [
+        (
+            "MSAA",
+            Cam {
+                msaa: Msaa::Sample4,
+                ..default()
+            },
+        ),
+        (
+            "HDR",
+            Cam {
+                hdr: true,
+                ..default()
+            },
+        ),
+    ] {
+        let picture = |guest: bool| {
+            run_scenario(
+                Scenario {
+                    scene: true,
+                    cams: vec![cam.clone()],
+                },
+                move |world| {
+                    if guest {
+                        put_guest(world)
+                    }
+                },
+            )
+        };
+        let Some(without) = picture(false) else {
+            eprintln!("SKIP: no GPU adapter");
+            return;
+        };
+        let with = picture(true).unwrap();
+        // The camera still renders; the guest is just not in it
+        let (a, b) = (&without.images[0], &with.images[0]);
+        assert_eq!(a.data, b.data, "{name}: the guest was composited");
+        assert!(
+            pixel(b, 60, 100)[1] > 150 && pixel(b, 60, 100)[0] < 100,
+            "{name}: the wall should show, got {:?}",
+            pixel(b, 60, 100)
+        );
+    }
+}
+
+#[test]
+fn a_viewport_that_does_not_start_at_the_corner_composites_in_place() {
+    // A 100 x 80 viewport at (40, 20) of the 160 x 120 target, and a guest frame of the viewport's size
+    let (origin, size) = (UVec2::new(40, 20), UVec2::new(100, 80));
+    let cam = Cam {
+        viewport: Some((origin, size)),
+        ..default()
+    };
+    let picture = |guest: bool| {
+        run_scenario(
+            Scenario {
+                scene: true,
+                cams: vec![cam.clone()],
+            },
+            move |world| {
+                if guest {
+                    world
+                        .resource_mut::<GuestFrames>()
+                        .set_frame(guest_of((size.x, size.y)));
+                }
+            },
+        )
+    };
+    let Some(without) = picture(false) else {
+        eprintln!("SKIP: no GPU adapter");
+        return;
+    };
+    let with = picture(true).unwrap();
+    let (host, composed) = (&without.images[0], &with.images[0]);
+    let (mut wrong, mut red_seen, mut host_seen) = (0, 0, 0);
+    for y in 0..SIZE.1 {
+        for x in 0..SIZE.0 {
+            let (h, c) = (pixel(host, x, y), pixel(composed, x, y));
+            let inside =
+                x >= origin.x && x < origin.x + size.x && y >= origin.y && y < origin.y + size.y;
+            let expected = if !inside {
+                h
+            } else if x - origin.x < size.x / 2 {
+                // guest at 3 m: it covers everything but what is nearer, the blue pillar (2.5 m)
+                if near(h, [40, 70, 230]) {
+                    h
+                } else {
+                    RED
+                }
+            } else if near(h, CLEAR) {
+                // guest at 8 m: it shows where the host drew nothing, and the host hides it elsewhere
+                RED
+            } else {
+                h
+            };
+            if !near(c, expected) {
+                wrong += 1;
+            }
+            red_seen += usize::from(inside && near(c, RED));
+            host_seen += usize::from(inside && near(c, h) && !near(h, CLEAR) && !near(c, RED));
+        }
+    }
+    assert!(
+        red_seen > 1500 && host_seen > 800,
+        "{red_seen} red, {host_seen} host pixels"
+    );
+    assert!(wrong <= 4, "{wrong} pixels are not what the rule says");
+}
+
+#[test]
+fn of_several_cameras_one_composites_and_the_others_are_left_alone() {
+    let a = Cam::default(); // spawned first, order 0
+    let b = Cam {
+        order: -1, // the lowest order wins, whatever the entity
+        ..default()
+    };
+    let picture = |guest: bool| {
+        run_scenario(
+            Scenario {
+                scene: true,
+                cams: vec![a.clone(), b.clone()],
+            },
+            move |world| {
+                if guest {
+                    put_guest(world)
+                }
+            },
+        )
+    };
+    let Some(without) = picture(false) else {
+        eprintln!("SKIP: no GPU adapter");
+        return;
+    };
+    let with = picture(true).unwrap();
+    assert_eq!(with.chosen, Some(with.cameras[1]));
+    // camera 0 shows the host only; camera 1 composited
+    assert_eq!(with.images[0].data, without.images[0].data);
+    assert!(near(pixel(&with.images[1], 60, 100), RED));
+    assert!(near(pixel(&without.images[1], 60, 100), WALL));
+}
+
+/// Like [`guest`], but white (FXAA works on luma, and red and the wall's green have about the same) and the
+/// 3 m / 8 m split is a slanted line, so the guest meets the wall in a staircase for FXAA to smooth.
+fn slanted_guest() -> GuestFrame {
+    let (w, h) = SIZE;
+    let mut rgba = Vec::new();
+    let mut depth = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            rgba.extend_from_slice(&[255, 255, 255, 255]);
+            let edge = 50.0 + y as f32 * 0.37;
+            depth.push(if (x as f32) < edge { 3.0 } else { 8.0 });
+        }
+    }
+    GuestFrame::new(1, 0, 0, SIZE, rgba, Some(depth)).unwrap()
+}
+
+#[test]
+fn the_guest_is_composited_before_the_anti_aliasing_pass() {
+    // On the wall's rows the guest's white (3 m) meets the wall (5 m) along a slanted line. Composited
+    // before FXAA, the pass smooths that staircase: pixels along it are neither pure white nor pure wall.
+    // Composited after, the edge stays as hard as the guest's bytes.
+    let picture = |fxaa: bool| {
+        run_scenario(
+            Scenario {
+                scene: true,
+                cams: vec![Cam { fxaa, ..default() }],
+            },
+            |world| {
+                world
+                    .resource_mut::<GuestFrames>()
+                    .set_frame(slanted_guest());
+            },
+        )
+    };
+    let Some(plain) = picture(false) else {
+        eprintln!("SKIP: no GPU adapter");
+        return;
+    };
+    let smoothed = picture(true).unwrap();
+    let blended = |img: &Image| {
+        let mut n = 0;
+        for y in 50..120u32 {
+            for x in 50..100u32 {
+                let p = pixel(img, x, y);
+                if !near(p, [255, 255, 255]) && !near(p, WALL) && !near(p, [40, 70, 230]) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+    assert_eq!(
+        blended(&plain.images[0]),
+        0,
+        "without FXAA the edge is hard"
+    );
+    assert!(
+        blended(&smoothed.images[0]) > 20,
+        "FXAA did not touch the edge between the guest and the host: the guest was composited after it"
+    );
 }
