@@ -5,6 +5,12 @@ edition = "2021"
 description = "Common model types and a provider trait so game rewrites can load each other's assets into one scene"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/patodois/rewrite-bridge"
+keywords = ["gamedev", "assets", "interop", "3d", "rewrite"]
+categories = ["game-development", "rendering::data-formats"]
+# The CI workflow is not part of the crate. The Bevy plugin (rewrite-bridge-bevy/) is its own package and is left out
+# of this one automatically.
+exclude = [".github/"]
 
 [workspace]
 # The core crate stays the root package, so `cargo test` here (and a git dependency on this repo)
