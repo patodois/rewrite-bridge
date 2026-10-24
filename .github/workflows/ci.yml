@@ -51,8 +51,37 @@ jobs:
       - run: cargo test -p rewrite-bridge-bevy
       - run: cargo build -p rewrite-bridge-bevy --example viewer --features viewer
       - run: cargo clippy -p rewrite-bridge-bevy --all-targets --features viewer -- -D warnings
-      # The GPU compositing (feature `compose`): its tests compare the shaders with link::compose and skip
-      # themselves where the runner has no GPU adapter
+      # The GPU compositing (feature `compose`). Its tests compare the shaders with link::compose and skip
+      # themselves where the runner has no GPU adapter; the first step prints, with `--nocapture`, which
+      # adapter they got (or that they will be skipped), so the log says it plainly. A software adapter
+      # (llvmpipe, WARP) runs them with a small tolerance on the comparisons that are exact on a hardware GPU
+      # (see rewrite-bridge-bevy/src/compose/tests.rs). To make a missing adapter a failure on a runner that
+      # is known to have one, set RB_REQUIRE_GPU=1 for the test steps.
+      - run: cargo test -p rewrite-bridge-bevy --features compose,viewer --lib gpu_report -- --nocapture
       - run: cargo test -p rewrite-bridge-bevy --features compose,viewer
       - run: cargo build -p rewrite-bridge-bevy --example guest_compose --features compose,viewer
+      - run: cargo clippy -p rewrite-bridge-bevy --all-targets --features compose,viewer -- -D warnings
+      - run: cargo doc -p rewrite-bridge-bevy --features compose --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # Windows only has to compile and lint the plugin (there is no GPU to test on, and the Bevy tree takes long
+  # to build there); the compositing's GPU code is the part most likely to differ between platforms.
+  bevy-windows:
+    name: Bevy plugin compiles (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: bevy-windows-${{ hashFiles('Cargo.lock') }}
+          restore-keys: bevy-windows-
+      - run: cargo check -p rewrite-bridge-bevy --all-targets --features compose,viewer
       - run: cargo clippy -p rewrite-bridge-bevy --all-targets --features compose,viewer -- -D warnings

@@ -120,7 +120,7 @@ presents now. It is the GPU form of the core crate's CPU reference, `rewrite_bri
 (contract section 9.7), with the same rules and tested against it.
 
 ```toml
-rewrite-bridge-bevy = { version = "0.2", features = ["compose"] }
+rewrite-bridge-bevy = { version = "0.2.2", features = ["compose"] }   # the feature is new in 0.2.2
 ```
 
 ```rust
@@ -144,9 +144,9 @@ App::new()
 | | |
 |---|---|
 | `GuestComposePlugin` | the render passes and the `GuestFrames` resource |
-| `GuestCompose` (component) | on a `Camera3d`: composite the guest's frames into it; `reproject: false` skips the warp |
-| `GuestFrames` (resource) | the newest `GuestFrame` and the ring of host cameras (`push_camera(seq, camera)`, `set_frame(frame)`), for an app that runs its own `Link` |
-| `HostLinkPlugin` | `Link::host` as a plugin: polls it, reads the pixel file the guest announces, and sends the `GuestCompose` camera once per frame, remembered under the `seq` the link gives it |
+| `GuestCompose` (component) | on a `Camera3d`: composite the guest's frames into it; `reproject: false` skips the warp. With several, the one with the lowest `Camera::order` composites and is sent to the guest (a warning says so once) |
+| `GuestFrames` (resource) | the newest `GuestFrame` and the ring of host cameras (`push_camera(seq, camera)`, `set_frame(frame)`), for an app that runs its own `Link`. The ring keeps 256 cameras (half a second at 500 Hz): one is sent per frame and the contract wants the last half second, so 32 would cover only 133 ms at 240 Hz |
+| `HostLinkPlugin` | `Link::host` as a plugin: polls it, reads the pixel file the guest announces, and sends the `GuestCompose` camera once per frame, remembered under the `seq` the link gives it. It works without `GuestComposePlugin` too (it adds `GuestFrames`; nothing is drawn). A frame stays until the next one or the guest's loss: the contract names no maximum age |
 | `host_camera` | a Bevy camera as the contract's `Camera` (view, projection, near, far, reversed depth) |
 
 How a frame gets onto the screen: the guest's colour (`Rgba8Uint`, the bytes as the file carries them) and
@@ -159,22 +159,34 @@ arithmetic (an `*Srgb` target is converted to encoded values and back around the
 a different view is resampled with the reference's rule for frames it could not match to a camera; a frame
 without a depth plane is pasted over the image, as the contract says, and is never warped.
 
-What the camera has to be: a perspective projection, `Msaa::Off`, and not `Hdr`. Anything else is left alone
-with a warning (see the module docs of `rewrite_bridge_bevy::compose` for why). Only what is in the depth
-buffer takes part, so alpha-blended host materials neither hide the guest nor are hidden by it, and TAA
-jitter is not accounted for.
+What the camera has to be: a plain perspective projection (not orthographic, not oblique: Bevy's
+`near_clip_plane` for mirrors and portals puts x and y into the depth row), `Msaa::Off`, and not `Hdr`.
+Anything else is left alone with a warning (see the module docs of `rewrite_bridge_bevy::compose` for why).
+The pass runs after the main pass and before tonemapping, FXAA, SMAA and sharpening, so the guest is scene
+content for them: its edges are anti-aliased against the host's. Only what is in the depth buffer takes
+part, so alpha-blended host materials neither hide the guest nor are hidden by it, and TAA jitter is not
+accounted for. A guest frame or a viewport that exceeds the device's limits (texture size, storage buffer
+size, workgroups, 65535 pixels a side for the reprojection's packing) is skipped with a warning rather than
+resized, and a device without compute shaders turns compositing off at start. A frame without a depth plane
+that has to be resampled (its size differs from the view's) is warped as if every pixel were 1 m away, which
+only has to be finite because the depth test is off for it and the render camera is the present one.
 
 **Verified against the CPU reference.** `cargo test -p rewrite-bridge-bevy --features compose,viewer`
 renders the same scenes through `link::compose` and through the shaders and compares every pixel: the plain
 composite (both occlusion directions, translucent guest pixels, translucent host pixels, a finite and an
-infinite far plane, a viewport inside a larger target, a frame without depth) must match exactly and does;
+infinite far plane, a viewport inside a larger target, a frame without depth, pixels with alpha 0 but a finite depth, a depth equal to the host's, every combination of guest and host alpha) must match exactly and does;
 through an sRGB target it may be off by one step and is not; reprojection (a sideways move, a move forward and
 a turn, a lunge at the ground, a finite far plane, frames 1.7, 5 and 20 times smaller than the view) may differ
 at footprint edges in at most 0.05% of the pixels, because the shaders run in `f32` where the reference is
 `f64`, and on the development GPU (Apple M5, Metal) it differs in none of them except for 6 pixels (0.031%) in
-the 20 times stretch. A test inside a headless Bevy app checks the wiring (host boxes hiding and covering a
-guest layer, a late frame reprojected to the camera the real `ExtractedView` has). Without a GPU adapter the
-tests print `SKIP`.
+the 20 times stretch. Tests inside a headless Bevy app check the wiring: host boxes hiding and covering a guest layer, a late
+frame reprojected to the camera the real `ExtractedView` has, a viewport that does not start at the corner,
+MSAA and HDR cameras left alone, one camera composited out of several, and the composite landing before
+FXAA. Other tests cover the link (a bad pixel file path, a bad slot, a good frame after bad ones, a bye and a
+new pixel file that restarts the numbering), the camera ring at 240 and 500 Hz, and the device limits.
+Without a GPU adapter the GPU tests print `SKIP` (`cargo test ... gpu_report -- --nocapture` says whether
+they ran; `RB_REQUIRE_GPU=1` makes a missing adapter a failure); on a software adapter (llvmpipe, WARP) the
+comparisons that are exact on hardware allow the same 0.05% as reprojection.
 
 **Cost.** One frame's upload, reprojection and composite, waiting for the GPU to finish it, in a release
 build on the same machine: 0.7 ms for a 640x360 guest frame into a 1280x720 view, 1.0 ms into 1920x1080, 2.0 ms
