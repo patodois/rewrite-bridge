@@ -1,6 +1,6 @@
 [package]
 name = "rewrite-bridge-bevy"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2021"
 description = "Bevy plugin that spawns rewrite-bridge models, skins, animations and scenes from any game rewrite's provider"
 license = "MIT OR Apache-2.0"
@@ -10,7 +10,7 @@ keywords = ["bevy", "gamedev", "assets", "rewrite"]
 categories = ["game-development"]
 
 [dependencies]
-rewrite-bridge = { path = "..", version = "0.1.0" }
+rewrite-bridge = { path = "..", version = "0.2.1" }
 
 [dependencies.bevy]
 version = "0.20"

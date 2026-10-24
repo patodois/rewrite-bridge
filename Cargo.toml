@@ -1,6 +1,6 @@
 [package]
 name = "rewrite-bridge"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2021"
 description = "Common model types and a provider trait so game rewrites can load each other's assets into one scene"
 license = "MIT OR Apache-2.0"
