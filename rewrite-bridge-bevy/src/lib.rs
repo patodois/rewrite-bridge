@@ -37,6 +37,8 @@
 //!   child entities; see [`animated`].
 //! - [`spawn_scene`]: a level, with the instances of each model sharing one mesh and one material,
 //!   lights in physical units and the sky; see [`scene`].
+//! - `compose` (the Cargo feature of the same name): composites a passthrough guest's frames, colour and depth, into a
+//!   camera with a per-pixel depth test and reprojects late frames, on the GPU; see the `compose` module.
 //!
 //! # Conventions
 //!

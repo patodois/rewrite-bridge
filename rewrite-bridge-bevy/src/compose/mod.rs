@@ -534,7 +534,12 @@ fn prepare_views(
 
         // Which camera the frame was rendered with: the one in the ring, or (no camera_seq, or one the
         // ring forgot, or reprojection off) the one presented now.
-        let render_camera = input.render_camera.as_ref().filter(|_| settings.reproject);
+        // A frame without depth cannot be warped (every pixel's position needs its distance), so it is
+        // only resampled when its size differs, as if rendered with the current camera.
+        let render_camera = input
+            .render_camera
+            .as_ref()
+            .filter(|_| settings.reproject && guest.has_depth());
         let same_camera =
             render_camera.is_none_or(|c| c.view == present_view && c.proj == present_proj);
         let warp_matrices = if same_camera && guest_size == dst_size {

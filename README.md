@@ -381,7 +381,8 @@ side freezes or dies.
 - Frames: a memory-mapped file in the temp directory, guarded by a seqlock. A frame is RGBA and
   can carry linear depth in metres, so the host can reproject it to its newest camera and let the
   nearer of its own pixel and the guest's win (`link::compose`, a CPU reference for testing and
-  small images; engines do the same on the GPU).
+  small images; engines do the same on the GPU, and `rewrite-bridge-bevy` does for a Bevy camera with
+  its [`compose` feature](rewrite-bridge-bevy/README.md#depth-compositing-of-a-guests-frames-feature-compose)).
 - Coordinates: the same glTF conventions as `Model`; each side converts its own.
 
 [`docs/CONTRACT.md`](docs/CONTRACT.md) is the versioned protocol (v1, revision 4), with every byte offset and C

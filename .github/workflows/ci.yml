@@ -51,3 +51,8 @@ jobs:
       - run: cargo test -p rewrite-bridge-bevy
       - run: cargo build -p rewrite-bridge-bevy --example viewer --features viewer
       - run: cargo clippy -p rewrite-bridge-bevy --all-targets --features viewer -- -D warnings
+      # The GPU compositing (feature `compose`): its tests compare the shaders with link::compose and skip
+      # themselves where the runner has no GPU adapter
+      - run: cargo test -p rewrite-bridge-bevy --features compose,viewer
+      - run: cargo build -p rewrite-bridge-bevy --example guest_compose --features compose,viewer
+      - run: cargo clippy -p rewrite-bridge-bevy --all-targets --features compose,viewer -- -D warnings

@@ -120,6 +120,9 @@ fn render(
     after_start: impl FnOnce(&mut World),
 ) -> Option<Image> {
     super::tests::gpu()?;
+    // Two Bevy apps starting at once in one process trip over each other's shader loading
+    static ONE_APP_AT_A_TIME: Mutex<()> = Mutex::new(());
+    let _one = ONE_APP_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = App::new();
     app.add_plugins(
         DefaultPlugins
@@ -274,7 +277,7 @@ fn a_late_frame_is_reprojected_to_the_camera_the_view_presents() {
     type Seen = Arc<Mutex<Option<(HostCamera, HostCamera, GuestFrame)>>>;
     let seen: Seen = Arc::default();
 
-    let run = |reproject_on: bool| {
+    let run = |reproject_on: bool, with_depth: bool| {
         let seen = seen.clone();
         render(b, false, reproject_on, move |world| {
             let mut query =
@@ -285,7 +288,7 @@ fn a_late_frame_is_reprojected_to_the_camera_the_view_presents() {
             let present = super::host_camera(global, proj, size).unwrap();
             let render_cam = super::host_camera(&GlobalTransform::from(a), proj, size).unwrap();
             let (rgba, depth) = super::tests::render_guest(&render_cam, SIZE, true);
-            let frame = GuestFrame::new(1, 0, 5, SIZE, rgba, Some(depth)).unwrap();
+            let frame = GuestFrame::new(1, 0, 5, SIZE, rgba, with_depth.then_some(depth)).unwrap();
             let mut frames = world.resource_mut::<GuestFrames>();
             frames.push_camera(5, render_cam);
             frames.push_camera(6, present);
@@ -293,11 +296,11 @@ fn a_late_frame_is_reprojected_to_the_camera_the_view_presents() {
             *seen.lock().unwrap() = Some((render_cam, present, frame));
         })
     };
-    let Some(late) = run(true) else {
+    let Some(late) = run(true, true) else {
         eprintln!("SKIP: no GPU adapter");
         return;
     };
-    let as_is = run(false).expect("a picture");
+    let as_is = run(false, true).expect("a picture");
     let (render_cam, present, frame) = seen.lock().unwrap().take().unwrap();
     let depth: Vec<f32> = frame.depth.as_ref().unwrap().to_vec();
     let n = (SIZE.0 * SIZE.1) as usize;
@@ -340,4 +343,12 @@ fn a_late_frame_is_reprojected_to_the_camera_the_view_presents() {
     compare("composited as it came", &as_is, reference(false));
     // and the reprojection did move the picture
     assert_ne!(late.data, as_is.data);
+
+    // A frame without depth cannot be warped (a pixel's position needs its distance), so it is pasted as
+    // it came whatever the ring holds
+    let pasted = run(true, false).expect("a picture");
+    let expected = composite(&host_rgba, &host_t, &frame.rgba, &vec![1.0; n])
+        .unwrap()
+        .rgba;
+    compare("pasted, no depth plane", &pasted, expected);
 }

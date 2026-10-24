@@ -146,6 +146,96 @@ struct Run<'a> {
     params: ComposeParams,
 }
 
+/// Fills `depth_view` (a `Depth32Float` texture) with the values of `d_src` (an `R32Float` texture): a
+/// depth texture can only be written by drawing, so a pass copies them over with `frag_depth`.
+fn fill_depth(
+    device: &RenderDevice,
+    encoder: &mut bevy::render::render_resource::CommandEncoder,
+    d_src: &bevy::render::render_resource::Texture,
+    depth_view: &bevy::render::render_resource::TextureView,
+) {
+    let module = device.create_and_validate_shader_module(ShaderModuleDescriptor {
+        label: Some("fill_depth"),
+        source: ShaderSource::Wgsl(FILL_DEPTH.into()),
+    });
+    let layout = device.create_bind_group_layout(
+        "fill_depth_layout",
+        &[bevy::render::render_resource::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: ShaderStages::FRAGMENT,
+            ty: bevy::render::render_resource::BindingType::Texture {
+                sample_type: bevy::render::render_resource::TextureSampleType::Float {
+                    filterable: false,
+                },
+                view_dimension: bevy::render::render_resource::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        }],
+    );
+    let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(
+        &bevy::render::render_resource::RawRenderPipelineDescriptor {
+            label: Some("fill_depth"),
+            layout: Some(&pipeline_layout),
+            vertex: bevy::render::render_resource::RawVertexState {
+                module: &module,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(bevy::render::render_resource::RawFragmentState {
+                module: &module,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[],
+            }),
+            primitive: Default::default(),
+            depth_stencil: Some(bevy::render::render_resource::DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(bevy::render::render_resource::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        },
+    );
+    let d_view = d_src.create_view(&TextureViewDescriptor::default());
+    let bind = device.create_bind_group(
+        "fill_depth_bind",
+        &layout,
+        &[BindGroupEntry {
+            binding: 0,
+            resource: BindingResource::TextureView(&d_view),
+        }],
+    );
+    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+        label: Some("fill_depth"),
+        color_attachments: &[],
+        depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+            view: depth_view,
+            depth_ops: Some(Operations {
+                load: bevy::render::render_resource::LoadOp::Clear(0.0),
+                store: StoreOp::Store,
+            }),
+            stencil_ops: None,
+        }),
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(&pipeline);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.draw(0..3, 0..1);
+}
+
 /// Runs the GPU passes and reads the target back (`size.0 * size.1 * 4` bytes, tightly packed).
 fn run_gpu(device: &RenderDevice, queue: &RenderQueue, run: &Run) -> Vec<u8> {
     let (w, h) = run.host.size;
@@ -192,88 +282,7 @@ fn run_gpu(device: &RenderDevice, queue: &RenderQueue, run: &Run) -> Vec<u8> {
     let target_view = target.create_view(&TextureViewDescriptor::default());
 
     let mut encoder = Engine::new_encoder(device);
-    {
-        let module = device.create_and_validate_shader_module(ShaderModuleDescriptor {
-            label: Some("fill_depth"),
-            source: ShaderSource::Wgsl(FILL_DEPTH.into()),
-        });
-        let layout = device.create_bind_group_layout(
-            "fill_depth_layout",
-            &[bevy::render::render_resource::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: ShaderStages::FRAGMENT,
-                ty: bevy::render::render_resource::BindingType::Texture {
-                    sample_type: bevy::render::render_resource::TextureSampleType::Float {
-                        filterable: false,
-                    },
-                    view_dimension: bevy::render::render_resource::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            }],
-        );
-        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_render_pipeline(
-            &bevy::render::render_resource::RawRenderPipelineDescriptor {
-                label: Some("fill_depth"),
-                layout: Some(&pipeline_layout),
-                vertex: bevy::render::render_resource::RawVertexState {
-                    module: &module,
-                    entry_point: Some("vs"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                fragment: Some(bevy::render::render_resource::RawFragmentState {
-                    module: &module,
-                    entry_point: Some("fs"),
-                    compilation_options: Default::default(),
-                    targets: &[],
-                }),
-                primitive: Default::default(),
-                depth_stencil: Some(bevy::render::render_resource::DepthStencilState {
-                    format: TextureFormat::Depth32Float,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(bevy::render::render_resource::CompareFunction::Always),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: Default::default(),
-                multiview_mask: None,
-                cache: None,
-            },
-        );
-        let d_view = d_src.create_view(&TextureViewDescriptor::default());
-        let bind = device.create_bind_group(
-            "fill_depth_bind",
-            &layout,
-            &[BindGroupEntry {
-                binding: 0,
-                resource: BindingResource::TextureView(&d_view),
-            }],
-        );
-        let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-            label: Some("fill_depth"),
-            color_attachments: &[],
-            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
-                view: &depth_view,
-                depth_ops: Some(Operations {
-                    load: bevy::render::render_resource::LoadOp::Clear(0.0),
-                    store: StoreOp::Store,
-                }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.draw(0..3, 0..1);
-    }
+    fill_depth(device, &mut encoder, &d_src, &depth_view);
 
     let buffers = run
         .params
@@ -1007,4 +1016,147 @@ fn a_viewport_inside_a_larger_target_leaves_the_rest_alone() {
     }
     let df = diff(&cpu, &gpu_in, vp.0);
     assert_eq!(df.differing, 0, "{:?}", df.first);
+}
+
+/// Frame times of the GPU path, upload included, waiting for the GPU to finish each frame. Not a
+/// test of anything: run it with
+/// `cargo test --release -p rewrite-bridge-bevy --features compose --lib frame_times -- --ignored --nocapture`.
+#[test]
+#[ignore = "a benchmark"]
+fn frame_times() {
+    use std::time::Instant;
+
+    let (device, queue) = gpu_or_skip!();
+    for (host_size, guest_size) in [
+        ((1280, 720), (640, 360)),
+        ((1920, 1080), (640, 360)),
+        ((1920, 1080), (1280, 720)),
+        ((2560, 1440), (960, 540)),
+    ] {
+        let render = camera([0.0, 1.5, 2.0], [0.0, 1.0, -4.0], guest_size, f32::INFINITY);
+        let present = camera([0.35, 1.5, 2.0], [0.2, 1.0, -4.0], host_size, f32::INFINITY);
+        let (g_rgba, g_depth) = render_guest(&render, guest_size, true);
+        let guest_frame = frame(g_rgba, Some(g_depth), guest_size);
+        let (h_rgba, h_t) = render_host(host_size);
+        let d = to_buffer(&h_t, &present);
+
+        let mut engine = Engine::new(device);
+        let format = TextureFormat::Rgba8UnormSrgb;
+        engine.prepare_format(device, format);
+        let mut guest = GuestGpu::new(device, guest_size, true);
+        let host_tex = texture(
+            device,
+            host_size,
+            format,
+            TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        );
+        write(queue, &host_tex, host_size, &h_rgba);
+        let host_view = host_tex.create_view(&TextureViewDescriptor::default());
+        let d_src = texture(
+            device,
+            host_size,
+            TextureFormat::R32Float,
+            TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        );
+        write(queue, &d_src, host_size, bytemuck::cast_slice(&d));
+        let depth_tex = texture(
+            device,
+            host_size,
+            TextureFormat::Depth32Float,
+            TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT,
+        );
+        let depth_view = depth_tex.create_view(&TextureViewDescriptor::default());
+        let target = texture(
+            device,
+            host_size,
+            format,
+            TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        );
+        let target_view = target.create_view(&TextureViewDescriptor::default());
+        let mut encoder = Engine::new_encoder(device);
+        fill_depth(device, &mut encoder, &d_src, &depth_view);
+        queue.submit([encoder.finish()]);
+
+        for warp in [false, true] {
+            let mut p = params(
+                &guest_frame,
+                host_size,
+                &present,
+                warp.then_some(&render),
+                true,
+            );
+            if !warp && guest_size != host_size {
+                // without a warp the frame has to be the viewport's size; resample instead
+                p.warp = WarpMatrices::new(&present, &present.view, &present.proj);
+            }
+            let buffers = p
+                .warp
+                .is_some()
+                .then(|| WarpBuffers::new(device, guest_size, host_size));
+            let mut times = Vec::new();
+            for i in 0..70 {
+                let began = Instant::now();
+                guest.upload(queue, &guest_frame);
+                let mut encoder = Engine::new_encoder(device);
+                if let Some(b) = &buffers {
+                    engine.encode_warp(device, &mut encoder, &p, &guest, b);
+                }
+                engine.encode_composite(
+                    device,
+                    &mut encoder,
+                    &p,
+                    &guest,
+                    buffers.as_ref(),
+                    &host_view,
+                    &depth_view,
+                    &target_view,
+                    format,
+                );
+                queue.submit([encoder.finish()]);
+                device.poll(PollType::wait_indefinitely()).unwrap();
+                if i >= 10 {
+                    times.push(began.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            times.sort_by(f64::total_cmp);
+            let mean = times.iter().sum::<f64>() / times.len() as f64;
+            eprintln!(
+                "host {}x{}, guest {}x{}, {}: mean {:.2} ms, median {:.2} ms, worst {:.2} ms",
+                host_size.0,
+                host_size.1,
+                guest_size.0,
+                guest_size.1,
+                if warp {
+                    "reproject + composite"
+                } else {
+                    "resample + composite"
+                },
+                mean,
+                times[times.len() / 2],
+                times[times.len() - 1],
+            );
+        }
+    }
+
+    // The CPU reference for one of the sizes
+    let (host_size, guest_size) = ((1280, 720), (640, 360));
+    let render = camera([0.0, 1.5, 2.0], [0.0, 1.0, -4.0], guest_size, f32::INFINITY);
+    let present = camera([0.35, 1.5, 2.0], [0.2, 1.0, -4.0], host_size, f32::INFINITY);
+    let (g_rgba, g_depth) = render_guest(&render, guest_size, true);
+    let guest_frame = frame(g_rgba, Some(g_depth), guest_size);
+    let (h_rgba, h_t) = render_host(host_size);
+    let began = std::time::Instant::now();
+    let _ = cpu_result(
+        &h_rgba,
+        &h_t,
+        &guest_frame,
+        &render,
+        &present,
+        host_size,
+        true,
+    );
+    eprintln!(
+        "CPU reference (compose.rs), host 1280x720, guest 640x360, reproject + composite: {:.0} ms",
+        began.elapsed().as_secs_f64() * 1000.0
+    );
 }

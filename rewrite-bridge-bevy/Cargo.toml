@@ -47,3 +47,7 @@ compose = ["rewrite-bridge/link", "bevy/bevy_core_pipeline", "dep:bytemuck"]
 [[example]]
 name = "viewer"
 required-features = ["viewer"]
+
+[[example]]
+name = "guest_compose"
+required-features = ["compose", "viewer"]

@@ -110,6 +110,90 @@ does not account for that when culling. Instances (and rigid meshes on nodes) th
 copy of their material with front-face culling, as Bevy's glTF loader does, made once per material. A pose
 that animates a node into a mirror is not followed.
 
+## Depth compositing of a guest's frames (feature `compose`)
+
+A passthrough guest (docs/CONTRACT.md, section 9) can send RGBA frames with a depth plane in linear metres.
+With the `compose` feature this crate puts them into a Bevy camera's image: the guest's pixel wins where its
+distance is smaller than the camera's own depth buffer says, the camera's pixel wins where it is nearer, and
+a frame that arrives late is first reprojected from the camera it was rendered with to the camera the view
+presents now. It is the GPU form of the core crate's CPU reference, `rewrite_bridge::link::compose`
+(contract section 9.7), with the same rules and tested against it.
+
+```toml
+rewrite-bridge-bevy = { version = "0.2", features = ["compose"] }
+```
+
+```rust
+use bevy::prelude::*;
+use rewrite_bridge::link::LinkConfig;
+use rewrite_bridge_bevy::compose::*;
+
+App::new()
+    .add_plugins((
+        DefaultPlugins,
+        GuestComposePlugin::default(),
+        // optional: listens for a guest, sends it the camera, reads its frames
+        HostLinkPlugin::new(LinkConfig::new("My Game")),
+    ))
+    .add_systems(Startup, |mut commands: Commands| {
+        commands.spawn((Camera3d::default(), Msaa::Off, GuestCompose::default()));
+    })
+    .run();
+```
+
+| | |
+|---|---|
+| `GuestComposePlugin` | the render passes and the `GuestFrames` resource |
+| `GuestCompose` (component) | on a `Camera3d`: composite the guest's frames into it; `reproject: false` skips the warp |
+| `GuestFrames` (resource) | the newest `GuestFrame` and the ring of host cameras (`push_camera(seq, camera)`, `set_frame(frame)`), for an app that runs its own `Link` |
+| `HostLinkPlugin` | `Link::host` as a plugin: polls it, reads the pixel file the guest announces, and sends the `GuestCompose` camera once per frame, remembered under the `seq` the link gives it |
+| `host_camera` | a Bevy camera as the contract's `Camera` (view, projection, near, far, reversed depth) |
+
+How a frame gets onto the screen: the guest's colour (`Rgba8Uint`, the bytes as the file carries them) and
+depth (`R32Float`) are uploaded once per frame. After the main pass, three compute passes reproject them to
+the view (a splat of each source pixel's warped square, the nearest surface wins, ties go to the lowest
+source index, exactly as the reference loops), and one fullscreen pass composites: it converts the camera's
+depth buffer to metres from the camera's own projection, tests it against the guest's depth, and blends with
+the contract's straight-alpha "over" in the sRGB-encoded 8-bit values, with the reference's integer
+arithmetic (an `*Srgb` target is converted to encoded values and back around the blend). A frame the size of
+a different view is resampled with the reference's rule for frames it could not match to a camera; a frame
+without a depth plane is pasted over the image, as the contract says, and is never warped.
+
+What the camera has to be: a perspective projection, `Msaa::Off`, and not `Hdr`. Anything else is left alone
+with a warning (see the module docs of `rewrite_bridge_bevy::compose` for why). Only what is in the depth
+buffer takes part, so alpha-blended host materials neither hide the guest nor are hidden by it, and TAA
+jitter is not accounted for.
+
+**Verified against the CPU reference.** `cargo test -p rewrite-bridge-bevy --features compose,viewer`
+renders the same scenes through `link::compose` and through the shaders and compares every pixel: the plain
+composite (both occlusion directions, translucent guest pixels, translucent host pixels, a finite and an
+infinite far plane, a viewport inside a larger target, a frame without depth) must match exactly and does;
+through an sRGB target it may be off by one step and is not; reprojection (a sideways move, a move forward and
+a turn, a lunge at the ground, a finite far plane, frames 1.7, 5 and 20 times smaller than the view) may differ
+at footprint edges in at most 0.05% of the pixels, because the shaders run in `f32` where the reference is
+`f64`, and on the development GPU (Apple M5, Metal) it differs in none of them except for 6 pixels (0.031%) in
+the 20 times stretch. A test inside a headless Bevy app checks the wiring (host boxes hiding and covering a
+guest layer, a late frame reprojected to the camera the real `ExtractedView` has). Without a GPU adapter the
+tests print `SKIP`.
+
+**Cost.** One frame's upload, reprojection and composite, waiting for the GPU to finish it, in a release
+build on the same machine: 0.7 ms for a 640x360 guest frame into a 1280x720 view, 1.0 ms into 1920x1080, 2.0 ms
+for a 1280x720 frame into 1920x1080 or a 960x540 one into 2560x1440. The CPU reference takes 10 ms for the
+first of these. (`cargo test --release -p rewrite-bridge-bevy --features compose --lib frame_times -- --ignored --nocapture`.)
+
+**Example.** `examples/guest_compose.rs` is a Bevy scene (ground, wall, pillar, crate) with the plugins above
+and a guest that is a thread of the same program: it speaks the link, ray-casts two spheres with the host's
+camera on the CPU and sends colour and depth, one sphere sunk into the wall and one that circles, sinks into
+the ground and passes behind the pillar. No game files.
+
+```sh
+cargo run --release --example guest_compose --features compose,window            # a window; R toggles reprojection
+cargo run --release --example guest_compose --features compose,viewer -- --screenshot out.png --latency 250
+# `--no-reproject`, `--no-depth`, `--no-guest`, `--swing 1.5`, `--size 1280x720`: see the top of the file
+# another guest instead of the built-in one (`bridge-guest`, or rewrite-bridge's `fake_guest --frames`):
+cargo run --release --example guest_compose --features compose,window -- --external
+```
+
 ## Memory
 
 `spawn_model_owned`, `spawn_animated_owned`, `spawn_scene` and `prepare_parts` take the model by value and move
@@ -122,7 +206,8 @@ light for sRGB) and add about a third to an image; turn them off with `SpawnOpti
 
 Bevy is a dependency with default features off, asking only for `std`, `bevy_asset`, `bevy_log`,
 `bevy_color`, `bevy_image`, `bevy_mesh`, `bevy_mikktspace`, `bevy_animation`, `bevy_curve`, `bevy_camera`,
-`bevy_light`, `bevy_render` and `bevy_pbr`. No audio, no gamepad, no windowing: your own `bevy` dependency adds
+`bevy_light`, `bevy_render` and `bevy_pbr` (the `compose` feature adds `bevy_core_pipeline`, for the render
+schedule it adds a pass to, and turns on `rewrite-bridge`'s `link` feature). No audio, no gamepad, no windowing: your own `bevy` dependency adds
 what your game wants, so on Linux this crate needs no `libasound2-dev` or `libudev-dev` (Bevy's `DefaultPlugins`
 with its default features does).
 
@@ -142,7 +227,8 @@ cargo run --release --example viewer --features window
 
 ## Tests
 
-`cargo test -p rewrite-bridge-bevy` covers meshes, materials, mip chains, the node hierarchy and skins, the
+With `--features compose` (and `viewer`, for the test that runs a whole headless app) the compositing tests
+above run too. `cargo test -p rewrite-bridge-bevy` covers meshes, materials, mip chains, the node hierarchy and skins, the
 conversion of every channel kind to Bevy curves, a clip played by name through Bevy's animation systems,
 instancing (shared handles, mirrored materials, lazily loaded assets, failures), light units and the sky's
 cube map orientation.
