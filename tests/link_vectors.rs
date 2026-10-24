@@ -24,20 +24,7 @@ use rewrite_bridge::link::*;
 use serde_json::Value;
 
 /// Vectors this implementation fails, `(id, why)`. Empty when it passes them all.
-const KNOWN_DISAGREEMENTS: &[(&str, &str)] = &[
-    (
-        "sess.host.control.invalid_utf8_ends_session",
-        "the reader's error path (Ctl::read_lines, poll_control) ends the session with end(reason, false): no bye; section 8 makes a line that is not a JSON object a protocol error answered with bye",
-    ),
-    (
-        "sess.host.control.line_of_65537_bytes_ends_session",
-        "an overlong line ends the session without a bye (same path); section 8 calls it a protocol error and 6.1 says every close for a protocol error writes a bye",
-    ),
-    (
-        "sess.host.control.65536_bytes_without_newline_ends_session",
-        "an overlong line ends the session without a bye (same path)",
-    ),
-];
+const KNOWN_DISAGREEMENTS: &[(&str, &str)] = &[];
 
 // ---------------------------------------------------------------------------------------------
 // Loading, reporting

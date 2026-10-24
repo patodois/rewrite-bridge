@@ -1098,23 +1098,25 @@ impl Ctl {
         Ok(())
     }
 
-    /// Reads what is available and splits complete lines off. The error, if any, applies after
-    /// the returned lines.
-    fn read_lines(&mut self) -> (Vec<String>, Option<String>) {
+    /// Reads what is available and splits complete lines off. The end, if any, applies after the
+    /// returned lines: the reason, and whether it is a protocol error (a line over [`MAX_LINE`] or
+    /// not UTF-8), which the peer is told about with a `bye` (contract sections 8 and 6.1), unlike a
+    /// connection that simply ended.
+    fn read_lines(&mut self) -> (Vec<String>, Option<(String, bool)>) {
         let mut lines = Vec::new();
         let mut buf = [0u8; 8192];
         let mut end = None;
         loop {
             match self.stream.read(&mut buf) {
                 Ok(0) => {
-                    end = Some("connection closed".to_owned());
+                    end = Some(("connection closed".to_owned(), false));
                     break;
                 }
                 Ok(n) => self.rbuf.extend_from_slice(&buf[..n]),
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 Err(e) => {
-                    end = Some(format!("control read failed: {e}"));
+                    end = Some((format!("control read failed: {e}"), false));
                     break;
                 }
             }
@@ -1127,16 +1129,16 @@ impl Ctl {
             let line = &self.rbuf[start..start + i + 1];
             start += i + 1;
             if line.len() > MAX_LINE {
-                return (lines, Some("control line too long".into()));
+                return (lines, Some(("control line too long".into(), true)));
             }
             match std::str::from_utf8(line) {
                 Ok(s) => lines.push(s.to_owned()),
-                Err(_) => return (lines, Some("control line is not UTF-8".into())),
+                Err(_) => return (lines, Some(("control line is not UTF-8".into(), true))),
             }
         }
         self.rbuf.drain(..start);
         if self.rbuf.len() >= MAX_LINE {
-            return (lines, Some("control line too long".into()));
+            return (lines, Some(("control line too long".into(), true)));
         }
         (lines, end)
     }
@@ -1498,8 +1500,8 @@ impl Link {
                 return;
             }
         }
-        if let Some(reason) = end {
-            self.end(reason, false);
+        if let Some((reason, bye)) = end {
+            self.end(reason, bye);
         }
     }
 
