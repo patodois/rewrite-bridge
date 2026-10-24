@@ -847,8 +847,8 @@ Shots are game content: they stay out of version control.
 - **Tests and CI work without the game** (section 10). nocturne-unpack's CI runs `fmt`, `clippy` and
   the tests with and without the `bridge` feature on Linux, macOS and Windows.
 - **Say what is left out.** Every provider has a section of what its data holds that the bridge
-  cannot carry or that the provider does not read: hytale-unpack's attachments, `shapeVisible` and
-  biome tints; nocturne-unpack's texture samplers, vertex colours and second UV set; wt-unpack's
+  cannot carry or that the provider does not read: hytale-unpack's random attachment sets,
+  `shapeVisible` and biome tints; nocturne-unpack's texture samplers, vertex colours and second UV set; wt-unpack's
   `NOT_APPLIED` list of what its level scenes leave out. It is the most useful part of a README for the next person.
 - **Say what you could not verify.** hytale-unpack states which of its block rotations are checked
   against real data (yaw) and which could not be (pitch and roll) and where one line flips the sign.
