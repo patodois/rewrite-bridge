@@ -98,8 +98,14 @@ def main():
         stats = r.get("stats") if r else None
         if stats:
             for k, v in sorted(stats.items()):
-                if v != 0:
-                    problems.append("%s: stats.%s is %r, expected 0" % (who, k, v))
+                # One datagram may legitimately be counted foreign by the guest: the host sends a Heartbeat right
+                # after its hello line, on another socket, so the guest can read that datagram before it has read
+                # the line, while it has no session yet (seen as state=Handshake, kind 1, seq 0 on the C# guest
+                # against the C host; every library has this window). The guest sends nothing before the host's
+                # hello, so the host's count stays exactly 0, as does every other counter.
+                allowed = 1 if (who == "guest" and k == "foreign") else 0
+                if v > allowed:
+                    problems.append("%s: stats.%s is %r, expected at most %d" % (who, k, v, allowed))
     for p in problems:
         print(p)
     sys.exit(1 if problems else 0)

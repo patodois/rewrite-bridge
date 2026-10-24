@@ -39,7 +39,7 @@ keys (a count is an integer; `stats` is `null` when the library has no counters)
 | `frames_bad` | frames announced but missing or wrong |
 | `focus` | focus events seen, in order, as strings `"<focus>:<kind>"`: `<focus>` is the `focus` value the event carries (`host` or `guest`), `<kind>` is `request` when the event says the peer asked for it (what a host sees) and `set` when the peer set it (what a guest sees) |
 | `lost_reason` | the reason text of the `Lost` event, or `null` |
-| `stats` | `{"malformed","foreign","stale","unknown_entity","spawn_ignored"}` from the library's counters, or `null`. Read when the rounds are over: by the host just before it sends its `despawn` of 3, by the guest on seeing that despawn. (Later, a heartbeat of the other side still in flight when the session ends is legitimately "foreign" to a link that is no longer in a session.) |
+| `stats` | `{"malformed","foreign","stale","unknown_entity","spawn_ignored"}` from the library's counters, or `null`. Read when the rounds are over: by the host just before it sends its `despawn` of 3, by the guest on seeing that despawn. (Later, a heartbeat of the other side still in flight when the session ends is legitimately "foreign" to a link that is no longer in a session.) `check_results.py` expects every counter to be 0, except that a guest may count one `foreign`: the host sends a `Heartbeat` immediately after its `hello` line, on another socket, and the guest can read that datagram before the line, when it has no session yet. |
 
 ## The session
 
