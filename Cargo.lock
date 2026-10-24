@@ -3547,6 +3547,7 @@ name = "rewrite-bridge-bevy"
 version = "0.2.1"
 dependencies = [
  "bevy",
+ "bytemuck",
  "rewrite-bridge",
 ]
 

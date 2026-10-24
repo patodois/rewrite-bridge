@@ -74,6 +74,8 @@
 //! audio, input), so a game that wants no audio or gamepad support does not get it from here.
 
 pub mod animated;
+#[cfg(feature = "compose")]
+pub mod compose;
 pub mod model;
 pub mod scene;
 

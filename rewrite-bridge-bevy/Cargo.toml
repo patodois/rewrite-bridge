@@ -11,6 +11,8 @@ categories = ["game-development"]
 
 [dependencies]
 rewrite-bridge = { path = "..", version = "0.2.1" }
+# Uploading depth as bytes (only the `compose` feature uses it; it is already in Bevy's own tree)
+bytemuck = { version = "1", optional = true }
 
 [dependencies.bevy]
 version = "0.20"
@@ -37,6 +39,10 @@ features = [
 viewer = ["bevy/bevy_core_pipeline", "bevy/bevy_window", "bevy/png", "bevy/multi_threaded", "bevy/async_executor"]
 # ... and to open a window
 window = ["viewer", "bevy/bevy_winit", "bevy/x11", "bevy/wayland"]
+
+# GPU depth compositing and reprojection of a guest's frames (docs/CONTRACT.md section 9.7): the
+# passthrough link's types and the render-graph node it adds to a camera.
+compose = ["rewrite-bridge/link", "bevy/bevy_core_pipeline", "dep:bytemuck"]
 
 [[example]]
 name = "viewer"
