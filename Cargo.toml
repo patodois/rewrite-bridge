@@ -42,6 +42,11 @@ required-features = ["link"]
 name = "fake_guest"
 required-features = ["link"]
 
+# The Rust side of the scripted cross-language session of tests/interop/README.md.
+[[example]]
+name = "interop_peer"
+required-features = ["link"]
+
 [[test]]
 name = "link_loopback"
 required-features = ["link"]

@@ -406,6 +406,12 @@ Without the feature the crate still has no dependencies; with it, it uses `memma
 `serde_json`. The link only exchanges what each process publishes about itself: it never reads
 another process's memory or injects code.
 
+The four implementations of the link (this crate, [link-java](https://github.com/patodois/link-java),
+[link-c](https://github.com/patodois/link-c), [link-cs](https://github.com/patodois/link-cs)) are held to the
+contract by shared test vectors, [`tests/vectors/link`](tests/vectors/link/README.md) (every implementation runs
+them in its own test suite), and by a cross-language interop job that runs all 16 host/guest pairs over real
+sockets and a real pixel file, [`tests/interop`](tests/interop/README.md).
+
 ## Examples
 
 All are in [`examples/`](examples). None needs game files.
@@ -415,6 +421,7 @@ All are in [`examples/`](examples). None needs game files.
 | `cube_provider` | A complete provider in one file: the example of the [guide](docs/WRITING_A_PROVIDER.md). Exits 0. |
 | `conformance` | The conformance checker run on a toy provider with one good and one deliberately wrong asset. |
 | `fake_host`, `fake_guest` | A host and a guest for the passthrough link, to see it work. Need `--features link`. |
+| `interop_peer` | This crate's side of the scripted cross-language session of [`tests/interop`](tests/interop/README.md). Needs `--features link`. |
 
 ### A provider and the checker
 

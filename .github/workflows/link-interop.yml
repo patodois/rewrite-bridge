@@ -1,0 +1,66 @@
+name: Link interop
+
+# Every host/guest pair among the four implementations of the link (Rust here, link-java, link-c, link-cs) runs the
+# same scripted session over real sockets and a real pixel file; see tests/interop/README.md. Linux only: the point is
+# the wire, and the per-OS behaviour of each implementation is covered by its own CI. The other repositories are
+# checked out at the revisions pinned in tests/interop/pins.txt, so a change there cannot break this repository's CI
+# until the pin is moved on purpose (move it in the same pull request that needs it).
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  interop:
+    name: 16 host/guest pairs (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the pinned revisions
+        id: pins
+        run: |
+          for r in link-java link-c link-cs; do
+            sha=$(awk -v r="$r" '$1 == r { print $2 }' tests/interop/pins.txt)
+            test -n "$sha" || { echo "no pin for $r"; exit 1; }
+            echo "${r//-/_}=$sha" >> "$GITHUB_OUTPUT"
+          done
+      - uses: actions/checkout@v4
+        with:
+          repository: patodois/link-java
+          ref: ${{ steps.pins.outputs.link_java }}
+          path: peers/link-java
+      - uses: actions/checkout@v4
+        with:
+          repository: patodois/link-c
+          ref: ${{ steps.pins.outputs.link_c }}
+          path: peers/link-c
+      - uses: actions/checkout@v4
+        with:
+          repository: patodois/link-cs
+          ref: ${{ steps.pins.outputs.link_cs }}
+          path: peers/link-cs
+      # The vectors are copied into each repository and pinned there by digest; the copies must be this directory.
+      - name: The other repositories carry exactly these vectors
+        run: |
+          for r in link-java link-c link-cs; do scripts/sync-link-vectors.sh --check "peers/$r"; done
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Build the four peers and run the 16 pairs
+        run: tests/interop/run.sh --build
+        env:
+          RBL_LINK_JAVA_DIR: ${{ github.workspace }}/peers/link-java
+          RBL_LINK_C_DIR: ${{ github.workspace }}/peers/link-c
+          RBL_LINK_CS_DIR: ${{ github.workspace }}/peers/link-cs
+          RBL_LOG_DIR: ${{ github.workspace }}/interop-logs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: interop-logs
+          path: interop-logs
