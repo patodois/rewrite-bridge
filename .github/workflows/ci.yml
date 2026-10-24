@@ -19,6 +19,11 @@ jobs:
           components: clippy
       - run: cargo test
       - run: cargo test --features link
+      # The shared link vectors are consumed by four implementations; the files must be exactly what the generator
+      # writes (the generator is the vectors' source, see tests/vectors/link/README.md). Ran by tests/link_vectors.rs
+      # above on every OS.
+      - run: python3 tests/vectors/link/gen.py --check
+        if: runner.os == 'Linux'
       # `cargo test` also runs the tests of the cube provider (the guide's example) and tests/docs.rs
       # (the guide shows the example as it is; the links in the docs lead somewhere)
       - run: cargo run --example cube_provider

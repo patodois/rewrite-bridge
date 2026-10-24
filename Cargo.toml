@@ -49,3 +49,8 @@ required-features = ["link"]
 [[test]]
 name = "link_review"
 required-features = ["link"]
+
+# The shared protocol vectors of tests/vectors/link, also run by link-java, link-c and link-cs.
+[[test]]
+name = "link_vectors"
+required-features = ["link"]
