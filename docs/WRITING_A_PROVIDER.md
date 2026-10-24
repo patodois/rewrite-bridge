@@ -5,14 +5,15 @@ rewrite-bridge types, so that any renderer can draw them without knowing the gam
 from an empty crate to a published one, with a complete example you can run (section 5).
 
 It was written from four real providers, and every statement about them was checked against the
-code at these commits (the repositories keep moving, so the commit is the reference):
+code at these commits (the repositories keep moving, so the commit is the reference). The last column is the
+first commit of each provider that takes rewrite-bridge from crates.io (`0.2.1`) instead of the `v0.1.0` git tag:
 
-| crate | game | commit read |
-|---|---|---|
-| [wt-unpack](https://github.com/patodois/wt-unpack) | War Thunder | `bc111a7` |
-| [wf-unpack](https://github.com/patodois/wf-unpack) | Warframe | `d5c33e7` |
-| [hytale-unpack](https://github.com/patodois/hytale-unpack) | Hytale | `9bbf066` |
-| [nocturne-unpack](https://github.com/patodois/nocturne-unpack) | Shin Megami Tensei III Nocturne HD Remaster | `826b963` |
+| crate | game | commit read | on crates.io from |
+|---|---|---|---|
+| [wt-unpack](https://github.com/patodois/wt-unpack) | War Thunder | `bc111a7` | `4915291` |
+| [wf-unpack](https://github.com/patodois/wf-unpack) | Warframe | `d5c33e7` | `e3ec925` |
+| [hytale-unpack](https://github.com/patodois/hytale-unpack) | Hytale | `9bbf066` | `dbc7cbe` |
+| [nocturne-unpack](https://github.com/patodois/nocturne-unpack) | Shin Megami Tensei III Nocturne HD Remaster | `826b963` | `49df6cc` |
 
 New words (node, skin, socket, seqlock ...) are in the [glossary](../README.md#glossary).
 
@@ -88,20 +89,26 @@ readers can be used without the bridge):
 ```toml
 [dependencies]
 # The bridge to other game rewrites
-rewrite-bridge = { git = "https://github.com/patodois/rewrite-bridge", tag = "v0.1.0", optional = true }
+rewrite-bridge = { version = "0.2.1", optional = true }
 
 [features]
 default = ["bridge"]
 bridge = ["dep:rewrite-bridge"]
 ```
 
-> **One tag for the whole build.** Every crate in one build that depends on rewrite-bridge must
-> name the same `tag`. A provider pinned to one revision and a renderer pinned to another are
-> built against two different crates that happen to share a name, and nothing from one is accepted
-> by the other. The compiler's complaint is `E0277` with the note
+> **One copy for the whole build.** Every crate in one build that depends on rewrite-bridge must
+> end up with the same copy of it. Two copies are two crates that happen to share a name, and nothing
+> from one is accepted by the other. The compiler's complaint is `E0277` with the note
 > *there are multiple different versions of crate `rewrite_bridge` in the dependency graph*.
-> `cargo tree -i rewrite-bridge` must list one entry. The [README](../README.md#one-tag-for-the-whole-build)
-> shows the symptom in full.
+>
+> From crates.io Cargo does this for you: `"0.2"`, `"0.2.1"` and `"^0.2.1"` all resolve to the same
+> release, which is built once, so a provider that asks for `"0.2"` and a renderer that asks for `"0.2"`
+> (or `"0.2.1"`) share it. Before 1.0 the minor number is the breaking one, so stay on one `0.x` line:
+> a `"0.3"` in the build would be a second copy. A `git` dependency, a `path` or a `[patch]` is a
+> different source and therefore a different copy too, which is why providers should depend on the
+> crates.io release and not on a tag or a revision.
+> `cargo tree -i rewrite-bridge` must list one entry, and `cargo tree -d` shows what is duplicated.
+> The [README](../README.md#one-copy-for-the-whole-build) shows the symptom in full.
 
 ## 3. Find and open the install
 
@@ -809,8 +816,9 @@ loads items from every provider into one Bevy gallery, under the same light, wit
 2 m ruler for scale, an arrow on the ground showing the +Z front of every item, and the axes at the
 origin. To add yours:
 
-1. add the crate as an optional dependency and a cargo feature in the testbed's `Cargo.toml` (pin
-   the same `rewrite-bridge` tag as every other crate there);
+1. add the crate as an optional dependency and a cargo feature in the testbed's `Cargo.toml` (it
+   must depend on the crates.io `rewrite-bridge` of the same `0.x` line as every other crate there,
+   so that Cargo builds one copy);
 2. add the name to `PROVIDER_NAMES` in `src/config.rs` and a match arm in `src/providers.rs` that
    opens your provider from `[providers.<name>] path = "..."` (the arm for the Hytale provider is the
    shortest to copy);
@@ -851,14 +859,14 @@ Shots are game content: they stay out of version control.
   published terms and what they do not say. This guide is not legal advice and neither is theirs; read the
   game's terms yourself and leave the decision about reading one's own install to the user.
 - **License.** The four providers and this crate are `MIT OR Apache-2.0`.
-- **Pin the tag** (section 2), and update the pin in one move across everything you build together.
+- **Depend on the crates.io release** (`rewrite-bridge = "0.2"`, section 2), and move every crate you build together to the next `0.x` line in one step, since a different minor line is a different copy.
 - **Tell people.** Once the provider is public, add a row to the "Projects using it" table of the
   [README](../README.md#projects-using-it).
 
 ## 14. Checklist
 
-- [ ] Library plus thin command line; `bridge` feature; `rewrite-bridge` pinned to a `tag`, the same
-      one as every other crate in the build.
+- [ ] Library plus thin command line; `bridge` feature; `rewrite-bridge` from crates.io on the same
+      `0.x` line as every other crate in the build (one copy in `cargo tree -i rewrite-bridge`).
 - [ ] The install path is an argument; a default per OS, an environment variable and `~` expansion
       exist; a wrong folder is an error that names it.
 - [ ] `list`: stable ids from the game's paths, only what draws, honest `AssetKind`, sorted, indexed once.

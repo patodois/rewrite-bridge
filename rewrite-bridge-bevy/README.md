@@ -1,5 +1,8 @@
 # rewrite-bridge-bevy
 
+[![crates.io](https://img.shields.io/crates/v/rewrite-bridge-bevy.svg)](https://crates.io/crates/rewrite-bridge-bevy)
+[![docs.rs](https://img.shields.io/docsrs/rewrite-bridge-bevy)](https://docs.rs/rewrite-bridge-bevy)
+
 A [Bevy](https://bevy.org) 0.20 plugin for [rewrite-bridge](https://github.com/patodois/rewrite-bridge):
 load the models, skins, animations and scenes of any game rewrite's `Provider` into a Bevy game in a few
 lines. It knows nothing about any game; it spawns what the bridge's types describe.
@@ -7,12 +10,13 @@ lines. It knows nothing about any game; it spawns what the bridge's types descri
 ```toml
 [dependencies]
 bevy = "0.20"
-rewrite-bridge = { git = "https://github.com/patodois/rewrite-bridge", tag = "v0.1.0" }
-rewrite-bridge-bevy = { git = "https://github.com/patodois/rewrite-bridge", tag = "v0.1.0" }
+rewrite-bridge = "0.2"
+rewrite-bridge-bevy = "0.2"
 ```
 
-Use the same tag for both, and for every provider you add: two tags are two different crates to Cargo
-(see [one tag for the whole build](../README.md#one-tag-for-the-whole-build)).
+Both come from crates.io, so every provider you add shares the one copy of rewrite-bridge that this plugin
+uses, as long as it asks for the same `0.2` line (see
+[one copy for the whole build](https://github.com/patodois/rewrite-bridge#one-copy-for-the-whole-build)).
 
 ```rust
 use bevy::prelude::*;

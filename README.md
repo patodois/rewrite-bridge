@@ -1,5 +1,10 @@
 # rewrite-bridge
 
+[![crates.io](https://img.shields.io/crates/v/rewrite-bridge.svg)](https://crates.io/crates/rewrite-bridge)
+[![docs.rs](https://img.shields.io/docsrs/rewrite-bridge)](https://docs.rs/rewrite-bridge)
+[![rewrite-bridge-bevy on crates.io](https://img.shields.io/crates/v/rewrite-bridge-bevy.svg?label=rewrite-bridge-bevy)](https://crates.io/crates/rewrite-bridge-bevy)
+[![license](https://img.shields.io/crates/l/rewrite-bridge.svg)](#license)
+
 rewrite-bridge is for people writing game **rewrites** (new engines that load the original game's
 assets from the player's own install, like IW4L) and **passthrough or mash-up mods** (two running
 games that share one world). It gives them one set of model, animation and scene types, a `Provider`
@@ -52,33 +57,41 @@ Add yours with a pull request or an issue once it is public.
 
 ```toml
 [dependencies]
-rewrite-bridge = { git = "https://github.com/patodois/rewrite-bridge", tag = "v0.1.0" }
+rewrite-bridge = "0.2"
 ```
 
-### One tag for the whole build
+### One copy for the whole build
 
-> **Every crate in one build must use the same rewrite-bridge tag.** Cargo treats a different `tag`,
-> `rev` or branch as a different crate, even when the code is the same. A provider built against one
-> and a renderer built against another then each have their own `Provider` and `Model`, and neither
-> accepts the other's:
+> **Every crate in one build must use the same copy of rewrite-bridge.** A provider built against one
+> copy and a renderer built against another then each have their own `Provider` and `Model`, and
+> neither accepts the other's:
 >
 > ```text
 > error[E0277]: the trait bound `Game: Provider` is not satisfied
 > note: there are multiple different versions of crate `rewrite_bridge` in the dependency graph
 > ```
 >
-> Check with `cargo tree -i rewrite-bridge`. With one version it prints one tree whose children are
-> every crate that depends on it. With two it refuses:
+> From crates.io this takes care of itself. Cargo gives every requirement that agrees with the others
+> (`"0.2"`, `"0.2.1"`, `"^0.2.1"`) the same release and builds it once, so the `rewrite-bridge = "0.2"`
+> in your crate and the `0.2.1` that a provider asks for are one crate. Before 1.0 the minor number is
+> the breaking one: a `"0.3"` anywhere in the build would be a second copy, and the error above. Stay
+> on one `0.x` line, as the providers and `rewrite-bridge-bevy` do.
+>
+> A second copy can still come from another source. Cargo treats a `git` dependency (such as the
+> `tag = "v0.1.0"` one that providers used before 0.2), a `path` or a `[patch]` as a different crate,
+> even when the code is the same. Check with `cargo tree -i rewrite-bridge`. With one copy it prints
+> one tree whose children are every crate that depends on it. With two it refuses:
 >
 > ```text
 > error: specification `rewrite-bridge` is ambiguous
 > help: re-run this command with one of the following specifications
->   git+https://github.com/patodois/rewrite-bridge?tag=v0.1.0#0.1.0
->   git+https://github.com/patodois/rewrite-bridge?rev=0c5d0b0e08fcff58166f2ed6ad3daf9bdc72c0a8#0.1.0
+>   rewrite-bridge@0.1.0
+>   rewrite-bridge@0.2.1
 > ```
 >
-> Fix it by moving every dependency to the same tag. `rewrite-bridge-bevy` comes from this same
-> repository, so give it the same `tag` too.
+> `cargo tree -d` lists the duplicated crates and the crates that pull each copy in. Fix it by moving
+> every dependency to crates.io: replace the `git` and `tag` lines of `rewrite-bridge` and
+> `rewrite-bridge-bevy` with `"0.2"`, and use a provider revision that does the same.
 
 ### Rust and build times
 
@@ -316,11 +329,12 @@ models with skins, animations with sockets, and scenes. A Rust game rewrite need
 
 ```toml
 [dependencies]
-rewrite-bridge = { git = "https://github.com/patodois/rewrite-bridge", tag = "v0.1.0" }
-rewrite-bridge-bevy = { git = "https://github.com/patodois/rewrite-bridge", tag = "v0.1.0" }
+rewrite-bridge = "0.2"
+rewrite-bridge-bevy = "0.2"
 ```
 
-Use the same tag for both, and for every provider you add (see [one tag](#one-tag-for-the-whole-build)).
+Both come from crates.io and are built once whatever else you combine, providers included (see
+[one copy](#one-copy-for-the-whole-build)).
 
 ```rust
 use bevy::prelude::*;
