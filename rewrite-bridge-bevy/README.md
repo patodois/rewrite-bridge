@@ -146,7 +146,7 @@ App::new()
 | `GuestComposePlugin` | the render passes and the `GuestFrames` resource |
 | `GuestCompose` (component) | on a `Camera3d`: composite the guest's frames into it; `reproject: false` skips the warp. With several, the one with the lowest `Camera::order` composites and is sent to the guest (a warning says so once) |
 | `GuestFrames` (resource) | the newest `GuestFrame` and the ring of host cameras (`push_camera(seq, camera)`, `set_frame(frame)`), for an app that runs its own `Link`. The ring keeps 256 cameras (half a second at 500 Hz): one is sent per frame and the contract wants the last half second, so 32 would cover only 133 ms at 240 Hz |
-| `HostLinkPlugin` | `Link::host` as a plugin: polls it, reads the pixel file the guest announces, and sends the `GuestCompose` camera once per frame, remembered under the `seq` the link gives it. It works without `GuestComposePlugin` too (it adds `GuestFrames`; nothing is drawn). A frame stays until the next one or the guest's loss: the contract names no maximum age |
+| `HostLinkPlugin` | `Link::host` as a plugin: polls it, reads the pixel file the guest announces, and sends the `GuestCompose` camera once per frame, remembered under the `seq` the link gives it. It works without `GuestComposePlugin` too: it adds `GuestFrames` and the choice of the camera to send, so it still sends the camera and keeps the newest frame; nothing is drawn. A frame stays until the next one or the guest's loss: the contract names no maximum age |
 | `host_camera` | a Bevy camera as the contract's `Camera` (view, projection, near, far, reversed depth) |
 
 How a frame gets onto the screen: the guest's colour (`Rgba8Uint`, the bytes as the file carries them) and
@@ -155,9 +155,11 @@ the view (a splat of each source pixel's warped square, the nearest surface wins
 source index, exactly as the reference loops), and one fullscreen pass composites: it converts the camera's
 depth buffer to metres from the camera's own projection, tests it against the guest's depth, and blends with
 the contract's straight-alpha "over" in the sRGB-encoded 8-bit values, with the reference's integer
-arithmetic (an `*Srgb` target is converted to encoded values and back around the blend). A frame the size of
-a different view is resampled with the reference's rule for frames it could not match to a camera; a frame
-without a depth plane is pasted over the image, as the contract says, and is never warped.
+arithmetic (an `*Srgb` target is converted to encoded values and back around the blend). A frame whose size is not
+the view's is resampled with the reference's rule for frames it could not match to a camera (the render camera
+is taken to be the present one). A frame without a depth plane is pasted over the image, as the contract says,
+and is never reprojected from another camera; if its size differs from the view's it is resampled like any
+other frame, by the same passes with a stand-in depth.
 
 What the camera has to be: a plain perspective projection (not orthographic, not oblique: Bevy's
 `near_clip_plane` for mirrors and portals puts x and y into the depth row), `Msaa::Off`, and not `Hdr`.
@@ -167,22 +169,25 @@ content for them: its edges are anti-aliased against the host's. Only what is in
 part, so alpha-blended host materials neither hide the guest nor are hidden by it, and TAA jitter is not
 accounted for. A guest frame or a viewport that exceeds the device's limits (texture size, storage buffer
 size, workgroups, 65535 pixels a side for the reprojection's packing) is skipped with a warning rather than
-resized, and a device without compute shaders turns compositing off at start. A frame without a depth plane
-that has to be resampled (its size differs from the view's) is warped as if every pixel were 1 m away, which
-only has to be finite because the depth test is off for it and the render camera is the present one.
+resized, and a device without compute shaders turns compositing off at start. The stand-in depth of a frame without a depth
+plane that has to be resampled is 1 m for every pixel: it only has to be finite and positive, because the
+render camera is the present one (the depth cancels in the warp) and the depth test is off for such a frame.
 
 **Verified against the CPU reference.** `cargo test -p rewrite-bridge-bevy --features compose,viewer`
 renders the same scenes through `link::compose` and through the shaders and compares every pixel: the plain
 composite (both occlusion directions, translucent guest pixels, translucent host pixels, a finite and an
-infinite far plane, a viewport inside a larger target, a frame without depth, pixels with alpha 0 but a finite depth, a depth equal to the host's, every combination of guest and host alpha) must match exactly and does;
+infinite far plane, a viewport inside a larger target, a frame without depth, pixels with alpha 0 but a finite depth, a depth equal to the host's, and guest and host alpha each in 64 steps from 0 to 255, so every pair of
+translucent guest and host pixels in that sample) must match exactly and does;
 through an sRGB target it may be off by one step and is not; reprojection (a sideways move, a move forward and
-a turn, a lunge at the ground, a finite far plane, frames 1.7, 5 and 20 times smaller than the view) may differ
+a turn, a lunge at the ground, a finite far plane, frames 1.7, 5, about 12 (13x10 into 160x120) and 20 times smaller than the view, and a stretch of exactly 16 or 32
+pixels in one direction only, which tells the 16 pixel footprint limit from a smaller or larger one) may differ
 at footprint edges in at most 0.05% of the pixels, because the shaders run in `f32` where the reference is
 `f64`, and on the development GPU (Apple M5, Metal) it differs in none of them except for 6 pixels (0.031%) in
 the 20 times stretch. Tests inside a headless Bevy app check the wiring: host boxes hiding and covering a guest layer, a late
 frame reprojected to the camera the real `ExtractedView` has, a viewport that does not start at the corner,
-MSAA and HDR cameras left alone, one camera composited out of several, and the composite landing before
-FXAA. Other tests cover the link (a bad pixel file path, a bad slot, a good frame after bad ones, a bye and a
+MSAA and HDR cameras left alone, one camera composited out of several and sent to the guest (also by
+`HostLinkPlugin` alone), the pass sitting in `EarlyPostProcess` and the composite landing before FXAA. If Bevy
+cannot start on the adapter the headless device could open, these tests print `SKIP` too. Other tests cover the link (a bad pixel file path, a bad slot, a good frame after bad ones, a bye and a
 new pixel file that restarts the numbering), the camera ring at 240 and 500 Hz, and the device limits.
 Without a GPU adapter the GPU tests print `SKIP` (`cargo test ... gpu_report -- --nocapture` says whether
 they ran; `RB_REQUIRE_GPU=1` makes a missing adapter a failure); on a software adapter (llvmpipe, WARP) the

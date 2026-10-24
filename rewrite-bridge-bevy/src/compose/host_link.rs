@@ -55,8 +55,10 @@ impl HostLink {
 /// reads the guest's frames, and sends the camera of the [`GuestCompose`](super::GuestCompose) camera after transforms and
 /// cameras have been updated, remembering it in [`GuestFrames`] under the `seq` the link gives it.
 ///
-/// Without [`GuestComposePlugin`](super::GuestComposePlugin) it still runs, keeping the newest frame in
-/// [`GuestFrames`] (which it adds if missing) for you to use; nothing is drawn then. If the link cannot
+/// Without [`GuestComposePlugin`](super::GuestComposePlugin) it still runs: it adds [`GuestFrames`] and the
+/// choice of the camera to send (the same one the compose plugin registers, once whichever plugin comes
+/// first), sends that camera and keeps the newest frame in [`GuestFrames`] for you to use; nothing is
+/// drawn then. If the link cannot
 /// start (the port is in use, say) it logs the error and does nothing.
 ///
 /// A frame stays on screen until the next one replaces it or the guest is lost; there is no maximum age
@@ -85,22 +87,22 @@ impl Plugin for HostLinkPlugin {
                 if let Some(addr) = link.control_addr() {
                     info!("passthrough link: waiting for a guest on {addr}");
                 }
-                app.init_resource::<GuestFrames>()
-                    .insert_non_send(HostLink {
-                        link,
-                        reader: None,
-                        newest: 0,
-                        stats: HostLinkStats::default(),
-                        retired: VecDeque::new(),
-                    })
-                    .add_systems(PreUpdate, poll_link)
-                    .add_systems(
-                        PostUpdate,
-                        send_camera
-                            .after(TransformSystems::Propagate)
-                            .after(CameraUpdateSystems)
-                            .after(ComposeCameraSystems),
-                    );
+                super::register_camera_choice(app);
+                app.insert_non_send(HostLink {
+                    link,
+                    reader: None,
+                    newest: 0,
+                    stats: HostLinkStats::default(),
+                    retired: VecDeque::new(),
+                })
+                .add_systems(PreUpdate, poll_link)
+                .add_systems(
+                    PostUpdate,
+                    send_camera
+                        .after(TransformSystems::Propagate)
+                        .after(CameraUpdateSystems)
+                        .after(ComposeCameraSystems),
+                );
             }
             Err(e) => warn!("passthrough link: cannot listen: {e}"),
         }
@@ -189,7 +191,7 @@ fn poll_link(mut host: NonSendMut<HostLink>, mut frames: ResMut<GuestFrames>) {
     }
 }
 
-fn send_camera(
+pub(super) fn send_camera(
     mut host: NonSendMut<HostLink>,
     mut frames: ResMut<GuestFrames>,
     cameras: Query<(&GlobalTransform, &Camera)>,
@@ -429,5 +431,67 @@ mod tests {
             "{} different buffers for 12 frames",
             seen.len()
         );
+    }
+
+    #[test]
+    fn alone_the_plugin_sends_the_camera_that_composites_and_remembers_it() {
+        use bevy::camera::{CameraProjection, PerspectiveProjection, RenderTargetInfo, Viewport};
+        use rewrite_bridge::link::Camera as HostCamera;
+
+        use super::super::{view_matrix, GuestCompose};
+
+        // No GuestComposePlugin, no render app: the plugin has to pick the camera itself
+        let (mut app, port) = host_app();
+        let proj = PerspectiveProjection::default().get_clip_from_view();
+        let camera = |order: isize, viewport: UVec2, x: f32| {
+            let mut c = Camera {
+                order,
+                viewport: Some(Viewport {
+                    physical_size: viewport,
+                    ..default()
+                }),
+                ..default()
+            };
+            c.computed.target_info = Some(RenderTargetInfo {
+                physical_size: UVec2::new(320, 180),
+                scale_factor: 1.0,
+            });
+            c.computed.clip_from_view = proj;
+            (
+                c,
+                GlobalTransform::from(Transform::from_xyz(x, 1.0, 2.0)),
+                GuestCompose::default(),
+            )
+        };
+        app.world_mut().spawn(camera(0, UVec2::new(320, 180), 0.0));
+        let chosen = app
+            .world_mut()
+            .spawn(camera(-1, UVec2::new(160, 90), 5.0))
+            .id();
+
+        let mut guest = guest_link(port);
+        let mut got: Vec<(u32, HostCamera)> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while got.len() < 5 {
+            assert!(Instant::now() < deadline, "no cameras: {:?}", stats(&app));
+            app.update();
+            for event in guest.poll() {
+                if let Event::Camera { header, camera } = event {
+                    got.push((header.seq, camera));
+                }
+            }
+            sleep(Duration::from_millis(2));
+        }
+        let frames = app.world().resource::<GuestFrames>();
+        assert_eq!(frames.compose_camera(), Some(chosen));
+        let want_view = view_matrix(&GlobalTransform::from(Transform::from_xyz(5.0, 1.0, 2.0)));
+        for (seq, camera) in &got {
+            // the lowest order's camera: its viewport and its place
+            assert_eq!(camera.viewport, [160, 90]);
+            assert_eq!(camera.view, want_view);
+            // and remembered under the seq it went out with
+            assert_eq!(frames.cameras().get(*seq), Some(camera));
+        }
+        assert!(stats(&app).cameras_sent >= 5);
     }
 }

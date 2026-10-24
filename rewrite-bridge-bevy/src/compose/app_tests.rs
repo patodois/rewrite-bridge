@@ -19,7 +19,9 @@ use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured};
 use bevy::render::RenderPlugin;
 use bevy::window::ExitCondition;
 
-use super::{GuestCompose, GuestComposePlugin, GuestFrame, GuestFrames};
+use rewrite_bridge::link::LinkConfig;
+
+use super::{GuestCompose, GuestComposePlugin, GuestFrame, GuestFrames, HostLinkPlugin};
 
 const SIZE: (u32, u32) = (160, 120);
 
@@ -169,31 +171,70 @@ struct Out {
     chosen: Option<Entity>,
 }
 
+/// Two Bevy apps starting at once in one process trip over each other's shader loading
+static ONE_APP_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+/// The app of a scenario, started, with the lock that keeps other apps out until it is dropped; `None`
+/// without a GPU, and also when Bevy cannot open the adapter that the headless device could (that is a
+/// runner's problem, not the plugin's: it is reported and the test skips, unless `RB_REQUIRE_GPU` is
+/// set). Only the starting of the app is guarded that way: a panic once it runs is a real failure.
+fn build_app(scenario: Scenario, link: bool) -> Option<(App, std::sync::MutexGuard<'static, ()>)> {
+    super::tests::gpu()?;
+    let lock = ONE_APP_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let skip = |e: Box<dyn std::any::Any + Send>| {
+        let why = e
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        eprintln!("SKIP: Bevy could not start on this adapter: {why}");
+        assert!(std::env::var_os("RB_REQUIRE_GPU").is_none(), "{why}");
+    };
+    let mut app = App::new();
+    let added = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        app.add_plugins(
+            // Not pipelined, so that a test can reach the render app and its schedules
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: None,
+                    exit_condition: ExitCondition::DontExit,
+                    ..default()
+                })
+                .set(RenderPlugin {
+                    synchronous_pipeline_compilation: true,
+                    ..default()
+                })
+                .disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>(),
+        );
+    }));
+    if let Err(e) = added {
+        skip(e);
+        return None;
+    }
+    app.insert_resource(scenario)
+        .init_resource::<Spawned>()
+        .add_plugins(GuestComposePlugin::default())
+        .add_systems(Startup, setup);
+    if link {
+        app.add_plugins(HostLinkPlugin::new(LinkConfig {
+            control_port: 0,
+            ..LinkConfig::new("app test host")
+        }));
+    }
+    let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        app.finish();
+        app.cleanup();
+    }));
+    if let Err(e) = finished {
+        skip(e);
+        return None;
+    }
+    Some((app, lock))
+}
+
 /// Runs the app, lets `after_start` put frames in, and returns the pictures, or `None` without a GPU.
 fn run_scenario(scenario: Scenario, after_start: impl FnOnce(&mut World)) -> Option<Out> {
-    super::tests::gpu()?;
-    // Two Bevy apps starting at once in one process trip over each other's shader loading
-    static ONE_APP_AT_A_TIME: Mutex<()> = Mutex::new(());
-    let _one = ONE_APP_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut app = App::new();
-    app.add_plugins(
-        DefaultPlugins
-            .set(WindowPlugin {
-                primary_window: None,
-                exit_condition: ExitCondition::DontExit,
-                ..default()
-            })
-            .set(RenderPlugin {
-                synchronous_pipeline_compilation: true,
-                ..default()
-            }),
-    )
-    .insert_resource(scenario)
-    .init_resource::<Spawned>()
-    .add_plugins(GuestComposePlugin::default())
-    .add_systems(Startup, setup);
-    app.finish();
-    app.cleanup();
+    let (mut app, _one) = build_app(scenario, false)?;
     for _ in 0..4 {
         app.update();
     }
@@ -646,4 +687,147 @@ fn the_guest_is_composited_before_the_anti_aliasing_pass() {
         blended(&smoothed.images[0]) > 20,
         "FXAA did not touch the edge between the guest and the host: the guest was composited after it"
     );
+}
+
+/// Keys of the systems of `schedule` that are the function `f` (system names are only kept with Bevy's
+/// `debug` feature, but a function system's type id is its function's).
+fn systems_of<M, F: bevy::ecs::system::IntoSystem<(), (), M> + 'static>(
+    schedule: &bevy::ecs::schedule::Schedule,
+    f: F,
+) -> Vec<bevy::ecs::schedule::SystemKey> {
+    use bevy::ecs::system::System as _;
+    let wanted = bevy::ecs::system::IntoSystem::into_system(f).system_type();
+    schedule
+        .systems()
+        .expect("a schedule that has run")
+        .filter(|(_, system)| system.system_type() == wanted)
+        .map(|(key, _)| key)
+        .collect()
+}
+
+fn one_camera_scenario() -> Scenario {
+    Scenario {
+        scene: true,
+        cams: vec![Cam::default()],
+    }
+}
+
+#[test]
+fn the_pass_runs_in_early_post_process_ahead_of_tonemapping_and_the_anti_aliasing() {
+    use bevy::core_pipeline::schedule::{Core3d, Core3dSystems};
+    use bevy::ecs::schedule::SystemSet;
+    use bevy::render::RenderApp;
+
+    let Some((mut app, _one)) = build_app(one_camera_scenario(), false) else {
+        eprintln!("SKIP: no GPU adapter");
+        return;
+    };
+    for _ in 0..4 {
+        app.update();
+    }
+    let render = app.get_sub_app_mut(RenderApp).expect("a render app");
+    render.world_mut().schedule_scope(Core3d, |_, schedule| {
+        let pass = systems_of(schedule, super::compose_pass);
+        assert_eq!(
+            pass.len(),
+            1,
+            "the compose pass is in the Core3d schedule once"
+        );
+        let in_set = |set: Core3dSystems| {
+            schedule
+                .graph()
+                .systems_in_set(set.intern())
+                .map(|systems| systems.contains(&pass[0]))
+                .unwrap_or(false)
+        };
+        // The sets run Prepass, MainPass, EarlyPostProcess, PostProcess in that order, and tonemapping, FXAA,
+        // SMAA and sharpening are in PostProcess: being in the early set is being ahead of all of them
+        assert!(in_set(Core3dSystems::EarlyPostProcess));
+        assert!(!in_set(Core3dSystems::PostProcess));
+        assert!(!in_set(Core3dSystems::MainPass));
+    });
+}
+
+#[test]
+fn the_host_link_sends_the_camera_that_composites_and_remembers_it_in_a_real_app() {
+    use bevy::ecs::schedule::{NodeId, SystemSet};
+    use rewrite_bridge::link::{Camera as HostCamera, Event, Link};
+
+    let low = Cam {
+        order: -1,
+        transform: Transform::from_xyz(1.0, 0.5, 2.0),
+        viewport: Some((UVec2::new(10, 10), UVec2::new(100, 80))),
+        ..default()
+    };
+    let scenario = Scenario {
+        scene: false,
+        cams: vec![Cam::default(), low],
+    };
+    let Some((mut app, _one)) = build_app(scenario, true) else {
+        eprintln!("SKIP: no GPU adapter");
+        return;
+    };
+    for _ in 0..4 {
+        app.update();
+    }
+    let port = app
+        .world()
+        .non_send::<super::HostLink>()
+        .link
+        .control_addr()
+        .unwrap()
+        .port();
+    let mut guest = Link::guest(LinkConfig {
+        control_port: port,
+        reconnect: std::time::Duration::from_millis(50),
+        ..LinkConfig::new("app test guest")
+    })
+    .unwrap();
+    let mut got: Vec<(u32, HostCamera)> = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while got.len() < 5 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the guest got {} cameras",
+            got.len()
+        );
+        app.update();
+        for event in guest.poll() {
+            if let Event::Camera { header, camera } = event {
+                got.push((header.seq, camera));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    let cameras = app.world().resource::<Spawned>().cameras.clone();
+    let frames = app.world().resource::<GuestFrames>();
+    assert_eq!(frames.compose_camera(), Some(cameras[1]));
+    let place = *app.world().get::<GlobalTransform>(cameras[1]).unwrap();
+    for (seq, camera) in &got {
+        // the camera with the lowest order: its viewport (not the other's 160 x 120) and its place
+        assert_eq!(camera.viewport, [100, 80]);
+        assert_eq!(camera.view, super::view_matrix(&place));
+        // remembered under the seq it went out with
+        assert_eq!(frames.cameras().get(*seq), Some(camera));
+    }
+
+    // The camera is sent after the choice is made, and the choice runs once with both plugins present
+    app.world_mut().schedule_scope(PostUpdate, |_, schedule| {
+        let choose = systems_of(schedule, super::choose_compose_camera);
+        let send = systems_of(schedule, super::host_link::send_camera);
+        assert_eq!((choose.len(), send.len()), (1, 1));
+        let set = super::ComposeCameraSystems.intern();
+        let key = schedule.graph().system_sets.get_key(set).expect("the set");
+        assert!(schedule
+            .graph()
+            .dependency()
+            .graph()
+            .contains_edge(NodeId::Set(key), NodeId::System(send[0])));
+        assert!(schedule
+            .graph()
+            .systems_in_set(set)
+            .unwrap()
+            .contains(&choose[0]));
+    });
 }

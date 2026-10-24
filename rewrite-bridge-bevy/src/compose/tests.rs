@@ -1266,6 +1266,12 @@ fn exact_camera(size: (u32, u32)) -> Camera {
 #[test]
 fn equal_depths_go_to_the_host_and_a_hair_nearer_goes_to_the_guest() {
     let (device, queue) = gpu_or_skip!();
+    // This pins a one-ulp difference in a division; a software adapter's division may differ in that last
+    // bit (and nothing here could tell its rounding from a bug), so it is a hardware-only test
+    if software() {
+        eprintln!("SKIP: a software adapter's division is not exact to the last bit");
+        return;
+    }
     let size = (16, 8);
     let cam = exact_camera(size);
     let n = (size.0 * size.1) as usize;
@@ -1311,13 +1317,14 @@ fn equal_depths_go_to_the_host_and_a_hair_nearer_goes_to_the_guest() {
 }
 
 #[test]
-fn blending_rounds_the_way_the_reference_does_over_every_alpha() {
+fn blending_rounds_the_way_the_reference_does_across_the_alpha_range() {
     let (device, queue) = gpu_or_skip!();
     let size = (64, 64);
     let cam = camera([0.0, 1.5, 2.0], [0.0, 1.0, -4.0], size, f32::INFINITY);
     let n = (size.0 * size.1) as usize;
-    // guest alpha runs along x, host alpha along y, so a translucent guest pixel lies over every
-    // translucent host pixel; the colours vary too
+    // Guest alpha runs along x and host alpha along y, each in 64 steps from 0 to 255 (both ends included:
+    // 0 is empty, 255 is opaque), so a translucent guest pixel lies over a translucent host pixel of every
+    // alpha in the sample; the colours vary too
     let (mut host_rgba, mut guest_rgba) = (Vec::new(), Vec::new());
     for y in 0..size.1 {
         for x in 0..size.0 {
@@ -1325,13 +1332,13 @@ fn blending_rounds_the_way_the_reference_does_over_every_alpha() {
                 (x * 3) as u8,
                 255 - (y * 4) as u8,
                 77,
-                (y * 4 + 1) as u8,
+                (y * 255 / 63) as u8,
             ]);
             guest_rgba.extend_from_slice(&[
                 255 - (x * 4) as u8,
                 (y * 4) as u8,
                 (x * 2 + y) as u8,
-                (x * 4 + 1) as u8,
+                (x * 255 / 63) as u8,
             ]);
         }
     }
@@ -1509,6 +1516,93 @@ fn an_empty_neighbour_does_not_pull_a_corner_to_its_depth() {
     );
 }
 
+/// A camera whose arithmetic is exact in `f32` and `f64` alike: identity view, `proj[0] = proj[5] = 1`, the
+/// reversed depth row with `near = 0.125`. Sizes and depths that are powers of two then give window
+/// coordinates that are exact, so a footprint that is exactly 16 pixels across is exactly 16 on both sides.
+fn exact_unit_camera(size: (u32, u32)) -> Camera {
+    #[rustfmt::skip]
+    let (view, proj) = (
+        [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ],
+        [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, -1.0,
+            0.0, 0.0, 0.125, 0.0,
+        ],
+    );
+    Camera {
+        view,
+        proj,
+        fov_y: std::f32::consts::FRAC_PI_2,
+        near: 0.125,
+        far: f32::INFINITY,
+        viewport: [size.0, size.1],
+        depth_range: DepthRange::Reversed,
+    }
+}
+
+#[test]
+fn a_stretch_of_exactly_16_pixels_is_kept_and_a_longer_one_falls_back_to_one_pixel() {
+    // A source pixel's warped square may be at most 16 pixels across in each direction (reference: `maxx -
+    // minx <= 16` and `maxy - miny <= 16`). Resampling a frame by a power of two in one direction only makes
+    // the square tall and narrow, or wide and flat, and exact.
+    let (device, queue) = gpu_or_skip!();
+    for (guest_size, dst, whole) in [
+        ((16, 8), (16, 128), true),  // 16 pixels tall: kept (`<=`, not `<`)
+        ((16, 4), (16, 128), false), // 32 tall: one pixel each, though only the height is over
+        ((8, 16), (128, 16), true),  // 16 wide
+        ((4, 16), (128, 16), false), // 32 wide, only the width is over
+    ] {
+        let cam = exact_unit_camera(dst);
+        let (mut rgba, mut depth) = (Vec::new(), Vec::new());
+        for y in 0..guest_size.1 {
+            for x in 0..guest_size.0 {
+                rgba.extend_from_slice(&[(x * 29 + 3) as u8, (y * 31 + 5) as u8, 90, 255]);
+                depth.push(4.0);
+            }
+        }
+        let guest = frame(rgba, Some(depth), guest_size);
+        let n = (dst.0 * dst.1) as usize;
+        let h_rgba = vec![0u8; n * 4];
+        let h_t = vec![f32::INFINITY; n];
+        let d = to_buffer(&h_t, &cam);
+        let cpu = cpu_result(&h_rgba, &h_t, &guest, &cam, &cam, dst, true);
+        let covered = cpu.chunks(4).filter(|p| p[3] != 0).count();
+        let expected = if whole {
+            n
+        } else {
+            (guest_size.0 * guest_size.1) as usize
+        };
+        assert_eq!(
+            covered, expected,
+            "the reference, {guest_size:?} into {dst:?}"
+        );
+        let gpu_out = run_gpu(
+            device,
+            queue,
+            &Run {
+                host: Host {
+                    rgba: &h_rgba,
+                    d: &d,
+                    size: dst,
+                    format: TextureFormat::Rgba8Unorm,
+                },
+                guest: &guest,
+                params: params(&guest, dst, &cam, Some(&cam), false),
+            },
+        );
+        assert_exact(
+            &format!("{guest_size:?} into {dst:?}"),
+            &diff(&cpu, &gpu_out, dst.0),
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Things that need no GPU
 
@@ -1579,20 +1673,36 @@ fn an_oblique_or_orthographic_projection_is_not_a_plain_perspective_one() {
         host_depth_terms(&m.to_cols_array()),
         Some((0.0, plain.near))
     );
-    // Bevy's oblique near plane (mirrors, portals) puts x and y into the depth row
-    let oblique = PerspectiveProjection {
-        near_clip_plane: vec4(0.3, -0.2, -1.0, -0.5),
-        ..default()
-    }
-    .get_clip_from_view();
+    // Bevy's oblique near plane (mirrors, portals) puts x and/or y into the depth row: a plane with only
+    // an x term, only a y term, and both, each of which has to be refused (checking one of the two
+    // elements of the row would let one of them through)
     let (view, size) = (GlobalTransform::default(), UVec2::new(160, 120));
-    assert!(oblique.to_cols_array()[2] != 0.0 || oblique.to_cols_array()[6] != 0.0);
-    assert_eq!(host_depth_terms(&oblique.to_cols_array()), None);
-    assert_eq!(
-        host_camera(&view, oblique, size).unwrap_err(),
-        UnsupportedCamera::NotPerspective
-    );
+    for (plane, x_term, y_term) in [
+        (vec4(0.3, 0.0, -1.0, -0.5), true, false),
+        (vec4(0.0, 0.3, -1.0, -0.5), false, true),
+        (vec4(0.3, -0.2, -1.0, -0.5), true, true),
+    ] {
+        let oblique = PerspectiveProjection {
+            near_clip_plane: plane,
+            ..default()
+        }
+        .get_clip_from_view();
+        let m = oblique.to_cols_array();
+        assert_eq!((m[2] != 0.0, m[6] != 0.0), (x_term, y_term), "{plane}");
+        assert_eq!(host_depth_terms(&m), None, "{plane}");
+        assert_eq!(
+            host_camera(&view, oblique, size).unwrap_err(),
+            UnsupportedCamera::NotPerspective,
+            "{plane}"
+        );
+    }
     assert!(host_camera(&view, m, size).is_ok());
+    // the message says what is true of an oblique projection too
+    let message = UnsupportedCamera::NotPerspective.to_string();
+    assert!(
+        message.contains("oblique") && message.contains("orthographic"),
+        "{message}"
+    );
     let ortho = Mat4::from_cols_array(&[
         1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, -0.1, 0.0, 0.0, 0.0, 0.0, 1.0,
     ]);

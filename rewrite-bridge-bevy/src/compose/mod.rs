@@ -292,7 +292,8 @@ impl GuestFrames {
 /// Why a Bevy camera cannot be described to the guest as a contract [`HostCamera`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedCamera {
-    /// `w_clip` is not `-z_view`: an orthographic or oblique projection.
+    /// Not a plain perspective projection: `w_clip` is not `-z_view` (an orthographic one), or the depth
+    /// row depends on `x` or `y` (an oblique near plane, Bevy's `near_clip_plane`).
     NotPerspective,
     /// The near plane read from the projection is not a positive number.
     BadNear,
@@ -304,7 +305,9 @@ impl std::fmt::Display for UnsupportedCamera {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::NotPerspective => {
-                "the projection is not a perspective one (w_clip is not -z_view)"
+                "the projection is not a plain perspective one (w_clip is not -z_view, as in an \
+                 orthographic projection, or its depth row depends on x or y, as with an oblique \
+                 near plane)"
             }
             Self::BadNear => "the near plane read from the projection is not a positive number",
             Self::NotFinite => "the camera holds a NaN or infinity",
@@ -407,10 +410,8 @@ impl Plugin for GuestComposePlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(GuestFrames::new(self.ring_capacity))
             .add_plugins(ExtractComponentPlugin::<GuestCompose>::default())
-            .add_systems(
-                PostUpdate,
-                (make_depth_readable, choose_compose_camera).in_set(ComposeCameraSystems),
-            );
+            .add_systems(PostUpdate, make_depth_readable);
+        register_camera_choice(app);
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
@@ -434,6 +435,24 @@ impl Plugin for GuestComposePlugin {
 /// sends the camera to the guest runs after them (the [`HostLinkPlugin`] does).
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ComposeCameraSystems;
+
+/// Marks that the camera choice is registered, so [`GuestComposePlugin`] and [`HostLinkPlugin`] can each
+/// ask for it and it still runs once.
+#[derive(Resource)]
+struct CameraChoiceRegistered;
+
+/// Adds [`GuestFrames`] (if missing) and the system that picks the composited camera; both plugins call
+/// it, in either order.
+fn register_camera_choice(app: &mut App) {
+    app.init_resource::<GuestFrames>();
+    if app.world().contains_resource::<CameraChoiceRegistered>() {
+        return;
+    }
+    app.insert_resource(CameraChoiceRegistered).add_systems(
+        PostUpdate,
+        choose_compose_camera.in_set(ComposeCameraSystems),
+    );
+}
 
 /// The depth buffer of a [`Camera3d`] is only bindable (for the compositing pass to read it) if the
 /// camera asks for that.
