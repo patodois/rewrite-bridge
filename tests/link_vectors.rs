@@ -443,6 +443,22 @@ fn check_datagram(c: &Value) -> Result<(), String> {
                 c["kind"]
             )),
         },
+        "accept" => {
+            let (_, body) = got.map_err(|e| format!("rejected: {e} ({})", c["why"]))?;
+            let want = match c["kind"].as_str().expect("kind") {
+                "heartbeat" => KIND_HEARTBEAT,
+                "camera" => KIND_CAMERA,
+                "pose" => KIND_POSE,
+                "collision" => KIND_COLLISION,
+                "frame" => KIND_FRAME,
+                other => panic!("accept kind {other}"),
+            };
+            if body.kind() == want {
+                Ok(())
+            } else {
+                Err(format!("decoded as kind {}, expected {want}", body.kind()))
+            }
+        }
         "decode" => {
             let (h, body) = got.map_err(|e| format!("rejected: {e}"))?;
             let want_h = header_of(&c["header"]);
@@ -735,23 +751,28 @@ fn check_pixel_writer(c: &Value) -> Result<(), String> {
     }
     let mut writer =
         FrameWriter::create_with(&path, &opts).map_err(|e| format!("create failed: {e}"))?;
+    let mut done = 0u64;
     for (i, wr) in w["writes"].as_array().unwrap().iter().enumerate() {
         let rgba = hex_decode(wr["rgba"].as_str().unwrap());
         let (width, height) = (ju32(&wr["width"]), ju32(&wr["height"]));
         let depth: Option<Vec<f32>> = wr["depth"].as_array().map(|a| a.iter().map(jf32).collect());
-        let ready = writer
-            .write_depth(
-                &rgba,
-                depth.as_deref(),
-                width,
-                height,
-                ju32(&wr["camera_seq"]),
-                ju64(&wr["time_us"]),
-            )
-            .map_err(|e| format!("write {i} failed: {e}"))?;
-        if ready.frame != i as u64 + 1
-            || ready.slot != ((i as u64 + 1) % u64::from(opts.slots)) as u32
-        {
+        let result = writer.write_depth(
+            &rgba,
+            depth.as_deref(),
+            width,
+            height,
+            ju32(&wr["camera_seq"]),
+            ju64(&wr["time_us"]),
+        );
+        if wr["expect"] == "refused" {
+            if let Ok(ready) = result {
+                return Err(format!("write {i} was accepted ({}): {ready:?}", wr["why"]));
+            }
+            continue;
+        }
+        let ready = result.map_err(|e| format!("write {i} failed: {e}"))?;
+        done += 1;
+        if ready.frame != done || ready.slot != (done % u64::from(opts.slots)) as u32 {
             return Err(format!("write {i} announced {ready:?}"));
         }
     }
@@ -850,7 +871,7 @@ fn event_json(e: Event) -> (String, Value) {
         ),
         Event::Collision(c) => (
             "collision".into(),
-            json!({"query": c.query, "triangles": c.triangles.len()}),
+            json!({"query": c.query, "triangles": c.triangles.len(), "center": c.center, "radius": c.radius}),
         ),
         Event::Frame { frame, .. } => (
             "frame".into(),

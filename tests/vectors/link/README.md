@@ -1,10 +1,11 @@
 # Link protocol test vectors
 
-Test vectors for the passthrough link protocol of `docs/CONTRACT.md` (protocol v1, revision 4). Every
+Test vectors for the passthrough link protocol of `docs/CONTRACT.md` (protocol v1, revision 5). Every
 implementation of the link (Rust in this repository, `link-java`, `link-c`, `link-cs`) reads these files in its
 own test suite and must agree with all of them. They are derived from the contract alone: `gen.py` writes them
 with an encoder of its own (standard library only), so no implementation's bug can have leaked into them. Where
-the contract is silent there is no vector; `GAPS.md` lists those places.
+the contract is silent there is no vector; `GAPS.md` lists the places where revision 4 was silent and says where revision 5
+settled each (a vector now covers all but a few).
 
 Regenerate with `python3 tests/vectors/link/gen.py`, check that the committed files are current with
 `python3 tests/vectors/link/gen.py --check`.
@@ -23,8 +24,9 @@ Regenerate with `python3 tests/vectors/link/gen.py`, check that the committed fi
 Each JSON file is `{"format": "rbl-link-vectors/1", "kind": ..., "contract": ..., "cases": [...]}`. Every case has a
 unique `id` (`ctl.*`, `dg.*`, `pf.*`/`pw.*`, `sess.*`) and a `section` of the contract it comes from. Some have a
 `basis`: `MUST` (the contract says it in so many words, the default), `table` (the contract fixes the value in a
-field table but does not say a reader must refuse anything else) or `derived` (follows from the text by reading it
-closely). A runner reports a failing `table` or `derived` vector like any other, and the report says its basis.
+field table but does not say a reader must refuse anything else; revision 5 states all of those in so many words,
+so none is left) or `derived` (follows from the text by reading it closely). A runner reports a failing `table` or
+`derived` vector like any other, and the report says its basis.
 `note` and `why` are for humans. Everything is ASCII; the JSON is one case per line.
 
 Numbers in JSON: `u32` and smaller are numbers; `u64` (`time_us`, `frame`, `lock`) are decimal strings, so that no
@@ -48,7 +50,8 @@ and `expect`:
 
 * `message`: the line must parse as the control message `message`, an object with the wire field names of the
   fields the contract defines (unknown fields on the line are ignored and are not listed). Absent optional fields
-  are absent in `message`.
+  are absent in `message`, except that a `bye` without a reason, or with `"reason": null`, is listed with
+  `"reason": ""` (its decoded form always has a reason).
 * `unknown`: the line is a JSON object with a string `type` the implementation does not know (`type` in the
   case); it parses without error and is ignored.
 * `reject`: the line must be refused (a protocol error).
@@ -68,6 +71,9 @@ optional field), and it must be a single line ending in `\n`.
   `header` and `body`, must produce exactly `hex`.
 * `ignore`: a datagram of unknown `kind` (the case's `kind`, and `payload_len`): decoding succeeds and reports an
   unknown kind, or at least is not an error.
+* `accept` (revision 5): a datagram of the known kind `kind` whose values the decoder does not check (a camera with
+  `near` 0, a pose with a NaN, a collision with a negative radius): decoding succeeds and gives that kind. Nothing
+  else is compared, since a NaN has no JSON form. These cases are named `dg.unchecked.*`.
 * `reject`: decoding fails.
 
 ## `pixelfiles.json`
@@ -87,14 +93,20 @@ the read must give: `expect: "ok"` with the slot header values (`frame`, `time_u
 `height`), the colour bytes `rgba` (hex, tightly packed `width * height * 4`; or `rgba_sha256` when `rgba` is
 null) and `depth` (a list of `width * height` floats, row-major, or `null` when no depth is wanted or the file has
 none; `want_depth` says whether the reader is asked for it), or `expect: "skip"`: the frame must not be
-delivered (an odd lock, another frame in the slot, a slot that does not exist, a file that has shrunk). A
+delivered (an odd lock, another frame in the slot, a slot that does not exist, a file that has shrunk, frame 0, a
+size in the datagram that differs from the slot header's, a size of 0 or above the file's in the slot header). A
 `then` list continues the case: `{"op": "truncate", "length": N}` truncates the file the reader holds open, and
 `{"op": "read", ...}` is another read.
 
 Writer cases (`pw.*`) have `writer` (`width`, `height`, `slots`, `with_depth`, and `writes`: the frames to write
 in order, each with `camera_seq`, `time_us`, `width`, `height`, `rgba` and `depth`). The writer is created at a
 new path in the temporary directory, the frames are written, and the file's bytes must equal `file` exactly.
-`expect: "create_fails"` means creating the writer must fail and leave no file; `create_fails_and_file_untouched`
+A write with `"expect": "refused"` (revision 5) must be refused by the writer (an error, an exception, a false
+return: whatever the library does) and must change nothing: the later writes of the case produce the same bytes
+as if the refused one had not been tried, so it used no frame number and touched no slot. Such a write may carry an
+`rgba` whose length does not match its `width` and `height` (the writer must refuse it and not read past the
+buffer), or a width or height of 0 (with an empty `rgba`). `expect: "create_fails"` means creating the writer must
+fail and leave no file; `create_fails_and_file_untouched`
 creates it at a path that already holds a file, which must stay as it was.
 
 ## `sessions.json`
@@ -141,7 +153,7 @@ Steps, in order. Waits take up to 3 seconds unless a step says otherwise; a step
 Event types and the keys a `match` may use: `connected` (`role` and `game` of the peer, `protocol`, `session`),
 `lost`, `handshake_failed` (no keys: the reason text is not specified), `camera` (`seq` of the datagram header,
 `viewport_width`, `viewport_height`, `depth_range`), `poses` (`count`, `entities`: the entity ids in order),
-`collision` (`query`, `triangles`: the total number of triangles), `frame` (`frame` as a decimal string, `slot`,
+`collision` (`query`, `triangles`: the total number of triangles, `center`: three numbers, `radius`), `frame` (`frame` as a decimal string, `slot`,
 `camera_seq`, `width`, `height`), `spawn` (`entity`, `provider`, `asset`, `name`), `despawn` (`entity`), `focus`
 (`focus`: `host` or `guest`, `requested`: whether this is a request, which is what a host sees), `frame_channel`
 (`path`, `width`, `height`, `slots`).

@@ -52,6 +52,12 @@ pub const COLLISION_HEADER_LEN: usize = 32;
 pub const TRIANGLE_LEN: usize = 36;
 pub const MAX_TRIANGLES: usize = (MAX_DATAGRAM - HEADER_LEN - COLLISION_HEADER_LEN) / TRIANGLE_LEN;
 pub const FRAME_LEN: usize = 24;
+/// Most chunks one collision snapshot may have, and so `chunk_count` at most: 4096 chunks are 925696
+/// triangles, 32 MiB (contract section 9.5). A decoder drops a chunk that claims more.
+pub const MAX_COLLISION_CHUNKS: u16 = 4096;
+/// Deepest nesting of arrays and objects in a control line, the line's own object counting as the
+/// first level (contract section 8, "Syntax of a line"); `serde_json` stops at the same depth.
+pub const MAX_JSON_NESTING: usize = 127;
 /// Longest control line, newline included.
 pub const MAX_LINE: usize = 65536;
 /// Unsent control bytes beyond which the peer counts as lost.
@@ -388,7 +394,12 @@ impl Collision {
     /// Splits the snapshot into datagram-sized chunks; an empty one is a single empty chunk.
     pub fn chunks(&self) -> Result<Vec<CollisionChunk>, WireError> {
         let n = self.triangles.len().div_ceil(MAX_TRIANGLES).max(1);
-        let count = u16::try_from(n).map_err(|_| WireError::BadValue("too many triangles"))?;
+        if n > usize::from(MAX_COLLISION_CHUNKS) {
+            return Err(WireError::BadValue(
+                "too many triangles: a snapshot has at most 4096 chunks",
+            ));
+        }
+        let count = n as u16;
         Ok((0..n)
             .map(|i| CollisionChunk {
                 query: self.query,
@@ -562,6 +573,11 @@ pub fn encode_datagram(
             if c.chunk_count == 0 || c.chunk_index >= c.chunk_count {
                 return Err(WireError::BadValue("chunk_index must be below chunk_count"));
             }
+            if c.chunk_count > MAX_COLLISION_CHUNKS {
+                return Err(WireError::BadValue(
+                    "chunk_count above MAX_COLLISION_CHUNKS",
+                ));
+            }
             if c.triangles.len() > MAX_TRIANGLES {
                 return Err(WireError::BadValue("more than MAX_TRIANGLES in a chunk"));
             }
@@ -701,6 +717,9 @@ pub fn decode_datagram(buf: &[u8]) -> Result<(Header, Datagram), WireError> {
             if chunk_count == 0 || chunk_index >= chunk_count {
                 return Err(WireError::BadValue("chunk_index"));
             }
+            if chunk_count > MAX_COLLISION_CHUNKS {
+                return Err(WireError::BadValue("chunk_count"));
+            }
             if n > MAX_TRIANGLES {
                 return Err(WireError::BadValue("triangle_count"));
             }
@@ -806,7 +825,7 @@ impl Control {
                 let mut v = json!({
                     "type": "hello",
                     "role": h.role.as_str(),
-                    "game": h.game,
+                    "game": clean(&h.game),
                     "protocol": h.protocol,
                     "min_protocol": h.min_protocol,
                     "udp_port": h.udp_port,
@@ -822,11 +841,11 @@ impl Control {
                 let mut v = json!({
                     "type": "spawn",
                     "entity": s.entity,
-                    "provider": s.provider,
-                    "asset": s.asset,
+                    "provider": clean(&s.provider),
+                    "asset": clean(&s.asset),
                 });
                 if let Some(n) = &s.name {
-                    v["name"] = n.as_str().into();
+                    v["name"] = clean(n).into();
                 }
                 v
             }
@@ -834,19 +853,19 @@ impl Control {
             Self::Input { focus, reason } => {
                 let mut v = json!({ "type": "input", "focus": focus.as_str() });
                 if let Some(r) = reason {
-                    v["reason"] = r.as_str().into();
+                    v["reason"] = clean(r).into();
                 }
                 v
             }
             Self::FrameChannel(c) => json!({
                 "type": "frame_channel",
-                "path": c.path,
+                "path": clean(&c.path),
                 "width": c.width,
                 "height": c.height,
                 "slots": c.slots,
             }),
-            Self::Bye { reason } => json!({ "type": "bye", "reason": reason }),
-            Self::Unknown(t) => json!({ "type": t }),
+            Self::Bye { reason } => json!({ "type": "bye", "reason": clean(reason) }),
+            Self::Unknown(t) => json!({ "type": clean(t) }),
         }
         .to_string();
         v.push('\n');
@@ -860,6 +879,12 @@ impl Control {
         let line = line.trim_end_matches(['\n', '\r']);
         if line.len() >= MAX_LINE {
             return Err(bad("line too long"));
+        }
+        // serde_json keeps only the last of a duplicate key, so a NUL in an overridden value would
+        // never reach the tree below: look at the text. (Everything else the contract's "Syntax of
+        // a line" asks for, serde_json checks itself: surrogates, nesting, number syntax.)
+        if has_nul_escape(line) {
+            return Err(bad("U+0000 in a string"));
         }
         let v: Value =
             serde_json::from_str(line).map_err(|e| WireError::BadControl(e.to_string()))?;
@@ -905,6 +930,34 @@ impl Control {
             other => Self::Unknown(other.to_owned()),
         })
     }
+}
+
+/// A string as the wire carries it: U+0000 becomes U+FFFD (section 8, "Syntax of a line", 4), since a
+/// line with a NUL escape is a protocol error for every receiver.
+fn clean(s: &str) -> String {
+    s.replace('\0', "\u{fffd}")
+}
+
+/// True when a string of the JSON text holds a `\u0000` escape (section 8, "Syntax of a line", 4):
+/// scans the text the way a lexer would, so that `"\\u0000"` (a backslash and the characters
+/// `u0000`) is not mistaken for one. Invalid JSON gives whatever; the parser refuses it anyway.
+fn has_nul_escape(line: &str) -> bool {
+    let b = line.as_bytes();
+    let (mut i, mut in_string) = (0, false);
+    while i < b.len() {
+        match b[i] {
+            b'"' => in_string = !in_string,
+            b'\\' if in_string => {
+                if b.get(i + 1) == Some(&b'u') && b.get(i + 2..i + 6) == Some(b"0000") {
+                    return true;
+                }
+                i += 1; // the escaped character is not a quote or a backslash that counts
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 struct Fields<'a>(&'a Map<String, Value>);
@@ -1912,6 +1965,12 @@ impl Link {
         if !self.is_connected() {
             return Err(LinkError::NotConnected);
         }
+        if triangles.len().div_ceil(MAX_TRIANGLES) > usize::from(MAX_COLLISION_CHUNKS) {
+            return Err(WireError::BadValue(
+                "too many triangles: a snapshot has at most 4096 chunks",
+            )
+            .into());
+        }
         let c = Collision {
             query: self.next_query,
             center,
@@ -2254,8 +2313,10 @@ impl FrameWriter {
         camera_seq: u32,
         time_us: u64,
     ) -> Result<FrameReady, WireError> {
-        if width > self.channel.width || height > self.channel.height {
-            return Err(WireError::BadValue("frame larger than the pixel file"));
+        if width == 0 || height == 0 || width > self.channel.width || height > self.channel.height {
+            return Err(WireError::BadValue(
+                "a frame is at least 1 x 1 and at most the size of the pixel file",
+            ));
         }
         let row = width as usize * 4;
         if rgba.len() != row * height as usize {
@@ -2558,7 +2619,12 @@ impl FrameReader {
         rgba: &mut Vec<u8>,
         depth: Option<&mut Vec<f32>>,
     ) -> Result<FrameData, FrameMiss> {
-        if ready.slot >= self.slots || ready.width > self.width || ready.height > self.height {
+        if ready.slot >= self.slots
+            || ready.width == 0
+            || ready.height == 0
+            || ready.width > self.width
+            || ready.height > self.height
+        {
             return Err(FrameMiss::OutOfRange);
         }
         // The peer must not shrink its file; if it did, touching the map would fault.
@@ -3646,5 +3712,142 @@ mod tests {
         println!("race test: {good} whole frames, {missed} misses");
         drop(r);
         drop(w);
+    }
+
+    // ----- revision 5 (the vectors cover the wire; these cover the pieces the vectors cannot reach)
+
+    #[test]
+    fn a_nul_escape_is_refused_wherever_it_is_and_only_there() {
+        for line in [
+            r#"{"type":"bye","reason":"\u0000"}"#,
+            r#"{"type":"bye","reason":"a\u0000b"}"#,
+            r#"{"type":"despawn","entity":1,"x":"\u0000"}"#,
+            r#"{"type":"despawn","entity":1,"a\u0000b":1}"#,
+            r#"{"type":"despawn","entity":1,"x":[{"y":"\u0000"}]}"#,
+            // an overridden duplicate is still read
+            r#"{"type":"despawn","entity":1,"x":"\u0000","x":1}"#,
+            r#"{"type":"bye","reason":"\\\u0000"}"#,
+        ] {
+            assert!(Control::parse(line).is_err(), "{line}");
+        }
+        for line in [
+            // a backslash followed by the characters u0000 is not an escape
+            r#"{"type":"bye","reason":"\\u0000"}"#,
+            r#"{"type":"bye","reason":"\\\\u0000"}"#,
+            // without the backslash it is just text; other control characters may be escaped
+            r#"{"type":"bye","reason":"u0000"}"#,
+            r#"{"type":"bye","reason":"\u000a"}"#,
+            r#"{"type":"bye","reason":"\u00011"}"#,
+        ] {
+            assert!(Control::parse(line).is_ok(), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_sender_writes_u_fffd_for_nul() {
+        let msgs = [
+            Control::Hello(Hello {
+                role: Role::Guest,
+                game: "a\0b".into(),
+                protocol: 1,
+                min_protocol: 1,
+                udp_port: 9,
+                heartbeat_ms: 250,
+                timeout_ms: 2000,
+                session: None,
+            }),
+            Control::Spawn(Spawn {
+                entity: 1,
+                provider: "p\0".into(),
+                asset: "\0a".into(),
+                name: Some("\0".into()),
+            }),
+            Control::Input {
+                focus: Role::Host,
+                reason: Some("x\0y".into()),
+            },
+            Control::FrameChannel(FrameChannel {
+                path: "/tmp/a\0b".into(),
+                width: 4,
+                height: 2,
+                slots: 3,
+            }),
+            Control::Bye {
+                reason: "\0".into(),
+            },
+            Control::Unknown("t\0".into()),
+        ];
+        for m in msgs {
+            let line = m.to_line();
+            assert!(!line.contains('\0') && !line.contains("\\u0000"), "{line}");
+            assert!(line.contains('\u{fffd}'), "{line}");
+            Control::parse(&line).expect("the line a sender writes is valid");
+        }
+    }
+
+    #[test]
+    fn collision_snapshots_are_limited_to_4096_chunks() {
+        assert_eq!(usize::from(MAX_COLLISION_CHUNKS) * MAX_TRIANGLES, 925_696);
+        let chunk = |index: u16, count: u16| {
+            Datagram::Collision(CollisionChunk {
+                query: 1,
+                chunk_index: index,
+                chunk_count: count,
+                center: [0.0; 3],
+                radius: 1.0,
+                triangles: Vec::new(),
+            })
+        };
+        let mut out = Vec::new();
+        assert!(encode_datagram(&header(0), &chunk(4095, MAX_COLLISION_CHUNKS), &mut out).is_ok());
+        for count in [4097, 9281, 65535] {
+            out.clear();
+            assert!(encode_datagram(&header(0), &chunk(0, count), &mut out).is_err());
+            // and the decoder drops what a hostile peer writes by hand
+            let mut raw = enc(&chunk(0, 1));
+            raw[HEADER_LEN + 6..HEADER_LEN + 8].copy_from_slice(&count.to_le_bytes());
+            assert_eq!(
+                decode_datagram(&raw),
+                Err(WireError::BadValue("chunk_count"))
+            );
+        }
+        let limit = usize::from(MAX_COLLISION_CHUNKS) * MAX_TRIANGLES;
+        let snapshot = |n: usize| Collision {
+            query: 1,
+            center: [0.0; 3],
+            radius: 1.0,
+            triangles: vec![[[0.0; 3]; 3]; n],
+        };
+        let at_limit = snapshot(limit).chunks().expect("4096 chunks are allowed");
+        assert_eq!(at_limit.len(), usize::from(MAX_COLLISION_CHUNKS));
+        assert!(at_limit
+            .iter()
+            .all(|c| c.chunk_count == MAX_COLLISION_CHUNKS));
+        assert!(snapshot(limit + 1).chunks().is_err());
+    }
+
+    #[test]
+    fn a_frame_of_size_zero_is_refused_by_the_writer_and_the_reader() {
+        let path = temp_path("size-zero");
+        let _ = std::fs::remove_file(&path);
+        let mut w = FrameWriter::create(&path, 4, 2, 3).unwrap();
+        let (rgba, _) = pattern(1, 4, 2);
+        assert!(w.write(&[], 0, 2, 1, 1).is_err());
+        assert!(w.write(&[], 4, 0, 1, 1).is_err());
+        assert!(w.write(&[], 0, 0, 1, 1).is_err());
+        // a refused write used no frame number
+        let ready = w.write(&rgba, 4, 2, 7, 9).unwrap();
+        assert_eq!((ready.frame, ready.slot), (1, 1));
+        let r = FrameReader::open(&path).unwrap();
+        let mut buf = Vec::new();
+        assert!(r.read(&ready, &mut buf).is_ok());
+        for (width, height) in [(0, 2), (4, 0), (0, 0), (3, 2), (4, 1)] {
+            let bad = FrameReady {
+                width,
+                height,
+                ..ready
+            };
+            assert!(r.read(&bad, &mut buf).is_err(), "{width}x{height}");
+        }
     }
 }

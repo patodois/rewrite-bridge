@@ -584,7 +584,7 @@ fn l9_heartbeat_ms_must_be_10_to_10000() {
 
 // ----- L7: the JSON dialect of the control channel
 
-/// Documents and whether the Rust side (serde_json) accepts them. link-java's `Json` reader must
+/// Documents and whether the Rust side (serde_json, plus the NUL rule of `Control::parse`) accepts them. link-java's `Json` reader must
 /// give the same answers: `LinkTests` carries this very table. Control lines are parsed by two
 /// implementations, so a line one accepts and the other rejects is a way to desynchronise them.
 pub const JSON_CORPUS: &[(&str, bool)] = &[
@@ -619,7 +619,7 @@ pub const JSON_CORPUS: &[(&str, bool)] = &[
     // string escapes
     (r#""A""#, true),
     (r#""é""#, true),
-    (r#""\u0000""#, true),
+    (r#""\u0000""#, false), // valid JSON, refused by the control channel since revision 5
     (r#""\/""#, true),
     (r#""𐀀""#, true),
     (r#""😀""#, true),
@@ -658,7 +658,9 @@ const JSON_MAX_NESTING: usize = 127;
 #[test]
 fn l7_json_corpus_matches_serde_json() {
     for &(doc, ok) in JSON_CORPUS {
-        let got = serde_json::from_str::<serde_json::Value>(doc).is_ok();
+        // `Control::parse` adds the NUL rule to serde_json (contract section 8, "Syntax of a line", 4)
+        let got =
+            serde_json::from_str::<serde_json::Value>(doc).is_ok() && !doc.contains("\\u0000");
         assert_eq!(got, ok, "{doc:?}");
     }
     for n in [1, JSON_MAX_NESTING, JSON_MAX_NESTING + 1, 500] {

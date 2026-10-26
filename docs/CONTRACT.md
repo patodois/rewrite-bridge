@@ -1,6 +1,7 @@
 # Passthrough link contract, protocol v1
 
-This document is the whole protocol. A host plugin written in C, C++, C# or anything else should be
+This is revision 5 of the contract for protocol v1 (section 12 lists what each revision changed). This
+document is the whole protocol. A host plugin written in C, C++, C# or anything else should be
 able to implement it from this page alone; the Rust implementation in `src/link.rs` (cargo feature
 `link`) is one implementation of it, not the definition.
 
@@ -47,6 +48,11 @@ Messages a side does not use may simply be ignored by the receiver.
 - **Datagram size.** A datagram is at most **8192 bytes** (`MAX_DATAGRAM`). macOS refuses UDP
   datagrams above 9216 bytes by default, and 8192 leaves room. Larger data is chunked (see
   `Collision`) or goes through the pixel file (see `Frame`).
+  A receiver reads into a buffer of at least **8193 bytes**: the OS cuts a datagram that does not fit
+  and says nothing, so with a buffer of exactly 8192 a 9000 byte `Collision` would arrive as a valid
+  8192 byte one. A datagram of more than 8192 bytes whose kind is known is malformed (no kind's
+  length rule allows it) and dropped; one of an unknown kind is ignored like any other unknown kind
+  (section 9.1), at whatever length the receiver's buffer holds.
 - UDP may drop or reorder datagrams even on loopback when a receive buffer fills. State is
   therefore "latest wins": every datagram is self-contained, and stale ones are discarded (section 7).
 - **Receive buffer.** A receiver SHOULD ask the OS for a UDP receive buffer of at least **4 MiB**
@@ -65,7 +71,8 @@ Messages a side does not use may simply be ignored by the receiver.
 - `reserved` fields are written as zero and ignored on read.
 - Matrices are 4x4 `f32`, **column-major** (glTF and OpenGL order): element `m[c*4 + r]` is column
   `c`, row `r`; the translation of a transform sits in `m[12..15]`.
-- Quaternions are `x, y, z, w`, unit length.
+- Quaternions are `x, y, z, w`, unit length when a sender writes them. A receiver that needs a unit
+  quaternion normalises it (section 9.4 says what a decoder does with the others).
 
 ## 4. Coordinates and units
 
@@ -128,6 +135,23 @@ native space at the boundary, on send and on receive; the wire is always in this
 
 `hello` has to be the first line in each direction. A side that has not received the peer's
 `hello` within its own `timeout_ms` of the TCP connection closes it.
+
+**What counts before and after the handshake (revision 5).** Nothing is ignored for being early or
+late:
+
+- The first line a side receives must be a `hello`, or a `bye` (a host answers a connection it cannot
+  take with `bye` before reading anything, so a guest can get a `bye` first; the receiver closes as
+  in section 6.1 without a `bye` of its own, and the handshake has failed). Any other first line, a
+  known type such as `spawn` or `input` as much as an unknown type, is a protocol error: the receiver
+  sends `bye` with a reason and closes (section 6.1). The sender's `hello` has not been read, so
+  nothing it sent after that line counts.
+- A second `hello` on a connection whose handshake has completed is a protocol error: the receiver
+  sends `bye` and the session is over. (A `hello` cannot renegotiate anything: the version and the
+  session are fixed for the life of the connection.)
+- A `hello` that fails its checks (section 8, `hello`) is a handshake error: `bye` and close.
+- A guest may reconnect after a session ends and the reference implementations do, after a delay
+  they let the application set; a host accepts a new guest as soon as the old session is over.
+  Whether a guest reconnects is its own choice, so no vector requires it.
 
 ### 6.1 Closing: after sending `bye`, half-close and drain
 
@@ -192,23 +216,72 @@ Future versions keep the datagram header's first 8 bytes (magic, version, kind, 
 - Entity ids are integers in `0 ..= 4294967295` (they are `u32` in the binary layouts). Each side
   owns its own entity ids: the guest's entity 7 and the host's entity 7 are different entities.
 
+### Syntax of a line (revision 5)
+
+A line is JSON as RFC 8259 defines it, with these points settled. They apply to the whole line,
+including the parts of unknown fields that nobody reads: a line that breaks one of them is a protocol
+error wherever in the line it does.
+
+1. **Framing.** A line ends at `\n`. One `\r` right before it is removed. Any other `\r` is JSON
+   whitespace like space, tab and `\n`; no other character (form feed, vertical tab, U+00A0, a NUL
+   byte) is whitespace.
+2. **Encoding.** The line is valid UTF-8 (no overlong forms, no surrogates, nothing above U+10FFFF) and
+   does not start with a byte order mark: `EF BB BF` is not whitespace, so a line that starts with it
+   is not JSON.
+3. **Nesting.** Arrays and objects nest at most **127** deep, the line's own object counting as the
+   first. So `{"x":[[...]]}` with 126 arrays is accepted and with 127 is not. Without a limit a line of
+   65536 bytes could nest 32768 deep and overflow the stack of a recursive parser.
+4. **Strings.** Every `\u` escape names a Unicode scalar value. A surrogate must come as a high
+   surrogate (`D800`..`DBFF`) followed at once by a low one (`DC00`..`DFFF`); a lone surrogate, a pair
+   the wrong way round and a high surrogate followed by anything but a low one are errors. **`\u0000`
+   is an error** in any string, key or value: it cannot be held by every implementation (the C one
+   works on NUL-terminated strings, where `"a\u0000b"` would silently become `"a"`, and a `path` could
+   be cut short), so none accepts it. (A raw control character in a string is an error in JSON
+   already.) A sender never writes one: a library that is handed a string with U+0000 in it writes
+   U+FFFD in its place (a C caller cannot hand one over, its strings end at the first NUL).
+5. **Duplicate keys.** When a key appears more than once in an object, **the last one wins**, in every
+   object. Keys are compared after their escapes are decoded (`"\u0065ntity"` is `"entity"`). A line
+   with `{"type":"despawn","type":"bye"}` is a `bye`. The earlier values still have to be valid:
+   `{"x":"\u0000","x":1}` is an error although `x` ends up as `1`.
+6. **Integers.** A field the tables below call an integer takes an integer literal: digits only, with no
+   sign (not even `-0`), no fraction and no exponent. `7.0`, `7e0` and `-0` are not integers here,
+   whatever their value, and neither is a string, `true` or `null`. A value outside the field's range
+   (tables below) is an error; so is one too large for any machine integer (`1e400`, 30 digits).
+7. **`null`.** For a field marked "optional", `null` means the field is absent. For any other field it
+   is the wrong type and an error. An encoder omits an absent optional field rather than writing `null`.
+8. **Unknown** types and fields are ignored after all of the above has been checked: ignoring a field
+   means not using its value, not skipping its syntax.
+
 ### `hello`
 
 | Field | Type | Meaning |
 |---|---|---|
 | `role` | `"host"` / `"guest"` | sender's role |
 | `game` | string | sender's game, e.g. a `Provider::game()` name |
-| `protocol` | integer | highest supported version (in the host reply: the chosen version) |
-| `min_protocol` | integer | lowest supported version |
-| `udp_port` | integer | the sender's UDP port on 127.0.0.1 |
-| `heartbeat_ms` | integer | how often the sender sends `Heartbeat`, **10 to 10000** |
-| `timeout_ms` | integer | the sender's own watchdog timeout |
-| `session` | integer, host only | nonzero `u32` session number |
+| `protocol` | integer, `0 ..= 65535` | highest supported version (in the host reply: the chosen version) |
+| `min_protocol` | integer, `0 ..= 65535` | lowest supported version |
+| `udp_port` | integer, `1 ..= 65535` | the sender's UDP port on 127.0.0.1 |
+| `heartbeat_ms` | integer, `0 ..= 4294967295`, valid only **10 to 10000** | how often the sender sends `Heartbeat` |
+| `timeout_ms` | integer, `0 ..= 4294967295` | the sender's own watchdog timeout |
+| `session` | integer, `1 ..= 4294967295`, host only | session number (a guest's `hello` does not carry one; `null` counts as absent) |
 
-A `hello` whose `heartbeat_ms` is outside `10 ..= 10000` is a handshake error: the receiver sends
-`bye` with the reason and closes (section 6). Without a floor a peer could ask for a heartbeat every
-millisecond or, with a huge value, stretch the watchdog (`4 * heartbeat_ms`) for ever. A side whose
-own configuration is outside the range sends the nearest value inside it.
+The two version fields are `u16`, like the `version` of the datagram header they end up in: `65536`
+is out of range, not a version nobody supports (as a `u32` it would make a `hello` with `protocol`
+65536 and `min_protocol` 1 negotiate version 1).
+
+A `hello` that breaks a range is a handshake error: the receiver sends `bye` with the reason and
+closes (section 6). Two ranges carry more than the type does:
+
+- `heartbeat_ms` outside `10 ..= 10000`. Without a floor a peer could ask for a heartbeat every
+  millisecond or, with a huge value, stretch the watchdog (`4 * heartbeat_ms`) for ever. A side whose
+  own configuration is outside the range sends the nearest value inside it.
+- `udp_port` 0. A socket bound to "any free port" announces the port it got, never 0, and nothing
+  can be sent to port 0.
+
+`timeout_ms` has no range beyond its type, 0 included, because a receiver never uses it: the
+watchdog that applies to a peer is `max(own timeout_ms, 4 * peer heartbeat_ms)` (section 7) and
+the peer's `timeout_ms` is informative (logs, diagnostics). A receiver must not divide by it, wait
+for it or trust it for anything.
 
 ### `spawn`
 
@@ -235,11 +308,16 @@ despawned**:
   peer cannot make the receiver allocate by inventing ids;
 - a peer has at most **1024** live spawned entities. A `spawn` of a new id beyond that is ignored
   and logged (once per session is enough) and its poses are ignored too; a `spawn` of an id that is
-  already live always replaces it, and a `despawn` frees the place.
+  already live always replaces it, and a `despawn` frees the place. Nothing is sent to the peer about
+  an ignored `spawn`: there is no message for it, and the peer finds out from the missing poses.
 
 ### `despawn`
 
 `{"type":"despawn","entity":7}` removes one of the sender's entities.
+
+A `despawn` of an id that is not live (never spawned, already despawned, or a `spawn` that was ignored
+because of the limit above) is ignored: no event, no error, nothing sent. Treating it as an error
+would make a peer whose `spawn` was dropped end the session by despawning that entity.
 
 ### `input`
 
@@ -262,6 +340,12 @@ Announces a pixel file (section 9.6) the sender will fill and refer to in `Frame
 {"type":"frame_channel","path":"/tmp/rewrite-bridge-2882400001-guest.frames","width":1280,"height":720,"slots":3}
 ```
 
+| Field | Type | Meaning |
+|---|---|---|
+| `path` | string | absolute path of the pixel file |
+| `width`, `height` | integer, `0 ..= 4294967295` | the file's maximum frame size; the limits are checked when the file is opened (section 9.6) |
+| `slots` | integer, `0 ..= 4294967295` | the file's number of slots; likewise |
+
 `path` is an absolute path to a file the receiver may map read-only (it is opened as section 9.6
 requires). A later `frame_channel` replaces the previous one (for example after a resize).
 
@@ -277,6 +361,19 @@ slot holding another frame (or the old file gone) and skips it.
 `{"type":"bye","reason":"shutting down"}`. The sender then half-closes, drains and closes the
 connection (section 6.1). The host also answers a connection it cannot take with
 `{"type":"bye","reason":"busy"}`, before or without reading that client's `hello`.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `reason` | string, optional | why the session ends, for people and logs |
+
+A `bye` without `reason`, or with `"reason": null`, is valid and means the empty reason. A `reason` of
+another type (a number, `true`, an array, an object) is a protocol error like any wrong-typed optional
+field, and gets a `bye` in answer. A `bye` ends the session whatever else it says.
+
+**The text of a reason is not part of the protocol.** Only `"busy"` is fixed: the host's refusal of a
+second guest (section 2). A receiver must not branch on any other text (it may show it); a sender that
+refuses a handshake or ends a session on a protocol error says why in a sentence of its own, and
+keeps it short (it must fit the 65536 byte line).
 
 ## 9. Datagrams (UDP, binary)
 
@@ -297,7 +394,11 @@ payload, or whose length does not match the counts it contains, is malformed and
 | 16 | 8 | u64 | `time_us` | send time, section 5 |
 
 A datagram of an unknown `kind` is ignored (it is not an error that ends the session), but it still
-counts as proof of life for the watchdog when magic, version and session are right.
+counts as proof of life for the watchdog when magic, version and session are right, whatever its
+length. The values of the fields of a known
+kind are not checked beyond what each section below names: a decoder tells a datagram that is
+malformed in its layout (length, counts, `depth_range`, indices) from one that is merely strange,
+and delivers the strange one as sent.
 
 ### 9.2 Heartbeat (kind 1)
 
@@ -323,6 +424,13 @@ present as possible, so the guest renders with the camera the host will actually
 Metal); `2` = reversed, near 1 and far 0 (Bevy's default and many D3D engines). Other values are
 malformed.
 
+**Values.** A sender writes finite numbers (only `far` may be `+inf`), `near > 0`, `far > near`, nonzero
+viewport sizes and the matrices it really renders with. A decoder checks none of it; a `Camera` with
+`near` 0, a NaN, a `far` below `near` or a viewport of 0 is a valid datagram and is delivered as sent.
+A receiver that builds a projection or a render target from it checks first, and ignores a camera
+that fails the way it ignores a stale one. The sizes are `u32` and can be 4294967295: never allocate
+from them unchecked.
+
 `proj` is the projection with +y up in normalized device coordinates: pixel row 0 of an image
 rendered with it is NDC y = +1, whatever the host's graphics API does to its own framebuffer (a host
 whose API flips Y flips it back before sending). Section 9.7 relies on this to reproject frames.
@@ -345,7 +453,7 @@ PoseRecord, 80 bytes:
 | Offset | Size | Type | Field | Meaning |
 |---|---|---|---|---|
 | 0 | 4 | u32 | `entity` | sender's entity id |
-| 4 | 4 | u32 | `flags` | bit 0 `TELEPORT`: do not interpolate from the previous pose; others 0 |
+| 4 | 4 | u32 | `flags` | bit 0 `TELEPORT`: do not interpolate from the previous pose; others 0, ignored on read |
 | 8 | 8 | u64 | `time_us` | when the pose was sampled, section 5 |
 | 16 | 12 | f32[3] | `translation` | world position, m |
 | 28 | 16 | f32[4] | `rotation` | world rotation, quaternion x, y, z, w |
@@ -355,6 +463,13 @@ PoseRecord, 80 bytes:
 
 The datagram length must be exactly `24 + 8 + 80 * count`. A record whose `entity` the peer has not
 spawned (section 8, `spawn`) is ignored.
+
+**Values.** A receiver ignores the `flags` bits it does not know, whatever they are, and the decoder
+delivers the field as sent (a later revision may give a bit a meaning, with 0 keeping the old one). A
+sender writes finite numbers and a `rotation` of unit length; a `scale` of 0 or a negative one is
+valid (a hidden or mirrored entity). A decoder checks none of it, NaN and an all-zero `rotation`
+included. A receiver that applies a pose should normalise the rotation first and skip a record whose
+numbers are not finite or whose rotation has length 0.
 
 ### 9.5 Collision (kind 4), 32 + 36·n byte payload
 
@@ -366,7 +481,7 @@ around the player, so the guest can collide with it. One snapshot is a **query**
 |---|---|---|---|---|
 | 0 | 4 | u32 | `query` | snapshot number, +1 per snapshot (serial arithmetic) |
 | 4 | 2 | u16 | `chunk_index` | `0 .. chunk_count-1` |
-| 6 | 2 | u16 | `chunk_count` | at least 1 |
+| 6 | 2 | u16 | `chunk_count` | `1 ..= 4096` (`MAX_COLLISION_CHUNKS`) |
 | 8 | 12 | f32[3] | `center` | world, m |
 | 20 | 4 | f32 | `radius` | m |
 | 24 | 4 | u32 | `triangle_count` | triangles in this chunk, `0 ..= 226` |
@@ -377,6 +492,40 @@ The datagram length must be exactly `24 + 32 + 36 * triangle_count`. All chunks 
 same `center`, `radius` and `chunk_count`. A query with no triangles is one chunk with
 `triangle_count = 0`; it means "nothing solid nearby". The receiver replaces its previous
 collision set only once every chunk of a newer query has arrived.
+
+**Size limit (revision 5).** A query has at most **4096 chunks** (`MAX_COLLISION_CHUNKS`), that is at
+most `4096 * 226 = 925696` triangles, 32 MiB in the 36 byte form of the wire. A `chunk_count` above 4096
+makes the datagram malformed, and a decoder drops it. Before, `chunk_count` could be 65535, and a
+sender or a hostile peer could make a receiver hold 533 MB of triangles for one snapshot (three of
+the four implementations did; the C one capped the sum at 2097152 triangles on its own). The limit is
+generous for what the link is for: a snapshot of the geometry around a player is some thousands to
+some hundred thousand triangles, and it takes 128 ticks of pacing (below) to send 4096 chunks. A sender
+whose snapshot needs more chunks does not send it; it keeps the triangles nearest to `center` and
+sends those. A receiver may refuse more than this (a smaller limit of its own), never less.
+
+**Assembly.** A receiver keeps the number of the newest query it has completed and at most one query
+being assembled. For a chunk (that passed the checks above and in section 9):
+
+1. If it has completed a query and the chunk's `query` is not newer (serial arithmetic), the chunk is
+   stale and dropped. A chunk of a query that was just completed is stale for the same reason.
+2. If a query is being assembled and it is the chunk's: when the chunk's `chunk_count` differs from the
+   one the assembly was started with, the chunk is malformed and dropped, and the assembly goes on
+   (it is not discarded, and the chunk does not start a new one). When the assembly's query is newer
+   than the chunk's, the chunk is stale and dropped.
+3. Otherwise the chunk starts a new assembly, which discards the incomplete older one. The assembly
+   takes `query`, `chunk_count`, `center` and `radius` **from this chunk, the first one that arrived**
+   (not necessarily index 0). Later chunks of the query that differ in `center` or `radius` are not
+   compared and their values are not used.
+4. A chunk whose `chunk_index` is already filled is dropped: **the first copy of a chunk wins** and
+   a repeat counts for nothing, so a datagram delivered twice cannot complete a query early. A new
+   index is stored.
+5. When every index `0 .. chunk_count-1` is filled, the receiver emits the snapshot, with the
+   triangles in chunk index order, and the query becomes the newest completed.
+
+The rules are the same for a host and a guest. They make the outcome of a snapshot whose chunks
+disagree deterministic: the first chunk to arrive decides `center`, `radius` and `chunk_count`; a
+chunk with another `chunk_count` is lost; the snapshot completes when the right number of distinct
+chunks has arrived.
 
 **Pacing.** A sender SHOULD NOT put a whole snapshot on the wire at once: it queues the chunks and
 sends at most **32** collision datagrams per tick (per `poll()` in the reference implementations),
@@ -393,11 +542,15 @@ too), writes it into a slot of the pixel file announced by `frame_channel`, then
 
 | Offset | Size | Type | Field | Meaning |
 |---|---|---|---|---|
-| 0 | 8 | u64 | `frame` | frame number, +1 per frame, starts at 1 in each pixel file |
+| 0 | 8 | u64 | `frame` | frame number, +1 per frame, starts at 1 in each pixel file; **0 is malformed** |
 | 8 | 4 | u32 | `slot` | slot written, `frame % slots` |
 | 12 | 4 | u32 | `camera_seq` | header `seq` of the `Camera` the frame was rendered with, 0 if none |
 | 16 | 4 | u32 | `width` | pixels |
 | 20 | 4 | u32 | `height` | pixels |
+
+A `Frame` with `frame` 0 is malformed and dropped by the decoder: a slot nobody has written yet holds
+frame 0, so a datagram that named frame 0 would match it and deliver an empty image. The other
+fields are not checked by the decoder; the reader below checks them against the file.
 
 `camera_seq` lets the host pair the pixels with the camera (and the poses) they were rendered for;
 section 9.7 says how it uses them to hide latency.
@@ -476,12 +629,33 @@ Writer:
 4. Send the `Frame` datagram.
 
 Reader, on a `Frame` datagram:
+0. If `slot` is not below the file's `slots`, skip this frame. (The reader finds the slot by `slot`
+   and does not require `slot == frame % slots`; a writer produces that, and step 3 is what ties the
+   slot to the frame.)
 1. `l1 = lock` (acquire). If `l1` is odd, skip this frame.
-2. Copy the header fields, the pixels and the depth plane (if wanted) out.
+2. Read the slot header's `width` and `height`. They must each be at least 1 and at most the file's, and
+   equal the datagram's `width` and `height`; if not, skip this frame, before anything is copied. Then
+   copy the header fields, the pixels and the depth plane (if wanted) out.
 3. Acquire fence, then `l2 = lock`. If `l2 != l1` or the copied `frame` is not the datagram's
    `frame`, the slot was overwritten while copying: discard the copy and wait for the next frame.
+   (The overwritten case cannot be written as a static file, so no vector shows it; the live tests of
+   each implementation do.)
 
 With 3 or more slots the writer rarely reaches the slot being read.
+
+A writer refuses a write whose width or height is 0 or above the file's, whose colour buffer is not
+`width * height * 4` bytes, whose depth is not `width * height` values or is given for a file
+without a depth plane. A refused write changes nothing: no byte of the file, no frame number used. A
+writer whose file has a depth plane writes depth with every frame; a call that supplies none is
+either refused or filled with `+inf` ("nothing here"), as the library decides, and a slot never
+keeps the depth of an older frame.
+
+**Header checks.** Every reader refuses a file whose `magic` is not `"RBFRAME"` and a zero byte,
+whose `version` is not 1, whose `format` is not 1, or whose `slot_size` is not a multiple of 64 or is
+below `64 + stride * height` (it has to hold the slot header and the colour rows). The field tables
+above fix these values; revision 5 says in so many words that a reader refuses the others. The
+`reserved` bytes of the file header (56 to 63) and of the slot header (36 to 63) are ignored on read
+whatever they hold, as they are in datagrams.
 
 **Compatibility and checks.** The depth fields use bytes that revisions 1 and 2 reserved, and
 `slot_size` grows to make room, so older readers keep working: they read the header fields they
@@ -523,6 +697,10 @@ does every byte of the file. A receiver MUST:
    fault (SIGBUS), which ends the process. The check narrows that window but cannot close it: a
    truncation between the check and the copy still faults. The other half is on the sender (next
    paragraph); the check guards against a broken or hostile peer, not a correct one.
+
+A writer that is asked to create a file with a number of slots outside 1 to 16, a width or height
+of 0 or above 16384, or more than 67108864 pixels (the limits above) fails and creates nothing; one
+asked for a path that exists fails and leaves what is there alone.
 
 A sender MUST create the file exclusively (`O_CREAT | O_EXCL`, `CREATE_NEW`; creation fails if the
 path exists, so it never opens over another file) and MUST NOT truncate, shrink or resize it, or
@@ -639,6 +817,7 @@ check that.
 #define RBL_MAX_DATAGRAM   8192
 #define RBL_MAX_POSES      102
 #define RBL_MAX_TRIANGLES  226
+#define RBL_MAX_COLLISION_CHUNKS 4096  /* chunk_count at most; 4096 * 226 = 925696 triangles */
 
 enum rbl_kind { RBL_HEARTBEAT = 1, RBL_CAMERA = 2, RBL_POSE = 3, RBL_COLLISION = 4, RBL_FRAME = 5 };
 enum rbl_depth_range { RBL_DEPTH_NEG_ONE_TO_ONE = 0, RBL_DEPTH_ZERO_TO_ONE = 1, RBL_DEPTH_REVERSED = 2 };
@@ -809,6 +988,49 @@ control lines, send `Heartbeat` when `heartbeat_ms` has passed, and check the wa
   sender's and receiver's own behaviour, invisible on the wire. A peer that depended on the old
   leniency (poses without a `spawn`, or a `heartbeat_ms` under 10) must add the `spawn` or raise
   the value; the reference examples (`fake_guest`, link-java's `LinkDemo`) already spawn first.
+
+- v1, revision 5: the places where revision 4 was silent or ambiguous, settled. `tests/vectors/link/GAPS.md`
+  lists all 26, with what each of the four implementations (Rust, link-java, link-c, link-cs) did before, the
+  rule, and the reason; the shared vectors now cover the rules. No byte layout, message or field changed.
+  Where the four implementations already agreed the rule is what they did, written down and tested; where
+  they differed, or all four accepted without a limit what no receiver can afford, the rule is the safest
+  one. What the text now says:
+  - **First line, second `hello`, `bye` (sections 6, 8).** The first line is a `hello` or a `bye`; any other
+    line, known type or not, is a protocol error. A second `hello` is a protocol error. A `bye` needs no
+    `reason`; `null` is absent; a reason of another type is a protocol error; the text of a reason is free
+    (only `"busy"` is fixed). A `despawn` of an id that is not live is ignored.
+  - **Syntax of a control line (section 8).** Duplicate keys: the last wins, and the overridden values must still
+    be valid. Integer fields take digit-only literals (no `7.0`, `7e0`, `-0`). `null` for an optional field is
+    absent. A CR inside the line is whitespace; a byte order mark, form feed, vertical tab and U+00A0 are not.
+    Lone surrogate escapes are errors. **A `\u0000` escape is an error**, and a sender writes U+FFFD in its
+    place. Arrays and objects nest at most 127 deep.
+  - **Integer ranges of `hello` (section 8).** `protocol` and `min_protocol` are `u16`; `heartbeat_ms` and
+    `timeout_ms` are `u32`; `udp_port` is 1 to 65535 (0 is a handshake error); `timeout_ms` has no range beyond
+    its type because no receiver uses the peer's value.
+  - **Datagrams (sections 2, 9).** A receiver's buffer is at least 8193 bytes; a datagram of a known kind above
+    8192 bytes is malformed, one of an unknown kind is ignored at any length. A `Frame` with `frame` 0 is
+    malformed. The decoder checks no value of a `Camera`, `Pose` or `Collision` beyond the layout ranges it
+    already had; unknown `Pose` flag bits are ignored; receivers check before they use.
+  - **Collision (section 9.5).** `chunk_count` is at most **4096** (925696 triangles, 32 MiB); the assembly
+    rules (first chunk decides `chunk_count`, `center` and `radius`; a chunk with another `chunk_count` is
+    dropped; the first copy of a chunk wins) are written out.
+  - **Pixel file (section 9.6).** The reader's steps now say: slot below `slots`, the slot header's size 1 to the
+    file's and equal to the datagram's, then the seqlock; `slot == frame % slots` is not required. The header
+    checks (`magic`, `version`, `format`, `slot_size`) and the constructor limits are stated as MUST, reserved
+    bytes are ignored, and a writer refuses a frame of size 0 or above the file's, or a buffer of the wrong
+    length, and changes nothing.
+
+  Why the protocol version stays 1: every datagram and every control line that a correct revision 4
+  implementation sends is still valid and means the same. Three new rules refuse something a revision 4
+  receiver let through, and a correct sender never produced any of them: a `\u0000` escape in a string (the C
+  implementation could not hold it, and the others could only hand it on to code that could not either), a
+  `chunk_count` above 4096 (sending that many chunks takes over two seconds of pacing at 60 ticks per
+  second, and the C implementation already dropped what exceeded 2097152 triangles), and a `Frame` datagram
+  whose size differs from the slot header's, or whose slot header has a size of 0 (every writer writes the
+  same size in both places). A peer that depended on the old leniency has to
+  write U+FFFD (or nothing) in place of NUL, keep a snapshot under 925696 triangles, and announce the size it
+  wrote. link-java, link-c and link-cs add an overload that takes the whole `Frame` datagram for the reader
+  (the old call stays, and does not know the datagram's size).
 
 A change that alters any layout or meaning above needs a new protocol version. Adding a control
 message type or field, or a new datagram `kind`, does not, because receivers ignore what they do

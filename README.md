@@ -385,7 +385,7 @@ side freezes or dies.
   its [`compose` feature](rewrite-bridge-bevy/README.md#depth-compositing-of-a-guests-frames-feature-compose)).
 - Coordinates: the same glTF conventions as `Model`; each side converts its own.
 
-[`docs/CONTRACT.md`](docs/CONTRACT.md) is the versioned protocol (v1, revision 4), with every byte offset and C
+[`docs/CONTRACT.md`](docs/CONTRACT.md) is the versioned protocol (v1, revision 5), with every byte offset and C
 structs, so plugins in other languages can implement it without this crate. In Rust:
 
 ```rust

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generates the link protocol test vectors (everything in this directory except this file and README.md).
 
-Every byte comes from docs/CONTRACT.md (protocol v1, revision 4) through the independent encoder below, which
+Every byte comes from docs/CONTRACT.md (protocol v1, revision 5) through the independent encoder below, which
 uses only the standard library. No implementation of the link (Rust, Java, C, C#) is involved, so a vector
 cannot have inherited a bug from one of them. The implementations are the consumers.
 
@@ -18,7 +18,7 @@ import struct
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CONTRACT = "v1 revision 4"
+CONTRACT = "v1 revision 5"
 INF = float("inf")
 
 # ---------------------------------------------------------------------------------------------
@@ -264,6 +264,83 @@ def datagram_cases():
     invalid("dg.bad.frame_47_bytes", "9.6", fr[:-1], "Frame is exactly 48 bytes")
     invalid("dg.bad.frame_49_bytes", "9.6", fr + b"\x00", "Frame is exactly 48 bytes")
     invalid("dg.bad.frame_header_only", "9.6", header(5), "Frame is exactly 48 bytes")
+
+    # --- revision 5 (section 9 and 9.6): what the contract now says in so many words
+    invalid("dg.bad.frame_0", "9.6", datagram(frame_body(frame=0)),
+            "frame numbers start at 1; a datagram naming frame 0 would match a slot nobody wrote")
+    valid("dg.frame.slot_u32_max_is_not_checked_by_the_decoder", "9.6", frame_body(slot=0xFFFFFFFF),
+          note="the reader checks slot against the file, not the decoder")
+    valid("dg.frame.zero_size_is_not_checked_by_the_decoder", "9.6", frame_body(width=0, height=0),
+          note="the reader compares the size with the slot header")
+    # collision: chunk_count at most 4096 (9.5)
+    valid("dg.collision.chunk_count_4096_first_chunk", "9.5", collision_body(index=0, count=4096, tris=0))
+    valid("dg.collision.chunk_count_4096_last_chunk", "9.5", collision_body(index=4095, count=4096, tris=2))
+    for cnt, idx in ((4097, 0), (4097, 4096), (9281, 5), (65535, 0), (65535, 65534)):
+        invalid("dg.bad.collision_chunk_count_%d_index_%d" % (cnt, idx), "9.5",
+                datagram(collision_body(index=idx, count=cnt, tris=0)),
+                "chunk_count is at most 4096 (MAX_COLLISION_CHUNKS): a query holds at most 925696 triangles")
+    # datagram size (2)
+    ignored("dg.unknown_kind.9_8193_bytes", "2, 9.1", header(9) + bytes(8193 - HEADER_LEN), 9,
+            "an unknown kind is ignored at any length")
+    ignored("dg.unknown_kind.255_9000_bytes", "2, 9.1", header(255) + bytes(9000 - HEADER_LEN), 255,
+            "an unknown kind is ignored at any length")
+    invalid("dg.bad.heartbeat_8193_bytes", "2, 9.2", header(1) + bytes(8193 - HEADER_LEN),
+            "a datagram of a known kind above 8192 bytes is malformed")
+    invalid("dg.bad.camera_8193_bytes", "2, 9.3", header(2) + bytes(8193 - HEADER_LEN),
+            "a datagram of a known kind above 8192 bytes is malformed")
+    invalid("dg.bad.collision_226_plus_one_byte", "2, 9.5", datagram(collision_body(tris=226)) + b"\x00",
+            "8193 bytes: the receiver's buffer must not cut it back to a valid 8192")
+    invalid("dg.bad.collision_226_plus_808_bytes", "2, 9.5", datagram(collision_body(tris=226)) + bytes(808),
+            "9000 bytes: the receiver's buffer must not cut it back to a valid 8192")
+    # pose: flags bits other than TELEPORT are delivered as sent and ignored (9.4)
+    for tag, fl_ in (("bit1", 2), ("bit31", 0x80000000), ("all_but_teleport", 0xFFFFFFFE), ("all", 0xFFFFFFFF)):
+        p = pose_at(1)
+        p["flags"] = fl_
+        valid("dg.pose.flags_" + tag, "9.4", {"kind": "pose", "poses": [p]},
+              note="bits other than bit 0 are ignored by the receiver; the decoder delivers the field as sent")
+    for tag, field, value in (("rotation_not_unit", "rotation", [0.0, 0.0, 0.0, 2.0]),
+                              ("scale_zero", "scale", [0.0, 0.0, 0.0]), ("scale_negative", "scale", [-1.0, 1.0, 1.0])):
+        p = pose_at(1)
+        p[field] = value
+        valid("dg.pose." + tag, "9.4", {"kind": "pose", "poses": [p]},
+              note="valid; the decoder checks no pose value (9.4, Values)")
+
+    # the values the decoder does not check (9.3, 9.4, 9.5): the datagram decodes, the contents are not compared
+    NAN = struct.pack("<I", 0x7FC00000)
+    PINF, NINF = struct.pack("<f", INF), struct.pack("<f", -INF)
+
+    def patch(data, off, raw):
+        return data[:off] + raw + data[off + len(raw):]
+
+    def accepted(id_, section, data, kind, why):
+        cases.append({"id": id_, "section": section, "expect": "accept", "hex": data.hex(), "kind": kind, "why": why})
+
+    P0 = HEADER_LEN
+    camd = datagram(camera_body())
+    for tag, off, raw in (("near_zero", 132, f32(0.0)), ("near_negative", 132, f32(-0.5)), ("near_nan", 132, NAN),
+                          ("near_inf", 132, PINF), ("far_below_near", 136, f32(0.0625)),
+                          ("far_equals_near", 136, f32(0.125)), ("far_nan", 136, NAN), ("far_negative_inf", 136, NINF),
+                          ("fov_nan", 128, NAN), ("fov_negative", 128, f32(-1.0)), ("view_nan", 0, NAN),
+                          ("view_inf", 60, PINF), ("proj_nan", 64 + 20, NAN), ("proj_negative_inf", 64 + 8, NINF),
+                          ("viewport_width_zero", 140, u32(0)), ("viewport_height_zero", 144, u32(0)),
+                          ("viewport_u32_max", 140, u32(0xFFFFFFFF))):
+        accepted("dg.unchecked.camera_" + tag, "9.3", patch(camd, P0 + off, raw), "camera",
+                 "a decoder checks only depth_range of a camera; the values are delivered as sent")
+    posed = datagram({"kind": "pose", "poses": [pose_at(1)]})
+    for tag, off, raw in (("translation_nan", 16, NAN), ("translation_inf", 20, PINF), ("rotation_nan", 28, NAN),
+                          ("rotation_zero", 28, bytes(16)), ("scale_nan", 44, NAN), ("velocity_inf", 60, PINF),
+                          ("angular_velocity_nan", 68, NAN)):
+        accepted("dg.unchecked.pose_" + tag, "9.4", patch(posed, P0 + 8 + off, raw), "pose",
+                 "a decoder checks no value of a pose record")
+    accepted("dg.unchecked.pose_second_record_nan", "9.4",
+             patch(datagram({"kind": "pose", "poses": [pose_at(1), pose_at(2)]}), P0 + 8 + 80 + 16, NAN), "pose",
+             "a bad number in one record does not make the datagram malformed")
+    cold = datagram(collision_body(tris=2))
+    for tag, off, raw in (("center_nan", 8, NAN), ("center_inf", 12, PINF), ("radius_nan", 20, NAN),
+                          ("radius_negative", 20, f32(-1.0)), ("radius_zero", 20, f32(0.0)),
+                          ("vertex_nan", 32 + 4, NAN), ("vertex_inf", 32 + 36 + 8, PINF)):
+        accepted("dg.unchecked.collision_" + tag, "9.5", patch(cold, P0 + off, raw), "collision",
+                 "a decoder checks no collision value")
     return cases
 
 
@@ -451,6 +528,178 @@ def control_cases():
             bad_value("frame_channel", key, v, tag, key + " is an integer")
     for tag, v in (("number", 5), ("null", None), ("array", [])):
         bad_value("frame_channel", "path", v, tag, "path is a string")
+
+    # =========================== revision 5: the syntax of a line, settled (section 8) ===========================
+    # --- bye: reason is optional, null counts as absent, another type is an error
+    accept("ctl.bye.without_reason", "8", '{"type":"bye"}', {"type": "bye", "reason": ""},
+           note="no reason is the empty reason")
+    accept("ctl.bye.reason_null", "8", '{"type":"bye","reason":null}', {"type": "bye", "reason": ""})
+    accept("ctl.bye.reason_empty", "8", '{"type":"bye","reason":""}', {"type": "bye", "reason": ""}, True)
+    for tag, v in (("number", 5), ("true", True), ("array", ["x"]), ("object", {})):
+        reject("ctl.bad.bye_reason_" + tag, "8", J(type="bye", reason=v), "reason is an optional string")
+
+    # --- integers are integer literals
+    for tag, lit in (("7_0", "7.0"), ("7e0", "7e0"), ("7E0", "7E0"), ("7e_plus_0", "7e+0"), ("70e_minus_1", "70e-1"),
+                     ("0_0", "0.0"), ("neg_0", "-0"), ("neg_0_0", "-0.0"), ("u32_max_0", "4294967295.0"),
+                     ("1e0", "1e0"), ("1e1", "1e1"), ("1e400", "1e400"), ("long_fraction", "7.00000000000000000000001"),
+                     ("30_digits", "123456789012345678901234567890")):
+        reject("ctl.bad.despawn_entity_%s" % tag, "8", '{"type":"despawn","entity":%s}' % lit,
+               "an integer field takes digits only: no sign, fraction or exponent, whatever the value")
+    hello_text = json.dumps(hg, separators=(",", ":"))
+    for key, was, now in (("protocol", '"protocol":1,', '"protocol":1.0,'),
+                          ("min_protocol", '"min_protocol":1,', '"min_protocol":1e0,'),
+                          ("udp_port", '"udp_port":53001', '"udp_port":53001.0'),
+                          ("heartbeat_ms", '"heartbeat_ms":250', '"heartbeat_ms":2.5e2'),
+                          ("timeout_ms", '"timeout_ms":2000', '"timeout_ms":2000.0')):
+        assert was in hello_text
+        reject("ctl.bad.hello_%s_not_an_integer_literal" % key, "8", hello_text.replace(was, now),
+               "an integer field takes digits only")
+    reject("ctl.bad.frame_channel_slots_not_an_integer_literal", "8",
+           '{"type":"frame_channel","path":"/tmp/x","width":4,"height":2,"slots":3.0}', "an integer field takes digits only")
+    reject("ctl.bad.hello_session_not_an_integer_literal", "8", json.dumps(hh, separators=(",", ":")).replace(
+        '"session":2882400001', '"session":2882400001.0'), "an integer field takes digits only")
+
+    # --- widths of the hello integers
+    accept("ctl.hello.protocol_and_min_protocol_65535", "8", J(**dict(hg, protocol=65535, min_protocol=65535)),
+           dict(hg, protocol=65535, min_protocol=65535), True, "the version fields are u16")
+    accept("ctl.hello.protocol_0", "8", J(**dict(hg, protocol=0, min_protocol=0)), dict(hg, protocol=0, min_protocol=0),
+           True)
+    for key, v in (("protocol", 65536), ("protocol", 4294967296), ("min_protocol", 65536), ("min_protocol", 4294967296)):
+        reject("ctl.bad.hello_%s_%d" % (key, v), "8", J(**dict(hg, **{key: v})), "the version fields are u16")
+    accept("ctl.hello.heartbeat_ms_u32_max_is_a_range_error_not_a_parse_error", "8", J(**dict(hg, heartbeat_ms=4294967295)),
+           dict(hg, heartbeat_ms=4294967295), True, "10 ..= 10000 is checked by the handshake, not the parser")
+    accept("ctl.hello.heartbeat_ms_0_is_a_range_error_not_a_parse_error", "8", J(**dict(hg, heartbeat_ms=0)),
+           dict(hg, heartbeat_ms=0), True)
+    reject("ctl.bad.hello_heartbeat_ms_above_u32", "8", J(**dict(hg, heartbeat_ms=4294967296)), "heartbeat_ms is a u32")
+    accept("ctl.hello.timeout_ms_0", "8", J(**dict(hg, timeout_ms=0)), dict(hg, timeout_ms=0), True,
+           "timeout_ms is informative and has no range beyond its type")
+    accept("ctl.hello.timeout_ms_u32_max", "8", J(**dict(hg, timeout_ms=4294967295)), dict(hg, timeout_ms=4294967295), True)
+    reject("ctl.bad.hello_timeout_ms_above_u32", "8", J(**dict(hg, timeout_ms=4294967296)), "timeout_ms is a u32")
+    accept("ctl.hello.udp_port_0_is_a_range_error_not_a_parse_error", "8", J(**dict(hg, udp_port=0)),
+           dict(hg, udp_port=0), True, "udp_port 0 is refused by the handshake, not the parser")
+    accept("ctl.frame_channel.u32_max_sizes", "8",
+           '{"type":"frame_channel","path":"/tmp/x","width":4294967295,"height":4294967295,"slots":4294967295}',
+           {"type": "frame_channel", "path": "/tmp/x", "width": 4294967295, "height": 4294967295, "slots": 4294967295},
+           True, "the file limits are checked when the file is opened, not by the parser")
+
+    # --- duplicate keys: the last wins, everywhere, and the earlier values still have to be valid
+    accept("ctl.json.duplicate_key_last_wins", "8", '{"type":"despawn","entity":1,"entity":2}',
+           {"type": "despawn", "entity": 2})
+    accept("ctl.json.duplicate_key_same_value", "8", '{"type":"despawn","entity":1,"entity":1}',
+           {"type": "despawn", "entity": 1})
+    accept("ctl.json.duplicate_type_last_wins", "8", '{"type":"despawn","type":"bye","entity":1}',
+           {"type": "bye", "reason": ""})
+    accept("ctl.json.duplicate_escaped_key_is_the_same_key", "8", '{"type":"despawn","entity":1,"\\u0065ntity":2}',
+           {"type": "despawn", "entity": 2}, note="keys are compared after their escapes are decoded")
+    accept("ctl.json.duplicate_unknown_key", "8", '{"type":"despawn","entity":1,"x":1,"x":2}',
+           {"type": "despawn", "entity": 1})
+    accept("ctl.json.duplicate_key_in_nested_object", "8", '{"type":"despawn","entity":1,"x":{"a":1,"a":2}}',
+           {"type": "despawn", "entity": 1})
+    reject("ctl.bad.duplicate_type_last_is_hello", "8", '{"type":"bye","type":"hello"}',
+           "the last type wins, and a hello needs its fields")
+    reject("ctl.bad.duplicate_key_hides_a_nul", "8", '{"type":"despawn","entity":1,"x":"\\u0000","x":1}',
+           "the overridden value still has to be valid")
+    reject("ctl.bad.duplicate_key_hides_a_lone_surrogate", "8", '{"type":"despawn","entity":1,"x":"\\ud83d","x":1}',
+           "the overridden value still has to be valid")
+    reject("ctl.bad.duplicate_key_hides_a_syntax_error", "8", '{"type":"despawn","entity":1,"x":01,"x":1}',
+           "the overridden value still has to be valid")
+    reject("ctl.bad.duplicate_key_hides_a_deep_value", "8", '{"type":"despawn","entity":1,"x":%s%s,"x":1}' % (
+        "[" * 130, "]" * 130), "the overridden value still has to be valid")
+
+    # --- null is "absent" for an optional field
+    accept("ctl.spawn.name_null_is_absent", "8", '{"type":"spawn","entity":1,"provider":"P","asset":"a","name":null}',
+           {"type": "spawn", "entity": 1, "provider": "P", "asset": "a"})
+    accept("ctl.input.reason_null_is_absent", "8", '{"type":"input","focus":"host","reason":null}',
+           {"type": "input", "focus": "host"})
+    accept("ctl.hello.guest_session_null_is_absent", "8", hello_text[:-1] + ',"session":null}', hg)
+
+    # --- strings: surrogates, NUL, escapes, UTF-8
+    name_line = '{"type":"spawn","entity":1,"provider":"P","asset":"a","name":"%s"}'
+    for tag, esc in (("lone_high", "\\ud83d"), ("lone_low", "\\ude00"), ("high_then_letter", "\\ud83dx"),
+                     ("pair_reversed", "\\ude00\\ud83d"), ("high_high_low", "\\ud83d\\ud83d\\ude00"),
+                     ("high_then_non_low_escape", "\\ud83d\\u0041"), ("lone_high_upper_case", "\\uD83D"),
+                     ("lone_low_then_letter", "\\uDC00a")):
+        reject("ctl.bad.string_surrogate_" + tag, "8", name_line % esc, "a surrogate escape must be a high one followed by a low one")
+    reject("ctl.bad.string_surrogate_in_unknown_field", "8", '{"type":"despawn","entity":1,"x":"\\ud83d"}',
+           "syntax applies to unknown fields too")
+    reject("ctl.bad.string_surrogate_in_key", "8", '{"type":"despawn","entity":1,"\\ud83d":1}', "keys are strings too")
+    reject("ctl.bad.string_surrogate_in_array_of_unknown_field", "8", '{"type":"despawn","entity":1,"x":[1,{"y":["\\udc00"]}]}',
+           "syntax applies to unknown fields too")
+    for tag, line in (("name", name_line % "\\u0000"), ("name_middle", name_line % "a\\u0000b"),
+                      ("name_then_letter", name_line % "\\u0000a"),
+                      ("asset", '{"type":"spawn","entity":1,"provider":"P","asset":"a\\u0000b"}'),
+                      ("path", '{"type":"frame_channel","path":"/tmp/a\\u0000b","width":4,"height":2,"slots":3}'),
+                      ("game", J(**dict(hg, game="a\u0000b"))), ("bye_reason", '{"type":"bye","reason":"\\u0000"}'),
+                      ("unknown_field", '{"type":"despawn","entity":1,"x":"\\u0000"}'),
+                      ("key", '{"type":"despawn","entity":1,"a\\u0000b":1}'),
+                      ("nested_unknown", '{"type":"despawn","entity":1,"x":{"y":["\\u0000"]}}')):
+        reject("ctl.bad.string_nul_" + tag, "8", line, "U+0000 in a string is an error: the C implementation cannot hold it")
+    accept("ctl.spawn.escape_hex_digits_in_upper_case", "8", name_line % "\\u00E9",
+           {"type": "spawn", "entity": 1, "provider": "P", "asset": "a", "name": "é"})
+    accept("ctl.spawn.escaped_u0001_and_u001f", "8", name_line % "\\u0001\\u001f",
+           {"type": "spawn", "entity": 1, "provider": "P", "asset": "a", "name": "\u0001\u001f"},
+           note="every other control character may be escaped")
+    accept("ctl.json.escaped_type", "8", '{"type":"desp\\u0061wn","entity":3}', {"type": "despawn", "entity": 3})
+    accept("ctl.json.escaped_key", "8", '{"\\u0074ype":"despawn","entity":3}', {"type": "despawn", "entity": 3})
+    accept("ctl.json.empty_key", "8", '{"":1,"type":"despawn","entity":3}', {"type": "despawn", "entity": 3})
+    accept("ctl.json.del_in_string", "8", '{"type":"bye","reason":"a\x7fb"}', {"type": "bye", "reason": "a\x7fb"})
+    accept("ctl.json.noncharacter_in_string", "8", '{"type":"bye","reason":"￾￿"}',
+           {"type": "bye", "reason": "￾￿"}, note="U+FFFE is a valid scalar value")
+    for tag, esc in (("x", "\\x41"), ("short_u", "\\u12"), ("bad_hex_u", "\\u12G4"), ("single_quote", "\\'")):
+        reject("ctl.bad.string_escape_" + tag, "8", name_line % esc, "not a JSON escape")
+    reject("ctl.bad.utf8_encoded_surrogate", "8", None, "UTF-8 may not encode a surrogate",
+           line_hex=(b'{"type":"bye","reason":"' + b"\xed\xa0\x80" + b'"}').hex())
+    reject("ctl.bad.utf8_above_10ffff", "8", None, "UTF-8 stops at U+10FFFF",
+           line_hex=(b'{"type":"bye","reason":"' + b"\xf4\x90\x80\x80" + b'"}').hex())
+    reject("ctl.bad.utf8_truncated_sequence", "8", None, "a sequence cut short is not UTF-8",
+           line_hex=(b'{"type":"bye","reason":"' + b"\xe2\x82" + b'"}').hex())
+    reject("ctl.bad.utf8_lone_continuation_byte", "8", None, "a continuation byte alone is not UTF-8",
+           line_hex=(b'{"type":"bye","reason":"' + b"\x80" + b'"}').hex())
+    reject("ctl.bad.byte_order_mark", "8", None, "EF BB BF is not whitespace",
+           line_hex=(b"\xef\xbb\xbf" + b'{"type":"bye","reason":"x"}').hex())
+
+    # --- whitespace
+    ws = {"type": "bye", "reason": "x"}
+    accept("ctl.json.cr_between_tokens", "8", '{"type":"bye",\r"reason":"x"}', ws, note="a CR inside the line is whitespace")
+    accept("ctl.json.cr_before_the_object", "8", '\r{"type":"bye","reason":"x"}', ws)
+    accept("ctl.json.cr_at_the_end", "8", '{"type":"bye","reason":"x"}\r', ws)
+    accept("ctl.json.two_cr_at_the_end", "8", '{"type":"bye","reason":"x"}\r\r', ws)
+    accept("ctl.json.tab_is_whitespace", "8", '\t{"type":\t"bye",\t"reason":"x"}\t', ws)
+    reject("ctl.bad.form_feed_is_not_whitespace", "8", '{"type":"bye",\x0c"reason":"x"}', "only space, tab, CR and LF")
+    reject("ctl.bad.vertical_tab_is_not_whitespace", "8", '{"type":"bye",\x0b"reason":"x"}', "only space, tab, CR and LF")
+    reject("ctl.bad.nbsp_is_not_whitespace", "8", None, "only space, tab, CR and LF",
+           line_hex=(b'{"type":"bye",' + b"\xc2\xa0" + b'"reason":"x"}').hex())
+    reject("ctl.bad.nul_byte_between_tokens", "8", None, "only space, tab, CR and LF",
+           line_hex=(b'{"type":"bye",\x00"reason":"x"}').hex())
+
+    # --- number and literal grammar (RFC 8259), in known and unknown fields
+    for tag, lit in (("leading_zero", "01"), ("plus", "+1"), ("trailing_dot", "1."), ("leading_dot", ".5"),
+                     ("hex", "0x10"), ("nan", "NaN"), ("infinity", "Infinity"), ("minus_only", "-"),
+                     ("exponent_without_digits", "1e"), ("exponent_sign_only", "1e+")):
+        reject("ctl.bad.number_" + tag, "8", '{"type":"despawn","entity":%s}' % lit, "not a JSON number")
+    reject("ctl.bad.number_leading_zero_in_unknown_field", "8", '{"type":"despawn","entity":1,"x":01}',
+           "syntax applies to unknown fields too")
+    for tag, lit in (("True", "True"), ("nul", "nul"), ("nullx", "nullx"), ("true1", "true1"), ("one_a", "1a")):
+        reject("ctl.bad.literal_" + tag, "8", '{"type":"despawn","entity":1,"x":%s}' % lit, "not a JSON literal")
+
+    # --- nesting (8, Syntax of a line, 3): the line's object counts as the first of 127 levels
+    def deep(n, opener="[", closer="]", leaf=""):
+        return '{"type":"despawn","entity":1,"x":%s%s%s}' % ((opener if opener == "[" else '{"a":') * n, leaf,
+                                                            closer * n)
+
+    despawn1 = {"type": "despawn", "entity": 1}
+    accept("ctl.json.nesting_127_levels_arrays", "8", deep(126), despawn1, note="the object and 126 arrays: 127 levels")
+    accept("ctl.json.nesting_127_levels_objects", "8", deep(126, "{", "}", "1"), despawn1,
+           note="the object and 126 objects: 127 levels")
+    accept("ctl.json.nesting_wide_is_not_deep", "8", '{"type":"despawn","entity":1,"x":[%s]}' % ",".join(["[1]"] * 5000),
+           despawn1)
+    reject("ctl.bad.nesting_128_levels_arrays", "8", deep(127), "at most 127 levels")
+    reject("ctl.bad.nesting_128_levels_objects", "8", deep(127, "{", "}", "1"), "at most 127 levels")
+    reject("ctl.bad.nesting_1000_levels", "8", deep(1000), "at most 127 levels")
+    reject("ctl.bad.nesting_30000_levels", "8", deep(30000), "a 64 KiB line must not be able to overflow a stack")
+    reject("ctl.bad.nesting_30000_levels_unclosed", "8", '{"type":"despawn","entity":1,"x":' + "[" * 30000,
+           "the limit is checked before the line ends")
+    reject("ctl.bad.nesting_12000_objects", "8", deep(12000, "{", "}", "1"), "a 64 KiB line must not be able to overflow a stack")
     return cases
 
 
@@ -653,11 +902,11 @@ def pixel_cases(outdir):
     H.put(1, 1, hdr_wh=(5, 2))
     H2 = Fixture()
     H2.put(1, 1, hdr_wh=(4, 3))
-    cases.append({"id": "pf.read.slot_header_wider_than_file", "section": "9.6", "basis": "table",
+    cases.append({"id": "pf.read.slot_header_wider_than_file", "section": "9.6", "basis": "MUST",
                   "file": fixture_file("depth_slot_wider_than_file.bin", H), "open": "ok", "info": info_of(H),
                   "reads": [skip_read(1, 1, "the slot header says 5 pixels used, the file's maximum is 4", w=5, h=2,
                                       camera_seq=101)]})
-    cases.append({"id": "pf.read.slot_header_taller_than_file", "section": "9.6", "basis": "table",
+    cases.append({"id": "pf.read.slot_header_taller_than_file", "section": "9.6", "basis": "MUST",
                   "file": fixture_file("depth_slot_taller_than_file.bin", H2), "open": "ok", "info": info_of(H2),
                   "reads": [skip_read(1, 1, "the slot header says 3 rows used, the file's maximum is 2", w=4, h=3,
                                       camera_seq=101)]})
@@ -784,11 +1033,11 @@ def pixel_cases(outdir):
                            ("format_0", dict(fmt=0), "format 1 = RGBA8"),
                            ("format_2", dict(fmt=2), "format 1 = RGBA8")):
         h = file_header(**over)
-        recipe("pf.bad.%s" % tag, "9.6", h, 64 + 3 * 128, why, basis="table")
+        recipe("pf.bad.%s" % tag, "9.6", h, 64 + 3 * 128, why)
     for tag, ss in (("slot_size_not_multiple_of_64", 130), ("slot_size_smaller_than_colour", 64)):
         h = file_header(slots=3, width=4, height=2, slot_size=ss)
         recipe("pf.bad.%s" % tag, "9.6", h, 64 + 3 * ss, "slot_size is a multiple of 64 and holds the slot header and "
-               "the colour rows", basis="table")
+               "the colour rows")
     # --- the path (9.6 "Opening and creating")
     for kind, why in (("relative", "the path must be absolute"), ("missing", "there is no such file"),
                       ("empty", "the path is empty"), ("directory", "a directory is not a regular file"),
@@ -831,9 +1080,108 @@ def pixel_cases(outdir):
         "why": "a sender creates the file exclusively and never truncates what is there"})
     for tag, (w, hh_, s) in (("width_16385", (16385, 1, 3)), ("height_16385", (1, 16385, 3)), ("slots_0", (4, 2, 0)),
                              ("slots_17", (4, 2, 17)), ("width_0", (0, 2, 3)), ("pixels_8193x8192", (8193, 8192, 1))):
-        cases.append({"id": "pw.refuses_%s" % tag, "section": "9.6", "basis": "table", "writer": {
+        cases.append({"id": "pw.refuses_%s" % tag, "section": "9.6", "basis": "MUST", "writer": {
             "width": w, "height": hh_, "slots": s, "with_depth": False, "writes": []}, "expect": "create_fails",
             "why": "a sender stays within the limits every receiver enforces"})
+    # =========================== revision 5 ===========================
+    # frame 0 names a slot nobody wrote (frame 0, lock 0): never delivered (9.6)
+    Z = Fixture()
+    Z.put(1, 1)
+    cases.append({"id": "pf.read.frame_0_names_a_slot_nobody_wrote", "section": "9.6", "basis": "MUST",
+                  "file": fixture_file("depth_one_frame_in_slot_1.bin", Z), "open": "ok", "info": info_of(Z),
+                  "reads": [skip_read(0, 0, "frame 0 is malformed; slot 0 is clean (lock 0, frame 0) and would match", camera_seq=0),
+                            skip_read(0, 2, "frame 0 is malformed; slot 2 is clean (lock 0, frame 0) and would match", camera_seq=0),
+                            read(Z, 1)]})
+    # the reader finds the slot by `slot`; it does not require slot == frame % slots (9.6, reader step 0)
+    M = Fixture()
+    M.put(2, 1)
+    cases.append({"id": "pf.read.slot_need_not_be_frame_modulo_slots", "section": "9.6", "basis": "MUST",
+                  "file": fixture_file("depth_frame_1_in_slot_2.bin", M), "open": "ok", "info": info_of(M),
+                  "reads": [read(M, 2), skip_read(1, 1, "slot 1 was never written", camera_seq=101)]})
+    # the datagram's size must equal the slot header's (9.6, reader step 2)
+    D2 = Fixture()
+    D2.put(1, 1)
+    cases.append({"id": "pf.read.datagram_size_differs_from_the_slot_header", "section": "9.6", "basis": "MUST",
+                  "file": fixture_file("depth_one_frame_in_slot_1_again.bin", D2), "open": "ok", "info": info_of(D2),
+                  "reads": [skip_read(1, 1, "the datagram says 3 pixels wide, the slot header says 4", w=3, h=2, camera_seq=101),
+                            skip_read(1, 1, "the datagram says 1 row, the slot header says 2", w=4, h=1, camera_seq=101),
+                            skip_read(1, 1, "the datagram says 5 x 3, above the file's maximum", w=5, h=3, camera_seq=101),
+                            skip_read(1, 1, "the datagram says 0 x 0", w=0, h=0, camera_seq=101),
+                            read(D2, 1)]})
+    # the slot header's size is 1 .. the file's (9.6, reader step 2)
+    H0 = Fixture()
+    H0.put(1, 1, hdr_wh=(0, 2))
+    cases.append({"id": "pf.read.slot_header_width_0", "section": "9.6", "basis": "MUST",
+                  "file": fixture_file("depth_slot_width_0.bin", H0), "open": "ok", "info": info_of(H0),
+                  "reads": [skip_read(1, 1, "the slot header says 0 pixels wide", w=0, h=2, camera_seq=101)]})
+    H1 = Fixture()
+    H1.put(1, 1, hdr_wh=(4, 0))
+    cases.append({"id": "pf.read.slot_header_height_0", "section": "9.6", "basis": "MUST",
+                  "file": fixture_file("depth_slot_height_0.bin", H1), "open": "ok", "info": info_of(H1),
+                  "reads": [skip_read(1, 1, "the slot header says 0 rows", w=4, h=0, camera_seq=101)]})
+    H3 = Fixture()
+    H3.put(1, 1, hdr_wh=(0, 0))
+    cases.append({"id": "pf.read.slot_header_size_0_x_0", "section": "9.6", "basis": "MUST",
+                  "file": fixture_file("depth_slot_size_0.bin", H3), "open": "ok", "info": info_of(H3),
+                  "reads": [skip_read(1, 1, "the slot header says 0 x 0 and so does the datagram", w=0, h=0, camera_seq=101)]})
+    # reserved bytes are ignored on read (9.6 Header checks)
+    R1 = Fixture(hdr_over={"reserved": b"\xff" * 8})
+    R1.put(1, 1)
+    cases.append({"id": "pf.read.file_header_reserved_bytes_ignored_depth", "section": "9.6", "basis": "MUST",
+                  "file": fixture_file("depth_file_reserved_ff.bin", R1), "open": "ok", "info": info_of(R1),
+                  "reads": [read(R1, 1)]})
+    R1b = Fixture(depth=False, hdr_over={"reserved": b"\xff" * 8})
+    R1b.put(1, 1)
+    cases.append({"id": "pf.read.file_header_reserved_bytes_ignored_colour", "section": "9.6", "basis": "MUST",
+                  "file": fixture_file("colour_file_reserved_ff.bin", R1b), "open": "ok", "info": info_of(R1b),
+                  "reads": [read(R1b, 1)]})
+    R2 = Fixture()
+    R2.put(1, 1)
+    sd = bytearray(R2.slots_data[1])
+    sd[36:64] = b"\xff" * 28
+    R2.slots_data[1] = bytes(sd)
+    cases.append({"id": "pf.read.slot_header_reserved_bytes_ignored", "section": "9.6", "basis": "MUST",
+                  "file": fixture_file("depth_slot_reserved_ff.bin", R2), "open": "ok", "info": info_of(R2),
+                  "reads": [read(R2, 1)]})
+    R3 = Fixture(depth=False, depth_format=7, hdr_over={"reserved": b"\xff" * 8, "depth_stride": 1, "depth_offset": 2})
+    R3.put(1, 1)
+    cases.append({"id": "pf.read.unknown_depth_format_with_reserved_bytes_set", "section": "9.6", "basis": "MUST",
+                  "file": fixture_file("unknown_depth_format_7_reserved_ff.bin", R3), "open": "ok",
+                  "info": dict(info_of(R3), has_depth=False), "reads": [read(R3, 1, False)]})
+
+    # writers: a refused write changes nothing (9.6)
+    def writes_for(fx, n):
+        out = []
+        for f in range(1, n + 1):
+            w, h = fx.width, fx.height
+            out.append({"camera_seq": 100 + f, "time_us": str(1_700_000_000_000_000 + f * 16_666), "width": w,
+                        "height": h, "rgba": px_rgba(f, w, h).hex(),
+                        "depth": [jf(v) for v in px_depth(f, w, h)] if fx.depth else None})
+        return out
+
+    def refused(width, height, rgba=b"", depth=None, why=""):
+        return {"expect": "refused", "why": why, "camera_seq": 99, "time_us": "99", "width": width, "height": height,
+                "rgba": rgba.hex(), "depth": None if depth is None else [jf(v) for v in depth]}
+
+    wc = writes_for(B, 3)
+    cases.append({"id": "pw.colour_refused_writes_change_nothing", "section": "9.6", "basis": "MUST", "writer": {
+        "width": 4, "height": 2, "slots": 3, "with_depth": False, "writes": [wc[0]] + [
+            refused(5, 2, bytes(40), why="wider than the file"), refused(4, 3, bytes(48), why="taller than the file"),
+            refused(0, 2, why="width 0"), refused(4, 0, why="height 0"), refused(0, 0, why="0 x 0"),
+            refused(5, 3, bytes(60), why="both above the file's"),
+            refused(4, 2, bytes(31), why="one byte short"), refused(4, 2, bytes(33), why="one byte over"),
+            refused(4, 2, bytes(32), depth=[1.0] * 8, why="depth for a file without a depth plane")] + wc[1:]},
+        "file": fb})
+    wd = writes_for(A, 3)
+    cases.append({"id": "pw.depth_refused_writes_change_nothing", "section": "9.6", "basis": "MUST", "writer": {
+        "width": 4, "height": 2, "slots": 3, "with_depth": True, "writes": [wd[0]] + [
+            refused(5, 2, bytes(40), depth=[1.0] * 10, why="wider than the file"),
+            refused(4, 3, bytes(48), depth=[1.0] * 12, why="taller than the file"),
+            refused(0, 2, depth=[], why="width 0"), refused(4, 0, depth=[], why="height 0"),
+            refused(4, 2, bytes(31), depth=[1.0] * 8, why="colour one byte short"),
+            refused(4, 2, bytes(32), depth=[1.0] * 7, why="depth one value short"),
+            refused(4, 2, bytes(32), depth=[1.0] * 9, why="depth one value over")] + wd[1:]},
+        "file": fa})
     for name, data in files.items():
         with open(os.path.join(outdir, "pixelfiles", name), "wb") as f:
             f.write(data)
@@ -1159,8 +1507,14 @@ def sessions():
         sendd(dg(encode_body(frame_body(frame=9, slot=0, camera_seq=77, width=320, height=240)).hex(), 5)),
         ev("frame", {"frame": "9", "slot": 0, "camera_seq": 77, "width": 320, "height": 240})])
 
-    def coll(query, index, count, tris):
-        return encode_body(collision_body(query=query, index=index, count=count, tris=tris)).hex()
+    def coll(query, index, count, tris, center=None, radius=None, first_tri=0):
+        b = collision_body(query=query, index=index, count=count, tris=0)
+        if center is not None:
+            b["center"] = list(center)
+        if radius is not None:
+            b["radius"] = radius
+        b["triangles"] = [tri_at(first_tri + i) for i in range(tris)]
+        return encode_body(b).hex()
 
     case("sess.host.udp.collision_reassembled_out_of_order", "7, 9.5", "host", HS + [
         sendd(dg(coll(1, 1, 3, 2), 4, seq=1)), sendd(dg(coll(1, 2, 3, 5), 4, seq=2)), noev("collision", 200),
@@ -1287,7 +1641,7 @@ def sessions():
          note="the datagrams need the session; a host hello carries one")
     case("sess.guest.handshake.host_session_zero_refused", "8", "guest", [
         {"op": "accept"}, expect_line(guest_hello), send(hello(role="host", session=0))] + bye_closed
-         + [ev("handshake_failed")], basis="table", note="session is a nonzero u32")
+         + [ev("handshake_failed")], note="session is a nonzero u32")
     case("sess.guest.handshake.host_session_above_u32_refused", "8", "guest", [
         {"op": "accept"}, expect_line(guest_hello), send(hello(role="host", session=4294967296))] + bye_closed
          + [ev("handshake_failed")])
@@ -1333,6 +1687,183 @@ def sessions():
     case("sess.guest.udp.wrong_session_dropped", "5, 6", "guest", GS + [
         sendd(dg(cam, 2, session="{session_le_minus1}", seq=1)), noev("camera", 300),
         sendd(dg(cam, 2, session="{session_le}", seq=2)), ev("camera", {"seq": 2})])
+
+    # =========================== revision 5 ===========================
+    # ---- before and after the handshake (6)
+    not_connected = {"op": "expect_no_event", "event": "connected", "ms": 200}
+    first_lines = (("spawn", spawn_line(5)), ("unknown_type", '{"type":"ping"}\n'),
+                   ("input", '{"type":"input","focus":"guest"}\n'), ("despawn", '{"type":"despawn","entity":1}\n'),
+                   ("frame_channel", '{"type":"frame_channel","path":"/tmp/x","width":4,"height":2,"slots":3}\n'))
+    for tag, first in first_lines:
+        case("sess.host.handshake.first_line_%s_is_a_protocol_error" % tag, "6", "host", [
+            {"op": "connect"}, send(first)] + bye_closed + [ev("handshake_failed")],
+             note="a first line that is not hello or bye is refused with a bye, known type or not")
+        case("sess.guest.handshake.first_line_%s_is_a_protocol_error" % tag, "6", "guest", [
+            {"op": "accept"}, expect_line(guest_hello), send(first), not_connected] + bye_closed
+             + [ev("handshake_failed")])
+    case("sess.host.handshake.first_line_hello_after_garbage_does_not_count", "6", "host", [
+        {"op": "connect"}, send(spawn_line(5)), send(hello())] + bye_closed + [ev("handshake_failed")],
+         note="the first line decides; a hello behind it is not read")
+    case("sess.host.handshake.first_line_bye_ends_quietly", "6", "host", [
+        {"op": "connect"}, send('{"type":"bye","reason":"x"}\n'), closed(), ev("handshake_failed")],
+         note="a bye is a valid first line; the receiver closes without a bye of its own")
+    case("sess.guest.handshake.first_line_bye_ends_quietly", "6", "guest", [
+        {"op": "accept"}, expect_line(guest_hello), send('{"type":"bye","reason":"busy"}\n'), closed(),
+        ev("handshake_failed")])
+    case("sess.guest.handshake.first_line_bye_without_reason", "6, 8", "guest", [
+        {"op": "accept"}, expect_line(guest_hello), send('{"type":"bye"}\n'), closed(), ev("handshake_failed")])
+    case("sess.host.control.second_hello_is_a_protocol_error", "6", "host", HS + [send(hello())] + bye_closed
+         + [ev("lost")])
+    case("sess.host.control.second_hello_with_other_values_is_a_protocol_error", "6", "host", HS + [
+        send(hello(protocol=7, min_protocol=1, udp_port=9))] + bye_closed + [ev("lost")])
+    case("sess.guest.control.second_hello_is_a_protocol_error", "6", "guest", GS + [
+        send(hello(role="host", session=SESSION))] + bye_closed + [ev("lost")])
+
+    # ---- bye (8)
+    for tag, line in (("without_reason", '{"type":"bye"}\n'), ("reason_null", '{"type":"bye","reason":null}\n'),
+                      ("reason_empty", '{"type":"bye","reason":""}\n')):
+        case("sess.host.control.bye_%s_ends_the_session" % tag, "6.1, 8", "host", HS + [
+            send(line), ev("lost"), closed()], note="a bye needs no reason; it is answered by closing, not by a bye")
+        case("sess.guest.control.bye_%s_ends_the_session" % tag, "6.1, 8", "guest", GS + [
+            send(line), ev("lost"), closed()])
+    for tag, line in (("reason_number", '{"type":"bye","reason":5}\n'), ("reason_array", '{"type":"bye","reason":["x"]}\n'),
+                      ("reason_true", '{"type":"bye","reason":true}\n')):
+        case("sess.host.control.bye_%s_is_a_protocol_error" % tag, "8", "host", HS + [send(line)] + bye_closed
+             + [ev("lost")])
+        case("sess.guest.control.bye_%s_is_a_protocol_error" % tag, "8", "guest", GS + [send(line)] + bye_closed
+             + [ev("lost")])
+
+    # ---- hello: widths and ranges (8)
+    def host_accepts(tag, text, note=None):
+        case("sess.host.handshake.%s_accepted" % tag, "8", "host", [
+            {"op": "connect"}, send(text), expect_line(host_reply), ev("connected")], note=note)
+
+    def host_refuses(tag, text, note=None):
+        case("sess.host.handshake.%s_refused" % tag, "8", "host", [
+            {"op": "connect"}, send(text), not_connected] + bye_closed + [ev("handshake_failed")], note=note)
+
+    def guest_accepts(tag, text, note=None):
+        case("sess.guest.handshake.%s_accepted" % tag, "8", "guest", [
+            {"op": "accept"}, expect_line(guest_hello), send(text), ev("connected")], note=note)
+
+    def guest_refuses(tag, text, note=None):
+        case("sess.guest.handshake.%s_refused" % tag, "8", "guest", [
+            {"op": "accept"}, expect_line(guest_hello), send(text), not_connected] + bye_closed
+             + [ev("handshake_failed")], note=note)
+
+    host_accepts("protocol_65535_min_1", hello(protocol=65535, min_protocol=1),
+                 "the version fields are u16; the session version is min(1, 65535) = 1")
+    host_accepts("min_protocol_0_protocol_1", hello(protocol=1, min_protocol=0))
+    host_refuses("protocol_65536", hello(protocol=65536, min_protocol=1), "65536 does not fit a u16")
+    host_refuses("protocol_u32_max_plus_1", hello(protocol=4294967296, min_protocol=1))
+    host_refuses("min_protocol_65536", hello(protocol=1, min_protocol=65536))
+    host_refuses("min_protocol_65535_above_1", hello(protocol=1, min_protocol=65535),
+                 "the ranges do not overlap: the session version 1 is below the guest's minimum")
+    host_refuses("heartbeat_u32_max", hello(heartbeat_ms=4294967295), "a u32, so not a parse error, but not 10 ..= 10000")
+    host_refuses("heartbeat_u32_max_plus_1", hello(heartbeat_ms=4294967296))
+    host_accepts("timeout_0", hello(timeout_ms=0), "timeout_ms is informative: any u32")
+    host_accepts("timeout_1", hello(timeout_ms=1))
+    host_accepts("timeout_u32_max", hello(timeout_ms=4294967295))
+    host_refuses("timeout_u32_max_plus_1", hello(timeout_ms=4294967296))
+    host_refuses("udp_port_0", hello(udp_port=0), "nothing can be sent to port 0")
+    host_refuses("udp_port_65536", hello(udp_port=65536))
+    host_accepts("udp_port_1", hello(udp_port=1))
+    host_refuses("protocol_not_an_integer_literal", hello().replace('"protocol":1,', '"protocol":1.0,'))
+    host_refuses("heartbeat_not_an_integer_literal", hello().replace('"heartbeat_ms":250', '"heartbeat_ms":2.5e2'))
+    host_refuses("udp_port_negative_zero", hello().replace('"udp_port":${peer_udp_port}', '"udp_port":-0'))
+    host_accepts("duplicate_key_last_wins", hello().replace('"type":"hello",', '"type":"hello","udp_port":0,'),
+                 "the first udp_port 0 is overridden by the real one; the last duplicate wins")
+    host_refuses("duplicate_key_last_is_bad", hello().replace('"type":"hello",', '"type":"hello","udp_port":${peer_udp_port},')
+                 .replace('"timeout_ms":2000}', '"timeout_ms":2000,"udp_port":0}'))
+    host_refuses("nul_in_game", hello(game="a\u0000b"), "U+0000 in a string is a protocol error")
+    host_refuses("lone_surrogate_in_game", hello().replace('"game":"vector peer"', '"game":"\\ud83d"'))
+    host_refuses("nul_in_an_unknown_field", hello(future="x\u0000y"))
+    host_refuses("deeply_nested_unknown_field", hello(future=json.loads("[" * 130 + "]" * 130)),
+                 "nesting above 127 levels")
+    host_accepts("nested_unknown_field_at_the_limit", hello(future=json.loads("[" * 126 + "]" * 126)),
+                 "the object and 126 arrays: 127 levels")
+    host_accepts("session_null_is_absent", hello().replace('"type":"hello",', '"type":"hello","session":null,'))
+    guest_accepts("timeout_0", hello(role="host", session=SESSION, timeout_ms=0))
+    guest_accepts("timeout_u32_max", hello(role="host", session=SESSION, timeout_ms=4294967295))
+    guest_refuses("timeout_u32_max_plus_1", hello(role="host", session=SESSION, timeout_ms=4294967296))
+    guest_refuses("udp_port_0", hello(role="host", session=SESSION, udp_port=0))
+    guest_refuses("protocol_65536", hello(role="host", session=SESSION, protocol=65536, min_protocol=0))
+    guest_accepts("session_u32_max", hello(role="host", session=4294967295))
+    guest_refuses("nul_in_game", hello(role="host", session=SESSION, game="a\u0000b"))
+    case("sess.host.handshake.byte_order_mark_is_not_whitespace", "8", "host", [
+        {"op": "connect"}, {"op": "send_hex", "hex": b"\xef\xbb\xbf".hex() + hello().encode().hex()}] + bye_closed
+         + [ev("handshake_failed")])
+    case("sess.host.handshake.lone_cr_is_whitespace", "8", "host", [
+        {"op": "connect"}, send(hello().replace('"role":"guest",', '"role":"guest",\r'))] + [
+        expect_line(host_reply), ev("connected")])
+    case("sess.host.handshake.line_ending_in_two_crs", "8", "host", [
+        {"op": "connect"}, send(hello().replace("\n", "\r\r\n")), expect_line(host_reply), ev("connected")])
+
+    # ---- despawn of an id that is not live (8)
+    case("sess.host.control.despawn_of_an_unknown_entity_is_ignored", "8", "host", HS + [
+        send('{"type":"despawn","entity":99}\n'), noev("despawn", 300), send(spawn_line(5)), ev("spawn", {"entity": 5}),
+        {"op": "expect_no_line", "ms": 100}], note="no event, no error, nothing sent")
+    case("sess.guest.control.despawn_of_an_unknown_entity_is_ignored", "8", "guest", GS + [
+        send('{"type":"despawn","entity":99}\n'), noev("despawn", 300), send(spawn_line(5)), ev("spawn", {"entity": 5}),
+        {"op": "expect_no_line", "ms": 100}])
+    case("sess.host.control.second_despawn_of_an_entity_is_ignored", "8", "host", HS + [
+        send(spawn_line(5)), ev("spawn", {"entity": 5}), send('{"type":"despawn","entity":5}\n'),
+        ev("despawn", {"entity": 5}), send('{"type":"despawn","entity":5}\n'), noev("despawn", 300),
+        {"op": "expect_no_line", "ms": 100}])
+    case("sess.host.control.despawn_of_a_spawn_ignored_over_the_limit", "8", "host", HS + [
+        {"op": "send_range", "template": '{"type":"spawn","entity":${i},"provider":"P","asset":"a"}\n', "from": 1,
+         "to": 1025},
+        ev("spawn", None, 1024), noev("spawn", 300), send('{"type":"despawn","entity":1025}\n'), noev("despawn", 300),
+        {"op": "expect_no_line", "ms": 100}, send('{"type":"despawn","entity":1}\n'), ev("despawn", {"entity": 1})],
+         note="the 1025th spawn was ignored; its despawn must not end the session")
+
+    # ---- collision assembly (9.5)
+    c1 = (9.0, 2.0, 3.0)
+    case("sess.host.udp.collision_center_and_radius_come_from_the_first_chunk_to_arrive", "9.5", "host", HS + [
+        sendd(dg(coll(1, 1, 2, 2, center=c1, radius=65.0), 4, seq=1)), sendd(dg(coll(1, 0, 2, 3), 4, seq=2)),
+        ev("collision", {"query": 1, "triangles": 5, "center": [9.0, 2.0, 3.0], "radius": 65.0})],
+         note="the chunks of a query are expected to agree; when they do not, the first one decides")
+    case("sess.host.udp.collision_center_and_radius_of_later_chunks_are_not_compared", "9.5", "host", HS + [
+        sendd(dg(coll(1, 0, 2, 3), 4, seq=1)), sendd(dg(coll(1, 1, 2, 2, center=c1, radius=65.0), 4, seq=2)),
+        ev("collision", {"query": 1, "triangles": 5, "center": [1.0, 2.0, 3.0], "radius": 64.0})])
+    case("sess.host.udp.collision_chunk_with_another_chunk_count_is_dropped", "9.5", "host", HS + [
+        sendd(dg(coll(1, 0, 2, 3), 4, seq=1)), sendd(dg(coll(1, 1, 3, 2), 4, seq=2)), noev("collision", 300),
+        sendd(dg(coll(1, 1, 2, 4), 4, seq=3)), ev("collision", {"query": 1, "triangles": 7})],
+         note="the assembly goes on: the odd chunk is lost, the rest completes")
+    case("sess.host.udp.collision_first_chunk_decides_chunk_count", "9.5", "host", HS + [
+        sendd(dg(coll(1, 2, 3, 2), 4, seq=1)), sendd(dg(coll(1, 1, 2, 2), 4, seq=2)), noev("collision", 300),
+        sendd(dg(coll(1, 0, 3, 2), 4, seq=3)), noev("collision", 300),
+        sendd(dg(coll(1, 1, 3, 2), 4, seq=4)), ev("collision", {"query": 1, "triangles": 6})])
+    case("sess.host.udp.collision_duplicate_chunk_does_not_complete_a_query", "9.5", "host", HS + [
+        sendd(dg(coll(1, 0, 2, 3), 4, seq=1)), sendd(dg(coll(1, 0, 2, 3), 4, seq=2)), noev("collision", 300),
+        sendd(dg(coll(1, 1, 2, 2), 4, seq=3)), ev("collision", {"query": 1, "triangles": 5}), noev("collision", 100)])
+    case("sess.host.udp.collision_first_copy_of_a_chunk_wins", "9.5", "host", HS + [
+        sendd(dg(coll(1, 0, 2, 3), 4, seq=1)), sendd(dg(coll(1, 0, 2, 1, first_tri=5), 4, seq=2)),
+        sendd(dg(coll(1, 1, 2, 2), 4, seq=3)), ev("collision", {"query": 1, "triangles": 5})])
+    case("sess.host.udp.collision_chunk_count_above_4096_is_malformed", "9.5", "host", HS + [
+        sendd(dg(coll(1, 0, 4097, 2), 4, seq=1)), sendd(dg(coll(1, 0, 65535, 2), 4, seq=2)), noev("collision", 300),
+        sendd(dg(coll(1, 0, 1, 1), 4, seq=3)), ev("collision", {"query": 1, "triangles": 1})],
+         note="a malformed chunk does not start an assembly: query 1 is still free")
+    case("sess.host.udp.collision_chunk_count_4096_is_accepted", "9.5", "host", HS + [
+        sendd(dg(coll(1, 4095, 4096, 1), 4, seq=1)), noev("collision", 300),
+        sendd(dg(coll(2, 0, 1, 1), 4, seq=2)), ev("collision", {"query": 2, "triangles": 1})],
+         note="4096 chunks are allowed; the incomplete query 1 is discarded when query 2 starts")
+    case("sess.host.udp.collision_of_8292_bytes_is_not_cut_to_8192", "2, 9.5", "host", HS + [
+        sendd(dg(coll(1, 0, 1, 226) + "00" * 100, 4, seq=1)), noev("collision", 400),
+        sendd(dg(coll(2, 0, 1, 226), 4, seq=2)), ev("collision", {"query": 2, "triangles": 226})],
+         note="a full 8192 byte chunk is accepted; the same with 100 more bytes is malformed, not a cut-down valid one")
+    case("sess.host.udp.pose_of_9000_bytes_is_not_cut_to_8192", "2, 9.4", "host", HS + [
+        {"op": "send_range", "template": '{"type":"spawn","entity":${i},"provider":"P","asset":"a"}\n', "from": 1000,
+         "to": 1101}, ev("spawn", None, 102),
+        sendd(dg(pose_hex(list(range(1000, 1102))) + "00" * 808, 3, seq=1)), noev("poses", 400),
+        sendd(dg(pose_hex(list(range(1000, 1102))), 3, seq=2)), ev("poses", {"count": 102})])
+    case("sess.host.udp.unknown_kind_above_8192_bytes_is_proof_of_life", "2, 7, 9.1", "host", [
+        {"op": "connect"}, send(hello(heartbeat_ms=10, timeout_ms=400)),
+        expect_line(host_reply, capture={"session": "session"}), ev("connected")] + [
+        s for _ in range(18) for s in (sendd(dg("00" * (9000 - 24), 9, seq=1)), {"op": "sleep", "ms": 100})] + [
+        noev("lost", 10), ev("lost")],
+         config={"timeout_ms": 1000, "heartbeat_ms": 100}, slow=True,
+         note="an unknown kind is ignored at any length and still proves the peer is there")
     return cases
 
 
