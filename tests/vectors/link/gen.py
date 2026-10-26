@@ -612,6 +612,13 @@ def control_cases():
     accept("ctl.input.reason_null_is_absent", "8", '{"type":"input","focus":"host","reason":null}',
            {"type": "input", "focus": "host"})
     accept("ctl.hello.guest_session_null_is_absent", "8", hello_text[:-1] + ',"session":null}', hg)
+    # --- a guest hello that carries a session: parsed as an optional u32 and ignored
+    accept("ctl.hello.guest_with_session_is_parsed_and_ignored", "8", J(**dict(hg, session=7)), dict(hg, session=7), True)
+    accept("ctl.hello.guest_with_session_u32_max", "8", J(**dict(hg, session=4294967295)), dict(hg, session=4294967295), True)
+    accept("ctl.hello.session_0_is_a_range_error_not_a_parse_error", "8", J(**dict(hh, session=0)), dict(hh, session=0), True,
+           "a host's session is valid from 1; the handshake refuses 0, not the parser")
+    for tag, v in (("negative", -1), ("string", "7"), ("above_u32", 4294967296), ("fraction", 0.5)):
+        reject("ctl.bad.hello_guest_session_" + tag, "8", J(**dict(hg, session=v)), "session is an optional u32 in any hello")
 
     # --- strings: surrogates, NUL, escapes, UTF-8
     name_line = '{"type":"spawn","entity":1,"provider":"P","asset":"a","name":"%s"}'
@@ -699,7 +706,7 @@ def control_cases():
     reject("ctl.bad.nesting_30000_levels", "8", deep(30000), "a 64 KiB line must not be able to overflow a stack")
     reject("ctl.bad.nesting_30000_levels_unclosed", "8", '{"type":"despawn","entity":1,"x":' + "[" * 30000,
            "the limit is checked before the line ends")
-    reject("ctl.bad.nesting_12000_objects", "8", deep(12000, "{", "}", "1"), "a 64 KiB line must not be able to overflow a stack")
+    reject("ctl.bad.nesting_10000_objects", "8", deep(10000, "{", "}", "1"), "at most 127 levels (the line is 50 KB, under the line limit)")
     return cases
 
 
@@ -1084,13 +1091,16 @@ def pixel_cases(outdir):
             "width": w, "height": hh_, "slots": s, "with_depth": False, "writes": []}, "expect": "create_fails",
             "why": "a sender stays within the limits every receiver enforces"})
     # =========================== revision 5 ===========================
-    # frame 0 names a slot nobody wrote (frame 0, lock 0): never delivered (9.6)
+    # frame 0 is never delivered (9.6). Slot 0 here holds "frame 0" with a complete, valid header (even lock, size 4 x 2, same
+    # size in the datagram), so nothing but the frame 0 rule can make the reader skip it. Slot 2 was never written.
     Z = Fixture()
+    Z.put(0, 0)
     Z.put(1, 1)
-    cases.append({"id": "pf.read.frame_0_names_a_slot_nobody_wrote", "section": "9.6", "basis": "MUST",
-                  "file": fixture_file("depth_one_frame_in_slot_1.bin", Z), "open": "ok", "info": info_of(Z),
-                  "reads": [skip_read(0, 0, "frame 0 is malformed; slot 0 is clean (lock 0, frame 0) and would match", camera_seq=0),
-                            skip_read(0, 2, "frame 0 is malformed; slot 2 is clean (lock 0, frame 0) and would match", camera_seq=0),
+    cases.append({"id": "pf.read.frame_0_is_skipped_though_the_slot_matches", "section": "9.6", "basis": "MUST",
+                  "file": fixture_file("depth_frame_0_in_slot_0.bin", Z), "open": "ok", "info": info_of(Z),
+                  "reads": [skip_read(0, 0, "frame 0 is malformed, though slot 0 holds frame 0 with a valid header of the same size",
+                                      camera_seq=100),
+                            skip_read(0, 2, "frame 0 is malformed; slot 2 was never written", camera_seq=0),
                             read(Z, 1)]})
     # the reader finds the slot by `slot`; it does not require slot == frame % slots (9.6, reader step 0)
     M = Fixture()
@@ -1783,6 +1793,9 @@ def sessions():
     host_accepts("nested_unknown_field_at_the_limit", hello(future=json.loads("[" * 126 + "]" * 126)),
                  "the object and 126 arrays: 127 levels")
     host_accepts("session_null_is_absent", hello().replace('"type":"hello",', '"type":"hello","session":null,'))
+    host_accepts("guest_session_7_is_ignored", hello(session=7), "a guest's hello may carry a session; it is parsed and ignored")
+    host_refuses("guest_session_negative", hello(session=-1), "session is an optional u32 in any hello")
+    host_refuses("guest_session_string", hello().replace('"type":"hello",', '"type":"hello","session":"7",'))
     guest_accepts("timeout_0", hello(role="host", session=SESSION, timeout_ms=0))
     guest_accepts("timeout_u32_max", hello(role="host", session=SESSION, timeout_ms=4294967295))
     guest_refuses("timeout_u32_max_plus_1", hello(role="host", session=SESSION, timeout_ms=4294967296))
@@ -1893,6 +1906,9 @@ def main():
         "pixelfiles.json": ("pixelfiles", pixel),
         "sessions.json": ("sessions", sessions()),
     }
+    for c in docs["control.json"][1]:
+        if "line" in c:
+            assert len(c["line"].encode("utf-8")) + 1 <= 65536, c["id"] + " is longer than a control line may be"
     ids = set()
     for name, (kind, cases) in docs.items():
         for c in cases:

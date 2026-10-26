@@ -245,8 +245,8 @@ error wherever in the line it does.
    `{"x":"\u0000","x":1}` is an error although `x` ends up as `1`.
 6. **Integers.** A field the tables below call an integer takes an integer literal: digits only, with no
    sign (not even `-0`), no fraction and no exponent. `7.0`, `7e0` and `-0` are not integers here,
-   whatever their value, and neither is a string, `true` or `null`. A value outside the field's range
-   (tables below) is an error; so is one too large for any machine integer (`1e400`, 30 digits).
+   whatever their value, and neither is a string, `true` or `null`. A value outside the field's parseable
+   range (tables below) is an error; so is one too large for any machine integer (`1e400`, 30 digits).
 7. **`null`.** For a field marked "optional", `null` means the field is absent. For any other field it
    is the wrong type and an error. An encoder omits an absent optional field rather than writing `null`.
 8. **Unknown** types and fields are ignored after all of the above has been checked: ignoring a field
@@ -260,10 +260,19 @@ error wherever in the line it does.
 | `game` | string | sender's game, e.g. a `Provider::game()` name |
 | `protocol` | integer, `0 ..= 65535` | highest supported version (in the host reply: the chosen version) |
 | `min_protocol` | integer, `0 ..= 65535` | lowest supported version |
-| `udp_port` | integer, `1 ..= 65535` | the sender's UDP port on 127.0.0.1 |
-| `heartbeat_ms` | integer, `0 ..= 4294967295`, valid only **10 to 10000** | how often the sender sends `Heartbeat` |
-| `timeout_ms` | integer, `0 ..= 4294967295` | the sender's own watchdog timeout |
-| `session` | integer, `1 ..= 4294967295`, host only | session number (a guest's `hello` does not carry one; `null` counts as absent) |
+| `udp_port` | integer, parses as `0 ..= 65535`, valid only **1 ..= 65535** | the sender's UDP port on 127.0.0.1 |
+| `heartbeat_ms` | integer, parses as `0 ..= 4294967295`, valid only **10 ..= 10000** | how often the sender sends `Heartbeat` |
+| `timeout_ms` | integer, `0 ..= 4294967295` (parses and valid) | the sender's own watchdog timeout |
+| `session` | integer, parses as `0 ..= 4294967295`; valid only **1 ..= 4294967295** from a host | session number; a guest's `hello` does not need one (see below) |
+
+Each integer has two ranges. The **parseable** range is the type (`u16` or `u32`): a value outside it
+is a protocol error found when the line is read. The **valid** range is what the handshake accepts: a
+value inside the type but outside it is a handshake error. Both end in a `bye`; the vectors tell them
+apart (`ctl.*` shows what parses, `sess.*` what the handshake accepts).
+
+A guest's `hello` may carry a `session`. A receiver parses it like the host's, as an optional
+`u32` (`null` is absent, `-1` or a string is a protocol error), and ignores it: the session number is
+the host's to choose.
 
 The two version fields are `u16`, like the `version` of the datagram header they end up in: `65536`
 is out of range, not a version nobody supports (as a `u32` it would make a `hello` with `protocol`
@@ -368,7 +377,7 @@ connection (section 6.1). The host also answers a connection it cannot take with
 
 A `bye` without `reason`, or with `"reason": null`, is valid and means the empty reason. A `reason` of
 another type (a number, `true`, an array, an object) is a protocol error like any wrong-typed optional
-field, and gets a `bye` in answer. A `bye` ends the session whatever else it says.
+field, and gets a `bye` in answer. A `bye` ends the session; extra fields do not matter.
 
 **The text of a reason is not part of the protocol.** Only `"busy"` is fixed: the host's refusal of a
 second guest (section 2). A receiver must not branch on any other text (it may show it); a sender that
@@ -394,8 +403,8 @@ payload, or whose length does not match the counts it contains, is malformed and
 | 16 | 8 | u64 | `time_us` | send time, section 5 |
 
 A datagram of an unknown `kind` is ignored (it is not an error that ends the session), but it still
-counts as proof of life for the watchdog when magic, version and session are right, whatever its
-length. The values of the fields of a known
+counts as proof of life for the watchdog when magic, version and session are right and it is at least
+24 bytes long (the header). The values of the fields of a known
 kind are not checked beyond what each section below names: a decoder tells a datagram that is
 malformed in its layout (length, counts, `depth_range`, indices) from one that is merely strange,
 and delivers the strange one as sent.
@@ -496,22 +505,22 @@ collision set only once every chunk of a newer query has arrived.
 **Size limit (revision 5).** A query has at most **4096 chunks** (`MAX_COLLISION_CHUNKS`), that is at
 most `4096 * 226 = 925696` triangles, 32 MiB in the 36 byte form of the wire. A `chunk_count` above 4096
 makes the datagram malformed, and a decoder drops it. Before, `chunk_count` could be 65535, and a
-sender or a hostile peer could make a receiver hold 533 MB of triangles for one snapshot (three of
-the four implementations did; the C one capped the sum at 2097152 triangles on its own). The limit is
+sender or a hostile peer could make a receiver hold 533 MB of triangles for one snapshot (the Rust and
+Java implementations did; the C and C# ones capped the sum at 2097152 triangles on their own). The limit is
 generous for what the link is for: a snapshot of the geometry around a player is some thousands to
 some hundred thousand triangles, and it takes 128 ticks of pacing (below) to send 4096 chunks. A sender
 whose snapshot needs more chunks does not send it; it keeps the triangles nearest to `center` and
-sends those. A receiver may refuse more than this (a smaller limit of its own), never less.
+sends those. A receiver may impose a smaller limit of its own, never a larger one.
 
 **Assembly.** A receiver keeps the number of the newest query it has completed and at most one query
 being assembled. For a chunk (that passed the checks above and in section 9):
 
 1. If it has completed a query and the chunk's `query` is not newer (serial arithmetic), the chunk is
    stale and dropped. A chunk of a query that was just completed is stale for the same reason.
-2. If a query is being assembled and it is the chunk's: when the chunk's `chunk_count` differs from the
-   one the assembly was started with, the chunk is malformed and dropped, and the assembly goes on
-   (it is not discarded, and the chunk does not start a new one). When the assembly's query is newer
-   than the chunk's, the chunk is stale and dropped.
+2. If the query being assembled is the chunk's and the chunk's `chunk_count` differs from the one the
+   assembly was started with, the chunk is malformed and dropped, and the assembly goes on (it is not
+   discarded, and the chunk does not start a new one).
+   If the query being assembled is newer than the chunk's, the chunk is stale and dropped.
 3. Otherwise the chunk starts a new assembly, which discards the incomplete older one. The assembly
    takes `query`, `chunk_count`, `center` and `radius` **from this chunk, the first one that arrived**
    (not necessarily index 0). Later chunks of the query that differ in `center` or `radius` are not
@@ -629,7 +638,8 @@ Writer:
 4. Send the `Frame` datagram.
 
 Reader, on a `Frame` datagram:
-0. If `slot` is not below the file's `slots`, skip this frame. (The reader finds the slot by `slot`
+0. If `frame` is 0 (a datagram never carries it, section 9.6, but a caller can hand a reader one, and an
+   unwritten or odd slot may hold frame 0) or `slot` is not below the file's `slots`, skip this frame. (The reader finds the slot by `slot`
    and does not require `slot == frame % slots`; a writer produces that, and step 3 is what ties the
    slot to the frame.)
 1. `l1 = lock` (acquire). If `l1` is odd, skip this frame.
@@ -1014,23 +1024,30 @@ control lines, send `Heartbeat` when `heartbeat_ms` has passed, and check the wa
   - **Collision (section 9.5).** `chunk_count` is at most **4096** (925696 triangles, 32 MiB); the assembly
     rules (first chunk decides `chunk_count`, `center` and `radius`; a chunk with another `chunk_count` is
     dropped; the first copy of a chunk wins) are written out.
-  - **Pixel file (section 9.6).** The reader's steps now say: slot below `slots`, the slot header's size 1 to the
+  - **Pixel file (section 9.6).** The reader's steps now say: frame not 0, slot below `slots`, the slot header's size 1 to the
     file's and equal to the datagram's, then the seqlock; `slot == frame % slots` is not required. The header
     checks (`magic`, `version`, `format`, `slot_size`) and the constructor limits are stated as MUST, reserved
     bytes are ignored, and a writer refuses a frame of size 0 or above the file's, or a buffer of the wrong
     length, and changes nothing.
 
-  Why the protocol version stays 1: every datagram and every control line that a correct revision 4
-  implementation sends is still valid and means the same. Three new rules refuse something a revision 4
-  receiver let through, and a correct sender never produced any of them: a `\u0000` escape in a string (the C
-  implementation could not hold it, and the others could only hand it on to code that could not either), a
-  `chunk_count` above 4096 (sending that many chunks takes over two seconds of pacing at 60 ticks per
-  second, and the C implementation already dropped what exceeded 2097152 triangles), and a `Frame` datagram
-  whose size differs from the slot header's, or whose slot header has a size of 0 (every writer writes the
-  same size in both places). A peer that depended on the old leniency has to
-  write U+FFFD (or nothing) in place of NUL, keep a snapshot under 925696 triangles, and announce the size it
-  wrote. link-java, link-c and link-cs add an overload that takes the whole `Frame` datagram for the reader
-  (the old call stays, and does not know the datagram's size).
+  Why the protocol version stays 1: no datagram and no control line that a known sender writes becomes
+  invalid, and none changes meaning. Three new rules do refuse something that the revision 4 text allowed
+  and that a receiver let through, so this is a judgment about senders and not a proof:
+  - a `\u0000` escape in a string. Revision 4 allowed it. The C implementation could not hold it (it cut the
+    string at the NUL), and the others could only hand it on to code that could not either; no known sender
+    writes one, and the new libraries write U+FFFD in its place.
+  - a collision `chunk_count` above 4096. Revision 4 allowed up to 65535. No known sender comes near it
+    (sending 4096 chunks takes over two seconds of pacing at 60 ticks per second, and the C and C#
+    implementations already dropped what exceeded 2097152 triangles).
+  - a `Frame` datagram whose size differs from the slot header's, or whose slot header has a size of 0.
+    Revision 4 never said a slot header may not have size 0 (its table only says "pixels used, `<=` file
+    width"). Every known writer writes the same size in both places and at least 1 x 1.
+
+  A peer that depended on the old leniency has to write U+FFFD (or nothing) in place of NUL, keep a
+  snapshot under 925696 triangles, and announce the size it wrote. link-java, link-c and link-cs add a
+  call that takes the whole `Frame` datagram for the reader. The old size-less call (`read(frame, slot,
+  wantDepth)` and its C and C# counterparts) is kept so that existing programs still build; **it does not
+  implement reader step 2 above and is not conformant**: new code uses the other.
 
 A change that alters any layout or meaning above needs a new protocol version. Adding a control
 message type or field, or a new datagram `kind`, does not, because receivers ignore what they do

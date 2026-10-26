@@ -1,7 +1,8 @@
 # What the contract did not say, and where revision 5 says it
 
-Revision 4 of `docs/CONTRACT.md` was silent or ambiguous in 26 places. Revision 5 settles every one of them, and
-the vectors in this directory now cover all but two (gap 12, a "may", and gap 22, which no static file can show).
+Revision 4 of `docs/CONTRACT.md` was silent or ambiguous in 26 places, and a review of revision 5 found a 27th. Revision 5
+settles every one of them, and the vectors in this directory now cover all but three (gap 12, a "may"; gap 22, which no
+static file can show; and the one case of gap 23 described there).
 
 How each rule was chosen. For every gap the four implementations (Rust `R`, link-java `J`, link-c `C`, link-cs `S`)
 were measured with probe vectors that ask the question in both directions (the probes are not part of this
@@ -71,8 +72,10 @@ Vector ids below are prefixes; `ctl.*` is `control.json`, `dg.*` is `datagrams.j
 ## Datagrams
 
 13. **`Frame` with `frame` 0.** Before: all four refused it at decode. Rule (a), section 9.6: malformed, because an
-    unwritten slot holds frame 0 and a clean lock and would otherwise match. Vectors `dg.bad.frame_0`,
-    `pf.read.frame_0_names_a_slot_nobody_wrote`.
+    unwritten slot holds frame 0 and a clean lock and would otherwise match. The decoder drops it, and (found by the
+    review of revision 5, which isolated the rule in a slot that holds frame 0 with a valid header) the reader skips it too
+    when a caller hands it one directly: all four readers delivered such a frame until then. Section 9.6 reader step 0.
+    Vectors `dg.bad.frame_0`, `pf.read.frame_0_is_skipped_though_the_slot_matches`.
 14. **`Camera` values.** Before: all four decoded and delivered every probe: `near` 0, negative, NaN or infinite, `far`
     below or equal to `near`, NaN or infinite matrix elements, `fov_y` NaN, a viewport of 0 or 4294967295. Rule (a),
     section 9.3 "Values": the decoder checks only `depth_range`; the sender must write sane numbers; a receiver
@@ -86,10 +89,14 @@ Vector ids below are prefixes; `ctl.*` is `control.json`, `dg.*` is `datagrams.j
     the first chunk to arrive (`center`, `radius`, `chunk_count`), dropped a chunk with another `chunk_count` without
     discarding the assembly, ignored the repeat of a chunk (the first copy wins and a repeat cannot complete a
     query), and did not compare the `center` or `radius` of later chunks. Rule (a), section 9.5 "Assembly", now
-    spelled out. **Size:** R, J and S let `chunk_count` go to 65535, that is up to 533 MB of triangles for one query;
-    C capped the sum at 2097152 triangles with a receiver option. New rule: `chunk_count` is at most 4096
+    spelled out. **Size:** R and J let `chunk_count` go to 65535, that is up to 533 MB of triangles for one query; C and
+    S capped the sum at 2097152 triangles with a receiver option (`max_collision_triangles`, `MaxCollisionTriangles`;
+    about 75 MiB). New rule: `chunk_count` is at most 4096
     (`MAX_COLLISION_CHUNKS`), 925696 triangles, 32 MiB; larger is a malformed datagram, and a sender refuses a bigger
     snapshot. Vectors `sess.host.udp.collision_*`, `dg.collision.chunk_count_4096_*`, `dg.bad.collision_chunk_count_*`.
+    The limit bounds the wire form (32 MiB); a receiver holds more than that while it assembles and delivers a full
+    snapshot, about twice as much on the JVM (the chunk lists, then the list handed to the application), so a
+    receiver short of memory may set a smaller limit of its own.
 17. **A `Frame` whose `slot` is not `frame % slots`, or whose size differs from the slot header.** Before: all four
     delivered a frame found by `slot` whatever `frame % slots` says (the slot header's frame number is the check). The
     datagram's width and height: R compared them with the slot header and skipped a mismatch, J, C and S ignored them
@@ -117,11 +124,20 @@ Vector ids below are prefixes; `ctl.*` is `control.json`, `dg.*` is `datagrams.j
     changed nothing; R refused all of these except a width or height of 0 (it wrote a 0 x N frame). For a call that
     supplies **no** depth to a file that has a plane, R refused and J, C and S filled the plane with `+inf`. Rule: the
     first group is (a) with R fixed; the last is left to the library, section 9.6 (what matters, that the slot never
-    keeps older depth, holds either way). Vectors `pw.*_refused_writes_change_nothing`.
+    keeps older depth, holds either way). **That last case has no vector**: the two outcomes (an error, or a file with
+    `+inf`) cannot both be what a vector requires, and picking one would break the callers of the other group (J, C and S
+    callers pass null/NULL for "nothing here"; R callers cannot). Vectors `pw.*_refused_writes_change_nothing`.
 24. **Creating a writer outside the limits.** Before: all four refused (vectors existed, as `table`). Rule (a), section
     9.6. Vectors `pw.refuses_*`.
 25. **Non-zero `reserved` bytes** (file header 56 to 63, slot header 36 to 63). Before: all four ignored them. Rule (a),
     section 9.6 "Header checks". Vectors `pf.read.*reserved*`.
+
+## Found while reviewing revision 5
+
+27. **A guest `hello` that carries `session`.** Section 8 said the field is "host only" and nothing on what a receiver
+    does when a guest sends one. Before: R, J, C and S all parsed it as an optional `u32` and ignored it (`null` is
+    absent; `-1` or a string is a protocol error). Rule (a), section 8 (`hello`). Vectors `ctl.hello.guest_with_session_*`,
+    `ctl.bad.hello_guest_session_*`, `sess.host.handshake.guest_session_*`.
 
 ## Sessions
 

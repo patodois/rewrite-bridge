@@ -56,7 +56,8 @@ pub const FRAME_LEN: usize = 24;
 /// triangles, 32 MiB (contract section 9.5). A decoder drops a chunk that claims more.
 pub const MAX_COLLISION_CHUNKS: u16 = 4096;
 /// Deepest nesting of arrays and objects in a control line, the line's own object counting as the
-/// first level (contract section 8, "Syntax of a line"); `serde_json` stops at the same depth.
+/// first level (contract section 8, "Syntax of a line"). `Control::parse` enforces it on the text,
+/// before serde_json sees the line (whose own recursion limit happens to be the same).
 pub const MAX_JSON_NESTING: usize = 127;
 /// Longest control line, newline included.
 pub const MAX_LINE: usize = 65536;
@@ -883,9 +884,7 @@ impl Control {
         // serde_json keeps only the last of a duplicate key, so a NUL in an overridden value would
         // never reach the tree below: look at the text. (Everything else the contract's "Syntax of
         // a line" asks for, serde_json checks itself: surrogates, nesting, number syntax.)
-        if has_nul_escape(line) {
-            return Err(bad("U+0000 in a string"));
-        }
+        check_line_text(line).map_err(bad)?;
         let v: Value =
             serde_json::from_str(line).map_err(|e| WireError::BadControl(e.to_string()))?;
         let o = v.as_object().ok_or_else(|| bad("not an object"))?;
@@ -938,26 +937,35 @@ fn clean(s: &str) -> String {
     s.replace('\0', "\u{fffd}")
 }
 
-/// True when a string of the JSON text holds a `\u0000` escape (section 8, "Syntax of a line", 4):
-/// scans the text the way a lexer would, so that `"\\u0000"` (a backslash and the characters
-/// `u0000`) is not mistaken for one. Invalid JSON gives whatever; the parser refuses it anyway.
-fn has_nul_escape(line: &str) -> bool {
+/// The two rules of a control line that serde_json cannot enforce for us (section 8, "Syntax of a
+/// line", 3 and 4), checked on the text before it is parsed: arrays and objects nest at most
+/// [`MAX_JSON_NESTING`] deep, and no string holds a `\u0000` escape. It scans the way a lexer would, so
+/// that `"\\u0000"` (a backslash and the characters `u0000`) is not mistaken for an escape and a bracket
+/// inside a string does not count. Invalid JSON gives whatever; the parser refuses it afterwards.
+fn check_line_text(line: &str) -> Result<(), &'static str> {
     let b = line.as_bytes();
-    let (mut i, mut in_string) = (0, false);
+    let (mut i, mut in_string, mut depth) = (0, false, 0usize);
     while i < b.len() {
         match b[i] {
             b'"' => in_string = !in_string,
             b'\\' if in_string => {
                 if b.get(i + 1) == Some(&b'u') && b.get(i + 2..i + 6) == Some(b"0000") {
-                    return true;
+                    return Err("U+0000 in a string");
                 }
                 i += 1; // the escaped character is not a quote or a backslash that counts
             }
+            b'{' | b'[' if !in_string => {
+                depth += 1;
+                if depth > MAX_JSON_NESTING {
+                    return Err("nested too deeply");
+                }
+            }
+            b'}' | b']' if !in_string => depth = depth.saturating_sub(1),
             _ => {}
         }
         i += 1;
     }
-    false
+    Ok(())
 }
 
 struct Fields<'a>(&'a Map<String, Value>);
@@ -2619,7 +2627,8 @@ impl FrameReader {
         rgba: &mut Vec<u8>,
         depth: Option<&mut Vec<f32>>,
     ) -> Result<FrameData, FrameMiss> {
-        if ready.slot >= self.slots
+        if ready.frame == 0
+            || ready.slot >= self.slots
             || ready.width == 0
             || ready.height == 0
             || ready.width > self.width
@@ -3741,6 +3750,31 @@ mod tests {
         ] {
             assert!(Control::parse(line).is_ok(), "{line}");
         }
+    }
+
+    #[test]
+    fn nesting_is_limited_to_127_levels_by_this_crate_not_by_serde_json() {
+        let line = |n: usize, closed: bool| {
+            format!(
+                r#"{{"type":"despawn","entity":1,"x":{}{}}}"#,
+                "[".repeat(n),
+                if closed { "]".repeat(n) } else { String::new() }
+            )
+        };
+        assert!(Control::parse(&line(126, true)).is_ok());
+        assert!(Control::parse(&line(127, true)).is_err());
+        // an unclosed line is refused by the text scan at the limit, not after a deep recursion
+        assert_eq!(
+            check_line_text(&line(MAX_JSON_NESTING, false)),
+            Err("nested too deeply")
+        );
+        assert!(check_line_text(&line(MAX_JSON_NESTING - 1, false)).is_ok());
+        // brackets inside strings do not count
+        let in_string = format!(r#"{{"type":"bye","reason":"{}"}}"#, "[".repeat(500));
+        assert!(Control::parse(&in_string).is_ok());
+        // nor do escaped quotes end the string early
+        let escaped = format!(r#"{{"type":"bye","reason":"\"{}"}}"#, "[".repeat(500));
+        assert!(Control::parse(&escaped).is_ok());
     }
 
     #[test]
