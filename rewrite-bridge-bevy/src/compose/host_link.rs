@@ -279,6 +279,18 @@ mod tests {
         }
     }
 
+    /// Waits until both ends have finished the handshake. The host can count the guest as connected
+    /// before the guest has read the host's `hello`, and a guest that sends then gets `NotConnected`.
+    fn connect(app: &mut App, guest: &mut Link) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !(stats(app).connected && guest.is_connected()) {
+            assert!(Instant::now() < deadline, "timed out: {:?}", stats(app));
+            app.update();
+            guest.poll();
+            sleep(Duration::from_millis(2));
+        }
+    }
+
     /// Lets everything in flight arrive.
     fn settle(app: &mut App, guests: &mut [&mut Link]) {
         for _ in 0..40 {
@@ -308,7 +320,7 @@ mod tests {
         // no GuestComposePlugin: the plugin made the resource itself
         assert!(app.world().get_resource::<GuestFrames>().is_some());
         let mut guest = guest_link(port);
-        pump(&mut app, &mut [&mut guest], |a| stats(a).connected);
+        connect(&mut app, &mut guest);
 
         // A channel whose path is not an absolute regular file is refused, and frames announced for it
         // are ignored
@@ -401,7 +413,7 @@ mod tests {
 
         // A new guest, a new pixel file, numbering from 1: shown
         let mut guest = guest_link(port);
-        pump(&mut app, &mut [&mut guest], |a| stats(a).connected);
+        connect(&mut app, &mut guest);
         let mut w3 = writer("hl-three");
         guest.announce_frames(w3.channel()).unwrap();
         let ready = write(&mut w3, 40);
@@ -415,7 +427,7 @@ mod tests {
     fn frame_buffers_are_reused_instead_of_allocated_every_frame() {
         let (mut app, port) = host_app();
         let mut guest = guest_link(port);
-        pump(&mut app, &mut [&mut guest], |a| stats(a).connected);
+        connect(&mut app, &mut guest);
         let mut w = writer("hl-reuse");
         guest.announce_frames(w.channel()).unwrap();
         let mut seen = std::collections::HashSet::new();
