@@ -5,7 +5,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -47,7 +47,7 @@ impl Drop for Dir {
 }
 
 #[cfg(unix)]
-fn mode_of(p: &Path) -> u32 {
+fn mode_of(p: &std::path::Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     fs::metadata(p).unwrap().permissions().mode() & 0o777
 }
