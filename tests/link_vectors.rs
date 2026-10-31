@@ -1,5 +1,6 @@
 //! Runs the shared link test vectors (`tests/vectors/link`, see the README there) against this
-//! implementation: control lines, datagrams, pixel files and scripted sessions over real sockets.
+//! implementation: control lines, datagrams, pixel files, scripted sessions over real sockets and
+//! endpoint files.
 //!
 //! The vectors are derived from `docs/CONTRACT.md` alone and are the same files `link-java`, `link-c` and
 //! `link-cs` run, so a vector this file fails is a place where this implementation and the contract (or
@@ -254,6 +255,7 @@ fn control_from(m: &Value) -> Control {
             heartbeat_ms: ju32(&m["heartbeat_ms"]),
             timeout_ms: ju32(&m["timeout_ms"]),
             session: m.get("session").map(ju32),
+            token: opt_str("token"),
         }),
         "spawn" => Control::Spawn(Spawn {
             entity: ju32(&m["entity"]),
@@ -949,6 +951,7 @@ impl Session {
             heartbeat: ms("heartbeat_ms", 250),
             timeout: ms("timeout_ms", 2000),
             reconnect: ms("reconnect_ms", 200),
+            token: cfgj.get("token").and_then(Value::as_str).map(str::to_owned),
             ..LinkConfig::new("vector ut")
         };
         let ut = if host {
@@ -1480,4 +1483,89 @@ fn session_vectors() {
         r.record(&c, res);
     }
     r.finish("sessions.json");
+}
+
+// ---------------------------------------------------------------------------------------------
+// endpoints.json (revision 6)
+
+/// The token of the revision 6 vectors; no error text may quote it.
+const VECTOR_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn check_endpoint(c: &Value) -> Result<(), String> {
+    let t = Temp::new("endpoint");
+    let path = match c["path_kind"].as_str() {
+        None => {
+            let p = t.path("endpoint.json");
+            let data = match (c["text"].as_str(), c["text_hex"].as_str()) {
+                (Some(text), _) => text.as_bytes().to_vec(),
+                (None, Some(h)) => hex_decode(h),
+                _ => panic!("no text"),
+            };
+            fs::write(&p, data).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = u32::from_str_radix(c["mode"].as_str().unwrap_or("0600"), 8).unwrap();
+                fs::set_permissions(&p, fs::Permissions::from_mode(mode)).unwrap();
+            }
+            p
+        }
+        Some("missing") => t.path("missing.json"),
+        Some("directory") => {
+            let p = t.path("dir.json");
+            fs::create_dir(&p).unwrap();
+            p
+        }
+        #[cfg(unix)]
+        Some("fifo") => {
+            let p = t.path("fifo.json");
+            let c_path = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+            // SAFETY: a valid NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
+            p
+        }
+        Some(other) => panic!("path_kind {other}"),
+    };
+    let got = Endpoint::read(&path);
+    match (c["expect"].as_str().unwrap(), got) {
+        ("ok", Ok(e)) => {
+            if u32::from(e.control_port) != ju32(&c["control_port"])
+                || e.token != c["token"].as_str().unwrap()
+            {
+                return Err(format!(
+                    "read port {} and another token than the case's",
+                    e.control_port
+                ));
+            }
+            Ok(())
+        }
+        ("ok", Err(e)) => Err(format!("refused: {e}")),
+        ("refused", Ok(e)) => Err(format!("accepted, port {}", e.control_port)),
+        ("refused", Err(e)) => {
+            if e.to_string().contains(VECTOR_TOKEN) {
+                return Err("the error quotes the token".into());
+            }
+            Ok(())
+        }
+        (other, _) => panic!("expect {other}"),
+    }
+}
+
+#[test]
+fn endpoint_vectors() {
+    let mut r = Report::default();
+    for c in load("endpoints.json") {
+        if cfg!(windows)
+            && c["skip_on"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|p| p == "windows"))
+        {
+            r.skipped
+                .push(format!("{} (not on Windows)", c["id"].as_str().unwrap()));
+            continue;
+        }
+        let res = check_endpoint(&c);
+        r.record(&c, res);
+    }
+    r.finish("endpoints.json");
 }

@@ -1,6 +1,6 @@
 # Passthrough link contract, protocol v1
 
-This is revision 5 of the contract for protocol v1 (section 12 lists what each revision changed). This
+This is revision 6 of the contract for protocol v1 (section 12 lists what each revision changed). This
 document is the whole protocol. A host plugin written in C, C++, C# or anything else should be
 able to implement it from this page alone; the Rust implementation in `src/link.rs` (cargo feature
 `link`) is one implementation of it, not the definition.
@@ -41,6 +41,10 @@ Messages a side does not use may simply be ignored by the receiver.
 - **Control, TCP.** The host listens on the control port (default **47800**, configurable). The
   guest connects to it. One guest per host: while a guest is connected, the host answers any other
   connection with `bye` (`"reason": "busy"`) and closes it.
+- **Authentication (revision 6, optional).** Any local process can connect to a port on
+  `127.0.0.1`. A host that wants only the guest of its own user's choosing configures a token,
+  hands it to the guest through an owner-only endpoint file, and refuses a `hello` without it
+  (section 6.2). Without a token the link works as in revision 5.
 - **State, UDP.** Each side binds its own UDP socket on `127.0.0.1` (port configurable; `0` means
   any free port) and announces the port in its `hello`. A side sends datagrams to
   `127.0.0.1:<peer udp_port>` and accepts datagrams only from that exact address. Anything else is
@@ -110,7 +114,10 @@ native space at the boundary, on send and on receive; the wire is always in this
    {"type":"hello","role":"guest","game":"Warframe rewrite","protocol":1,"min_protocol":1,
     "udp_port":53001,"heartbeat_ms":250,"timeout_ms":2000}
    ```
+   A guest that has a token for this host adds it as `"token":"..."` (section 6.2).
 3. The host checks it:
+   - if the host has a token (section 6.2), the `token` must match it; this check comes first, and a
+     `hello` that fails it gets `{"type":"bye","reason":"unauthorized"}`;
    - `role` must be `"guest"`;
    - the version ranges must overlap: the session version is
      `v = min(host.protocol, guest.protocol)`, and it is valid only if
@@ -179,6 +186,111 @@ non-blocking, on each tick until it is done.
 
 Future versions keep the datagram header's first 8 bytes (magic, version, kind, flags) and the
 `hello` fields above, so two implementations can always negotiate.
+
+### 6.2 Authentication: the token and the endpoint file (revision 6)
+
+Authentication is optional and decided by the host alone. A host that has no token accepts any guest,
+exactly as before revision 6; a guest that has no token sends none.
+
+**The token.** A token is a string of **1 to 256 bytes** in UTF-8.
+
+1. A host may be configured with a token. A guest that has been given the host's token sends it in its
+   `hello` as the string field `token` (section 8). Only a guest's `hello` carries one: a host never
+   puts `token` in its own `hello`.
+2. A host with a token checks it as soon as the guest's `hello` has been parsed, **before any other
+   check of section 6**: the `hello` must carry a `token` of 1 to 256 bytes that is equal, byte for
+   byte in UTF-8, to the host's. If the field is absent (or `null`), outside that length, or not equal,
+   the host sends `{"type":"bye","reason":"unauthorized"}` and closes as in section 6.1. This is a
+   handshake error. A peer that did not show the token learns only that word, not which check failed
+   nor anything else about the host (its version range, for instance, which a later check would name).
+3. A host without a token **ignores** `token`: it parses the field like any other (a `token` that is not
+   a string is a protocol error, section 8) and does not look at its value or its length.
+4. A guest parses a `token` in a host's `hello` the same way and ignores it.
+5. The token is a secret. A host never echoes it, logs it, or puts it, or any part of the token a guest
+   sent, into a `bye` reason, an error, an event or a log line; neither does a guest. The fixed reason
+   `unauthorized` is the whole answer.
+6. **Comparison in constant time.** The time the comparison takes must not depend on the contents of
+   either token, nor on where they first differ. The reference method: copy each token into a buffer of
+   256 zero bytes, OR together the XOR of all 256 byte pairs, OR in the XOR of the two lengths, and call
+   the tokens equal only if the result is 0. There is no early exit, and a length mismatch does the same
+   work as a match. (The length itself is not secret: a generated token always has 64 bytes.)
+7. **Generating.** A host that makes its own token takes **32 bytes from the operating system's
+   cryptographic random number generator** (`getrandom`, `getentropy` or `arc4random_buf`, or
+   `/dev/urandom`, on Unix; `BCryptGenRandom` on Windows; `SecureRandom` in Java;
+   `RandomNumberGenerator` in .NET) and writes them as **64 lowercase hex digits**. It makes a new one
+   each time it starts. Receivers do not check the format: any string of 1 to 256 bytes is a token, so a
+   host may also be given one by a launcher.
+
+**The endpoint file.** A host hands the port and the token to the guest through a file that only the
+user who runs both can read. (The idea follows the endpoint file that Horizon writes for its control
+socket; the format here is this contract's own.) The file holds one JSON object:
+
+```json
+{"control_port":47800,"token":"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `control_port` | integer, valid only **1 ..= 65535** | the port the host is listening on, the one it actually bound (with port 0 configured, the port the OS gave it) |
+| `token` | string, **1 ..= 256 bytes** | the host's token |
+
+The text follows the rules of a control line (section 8, "Syntax of a line"), is at most 4096 bytes
+and may end in a newline. Unknown fields are ignored, so a later revision can add some. A reader
+refuses a file that breaks any of this.
+
+- **Writing (host).** The host writes the file **only after it has bound its control port**, and with
+  the port it bound. It writes atomically: it creates a temporary file in the same directory,
+  exclusively and with owner-only permissions from the moment it exists (Unix:
+  `open(O_CREAT | O_EXCL | O_WRONLY, 0600)`, never a `chmod` after the data is in), writes and closes
+  it, then renames it over the path (Windows: `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`). A reader
+  therefore finds no file, the previous one, or the complete new one, never a partial one. On Windows
+  there are no mode bits to set: the file goes under the user's local application data (below), and the
+  per-user ACL of that directory is what keeps other users out. The host removes the file when it shuts
+  down cleanly. A host that crashes leaves it behind; its token dies with it, since the next run makes a
+  new one.
+- **Reading (guest).** The guest reads the file and takes `control_port` and `token` from it. It refuses
+  a path that does not name a regular file (symbolic links followed), and checks that before it opens the
+  path, since opening a FIFO for reading would block. On Unix it also refuses a file whose permissions
+  grant anything to the group or to others (`mode & 077` not 0): such a file can have been written by
+  someone else. Its errors do not quote the file's contents. A file that does not
+  exist means that the host is not running (yet): the guest tries again later. A guest that is answered
+  `unauthorized`, or cannot connect, reads the file again before it retries, since the host may have
+  restarted with a new port and token.
+- **Where.** The path is the application's choice; host and guest only have to agree on it. The
+  recommended places, with `<name>` a name both sides know (the host's game, for instance):
+  - Linux and other Unix: `$XDG_RUNTIME_DIR/rewrite-link/<name>.json` (that directory belongs to the
+    user, has mode 0700 and is emptied at logout); without `XDG_RUNTIME_DIR`,
+    `$HOME/.cache/rewrite-link/<name>.json`;
+  - macOS: `$HOME/Library/Application Support/rewrite-link/<name>.json`;
+  - Windows: `%LOCALAPPDATA%\rewrite-link\<name>.json`.
+
+  An application that creates the `rewrite-link` directory creates it with mode 0700 on Unix.
+
+**What the token protects, and what it does not.**
+
+- It keeps out **other users** of the machine, and **any process that cannot read the endpoint file**: a
+  sandboxed program, a service running under another account, anything that can open a TCP connection
+  to `127.0.0.1` but cannot read the user's files.
+- It defeats a process that **squats the control port** before the host starts. The host's bind then
+  fails, so the host writes no file, and a guest that reads the file never hands the token to the
+  squatter. (A host that wrote the file before binding would send the guest to whoever holds the port,
+  token included.) A file left by a crashed host can still lead a guest to a process that took the port
+  since; what that process receives is the dead host's token, which opens nothing.
+- It does **not** protect against processes running **as the same user**: they can read the file, and
+  they can read the memory of the host and the guest anyway. Nor against an administrator or root.
+- It authenticates the guest to the host, not the host to the guest: a guest that reads the file trusts
+  that the process listening on the port named there is the host, which holds for a file the host wrote
+  after binding and that only the user can write.
+- It does not hide that a host is there. Anyone can still connect and get `busy` while a session is on,
+  or `unauthorized`.
+- It does not encrypt or sign anything. The control connection and the datagrams travel in clear on
+  loopback, as before; what the token decides is who may start a session.
+
+**UDP is unchanged.** Each side accepts datagrams only from the address the peer announced in its
+`hello` and only with the session from the host's `hello` (section 2, section 6). With a token those two
+announcements arrive over a control connection that has been authenticated, and that is what binds the
+UDP traffic to the authenticated peer: another process would have to send from the guest's own UDP port,
+which the guest holds, and know the session number.
 
 ## 7. Watchdog, heartbeat and late or lost data
 
@@ -264,6 +376,7 @@ error wherever in the line it does.
 | `heartbeat_ms` | integer, parses as `0 ..= 4294967295`, valid only **10 ..= 10000** | how often the sender sends `Heartbeat` |
 | `timeout_ms` | integer, `0 ..= 4294967295` (parses and valid) | the sender's own watchdog timeout |
 | `session` | integer, parses as `0 ..= 4294967295`; valid only **1 ..= 4294967295** from a host | session number; a guest's `hello` does not need one (see below) |
+| `token` | string, optional; parses as any string, valid only **1 ..= 256 bytes** (UTF-8) | revision 6: the host's token, sent by a guest (section 6.2); a host's `hello` never has one |
 
 Each integer has two ranges. The **parseable** range is the type (`u16` or `u32`): a value outside it
 is a protocol error found when the line is read. The **valid** range is what the handshake accepts: a
@@ -273,6 +386,12 @@ apart (`ctl.*` shows what parses, `sess.*` what the handshake accepts).
 A guest's `hello` may carry a `session`. A receiver parses it like the host's, as an optional
 `u32` (`null` is absent, `-1` or a string is a protocol error), and ignores it: the session number is
 the host's to choose.
+
+`token` follows the same two-range rule, with lengths in bytes instead of values. Any string parses
+(`null` is absent; a number, `true`, an array or an object is a protocol error). The valid range,
+1 to 256 bytes of UTF-8, is checked by a host that has a token, and only there: a `token` outside it,
+like a missing or unequal one, is a handshake error answered with `unauthorized` (section 6.2). A host
+without a token, and a guest, ignore the value whatever its length.
 
 The two version fields are `u16`, like the `version` of the datagram header they end up in: `65536`
 is out of range, not a version nobody supports (as a `u32` it would make a `hello` with `protocol`
@@ -379,8 +498,10 @@ A `bye` without `reason`, or with `"reason": null`, is valid and means the empty
 another type (a number, `true`, an array, an object) is a protocol error like any wrong-typed optional
 field, and gets a `bye` in answer. A `bye` ends the session; extra fields do not matter.
 
-**The text of a reason is not part of the protocol.** Only `"busy"` is fixed: the host's refusal of a
-second guest (section 2). A receiver must not branch on any other text (it may show it); a sender that
+**The text of a reason is not part of the protocol.** Two reasons are fixed: `"busy"`, the host's refusal
+of a second guest (section 2), and, from revision 6, `"unauthorized"`, the host's refusal of a `hello`
+without the right token (section 6.2). A guest may act on these two (after `unauthorized`, read the
+endpoint file again). A receiver must not branch on any other text (it may show it); a sender that
 refuses a handshake or ends a session on a protocol error says why in a sentence of its own, and
 keeps it short (it must fit the 65536 byte line).
 
@@ -1048,6 +1169,28 @@ control lines, send `Heartbeat` when `heartbeat_ms` has passed, and check the wa
   call that takes the whole `Frame` datagram for the reader. The old size-less call (`read(frame, slot,
   wantDepth)` and its C and C# counterparts) is kept so that existing programs still build; **it does not
   implement reader step 2 above and is not conformant**: new code uses the other.
+
+- v1, revision 6: an optional authentication token (section 6.2). What changed:
+  - **`hello` (section 8).** A new optional field `token`, a string, sent only by a guest. It parses as any
+    string (another type is a protocol error, `null` is absent) and is valid from 1 to 256 bytes.
+  - **Handshake (sections 6, 6.2).** A host may be configured with a token. Such a host checks the
+    guest's `token` before anything else, compares it in constant time, and refuses a missing, out of
+    range or unequal one with `{"type":"bye","reason":"unauthorized"}`. A host without a token ignores the
+    field. Nobody echoes or logs a token.
+  - **`bye` (section 8).** `"unauthorized"` is the second fixed reason, after `"busy"`.
+  - **Endpoint file (section 6.2).** `{"control_port":...,"token":"..."}`, written by the host after it has
+    bound the port, atomically and owner-only, removed on a clean shutdown, read by the guest. Recommended
+    places per OS, and what the token protects against and what it does not. A host that makes its own
+    token takes 32 bytes from the OS's cryptographic generator and writes them as 64 lowercase hex digits.
+  - **UDP (section 6.2).** Unchanged; the text says why authenticating the control connection is enough.
+
+  Why the protocol version stays 1: no layout changes, and a field is added to a message, which section 8
+  ("unknown fields are ignored") and the end of this section have always allowed. A host without a token (the default, and every host before revision
+  6) behaves exactly as before. A revision 5 host ignores `token` as an unknown field, so a revision 6 guest
+  with a token can still talk to it. A revision 5 guest cannot open a session with a host that has a token,
+  which is the purpose: the host's owner turned authentication on. One thing a revision 5 receiver accepted is
+  now refused: a `hello` whose `token` is not a string (revision 5 ignored it as an unknown field of any
+  type). No known sender writes a `token` field other than a revision 6 guest, which writes a string.
 
 A change that alters any layout or meaning above needs a new protocol version. Adding a control
 message type or field, or a new datagram `kind`, does not, because receivers ignore what they do

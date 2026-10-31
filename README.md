@@ -385,7 +385,7 @@ side freezes or dies.
   its [`compose` feature](rewrite-bridge-bevy/README.md#depth-compositing-of-a-guests-frames-feature-compose)).
 - Coordinates: the same glTF conventions as `Model`; each side converts its own.
 
-[`docs/CONTRACT.md`](docs/CONTRACT.md) is the versioned protocol (v1, revision 5), with every byte offset and C
+[`docs/CONTRACT.md`](docs/CONTRACT.md) is the versioned protocol (v1, revision 6), with every byte offset and C
 structs, so plugins in other languages can implement it without this crate. In Rust:
 
 ```rust
@@ -402,6 +402,23 @@ for event in link.poll() {            // never blocks
 
 The [examples](#examples) run a fake host and a fake guest against each other, with no game.
 
+Any local process can connect to a port on `127.0.0.1`. A host that should accept only the guest its
+user starts can require a token (contract section 6.2): with `endpoint_file` set, the host generates
+one, writes it with the port it bound to an owner-only file once it is listening, and removes the file
+when it closes; a guest with the same `endpoint_file` reads port and token from it before each
+connection attempt. A guest without the token is answered `bye` `unauthorized`.
+
+```rust
+use rewrite_bridge::link::{Link, LinkConfig};
+
+let path = std::env::temp_dir().join("my-host.json"); // see the contract for the recommended places
+let host = Link::host(LinkConfig { control_port: 0, endpoint_file: Some(path.clone()), ..LinkConfig::new("Host") })?;
+let guest = Link::guest(LinkConfig { endpoint_file: Some(path), ..LinkConfig::new("Guest") })?;
+```
+
+The token keeps out other users and processes that cannot read the file, not programs running as the
+same user; the contract says what it protects and what it does not.
+
 Without the feature the crate still has no dependencies; with it, it uses `memmap2` and
 `serde_json`. The link only exchanges what each process publishes about itself: it never reads
 another process's memory or injects code.
@@ -410,7 +427,8 @@ The four implementations of the link (this crate, [link-java](https://github.com
 [link-c](https://github.com/patodois/link-c), [link-cs](https://github.com/patodois/link-cs)) are held to the
 contract by shared test vectors, [`tests/vectors/link`](tests/vectors/link/README.md) (every implementation runs
 them in its own test suite), and by a cross-language interop job that runs all 16 host/guest pairs over real
-sockets and a real pixel file, [`tests/interop`](tests/interop/README.md).
+sockets and a real pixel file, without a token, with one from an endpoint file and with a wrong one,
+[`tests/interop`](tests/interop/README.md).
 
 ## Examples
 

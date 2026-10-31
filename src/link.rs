@@ -12,6 +12,10 @@
 //!   memory-mapped file; [`compose`] has the reference CPU reprojection and depth compositing for
 //!   such frames.
 //!
+//! A host can require a token from its guest (contract section 6.2): set [`LinkConfig::token`], or
+//! [`LinkConfig::endpoint_file`] to have the host generate one and hand it, with the port, to the guest
+//! through an owner-only [`Endpoint`] file.
+//!
 //! The link only exchanges what each process chooses to publish. It never touches another process.
 
 use std::collections::hash_map::RandomState;
@@ -74,6 +78,13 @@ pub const MAX_FRAME_PIXELS: u64 = 1 << 26;
 pub const MAX_ENTITIES: usize = 1024;
 /// The range of `heartbeat_ms` a `hello` may announce (section 8).
 pub const HEARTBEAT_MS_RANGE: std::ops::RangeInclusive<u32> = 10..=10_000;
+/// Longest token, in bytes of UTF-8 (contract section 6.2); the shortest is 1 byte.
+pub const MAX_TOKEN_BYTES: usize = 256;
+/// Longest endpoint file, in bytes (contract section 6.2).
+pub const MAX_ENDPOINT_FILE: usize = 4096;
+/// The `bye` reason of a host that refuses a `hello` without the right token (contract section 6.2),
+/// and the reason of the [`Event::HandshakeFailed`] it reports.
+pub const UNAUTHORIZED: &str = "unauthorized";
 /// Collision datagrams one [`Link::poll`] sends at most (section 9.5).
 pub const COLLISION_PER_POLL: usize = 32;
 /// The UDP receive buffer a receiver asks for, in bytes (section 2); the OS may grant less.
@@ -763,7 +774,7 @@ pub fn decode_datagram(buf: &[u8]) -> Result<(Header, Datagram), WireError> {
 // ---------------------------------------------------------------------------------------------
 // Control messages
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Hello {
     pub role: Role,
     pub game: String,
@@ -775,6 +786,34 @@ pub struct Hello {
     pub timeout_ms: u32,
     /// Set in the host's reply only.
     pub session: Option<u32>,
+    /// Revision 6: the host's token, sent by a guest that has one (contract section 6.2). A host's
+    /// `hello` never carries one. `Debug` does not show it.
+    pub token: Option<String>,
+}
+
+impl fmt::Debug for Hello {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Hello")
+            .field("role", &self.role)
+            .field("game", &self.game)
+            .field("protocol", &self.protocol)
+            .field("min_protocol", &self.min_protocol)
+            .field("udp_port", &self.udp_port)
+            .field("heartbeat_ms", &self.heartbeat_ms)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("session", &self.session)
+            .field("token", &self.token.as_ref().map(|_| Redacted))
+            .finish()
+    }
+}
+
+/// Stands for a token in `Debug` output.
+struct Redacted;
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
 }
 
 /// An entity of the sender's, drawn with a provider's asset.
@@ -835,6 +874,9 @@ impl Control {
                 });
                 if let Some(s) = h.session {
                     v["session"] = s.into();
+                }
+                if let Some(t) = &h.token {
+                    v["token"] = clean(t).into();
                 }
                 v
             }
@@ -903,6 +945,7 @@ impl Control {
                 heartbeat_ms: f.int("heartbeat_ms")?,
                 timeout_ms: f.int("timeout_ms")?,
                 session: f.opt_int("session")?,
+                token: f.opt_str("token")?,
             }),
             "spawn" => Self::Spawn(Spawn {
                 entity: f.int("entity")?,
@@ -1003,8 +1046,8 @@ impl Fields<'_> {
 // ---------------------------------------------------------------------------------------------
 // Link
 
-/// Settings for [`Link::host`] and [`Link::guest`].
-#[derive(Clone, Debug)]
+/// Settings for [`Link::host`] and [`Link::guest`]. `Debug` does not show the token.
+#[derive(Clone)]
 pub struct LinkConfig {
     /// This side's game, sent in `hello`.
     pub game: String,
@@ -1021,6 +1064,33 @@ pub struct LinkConfig {
     pub timeout: Duration,
     /// Guest: how often to retry connecting while no host answers.
     pub reconnect: Duration,
+    /// Revision 6 (contract section 6.2). Host: the token a guest's `hello` must carry; `None` accepts
+    /// any guest, unless [`LinkConfig::endpoint_file`] is set, which makes the host generate one. Guest:
+    /// the token to send (replaced by the endpoint file's when that is set). 1 to [`MAX_TOKEN_BYTES`]
+    /// bytes, no U+0000; [`Link::host`] and [`Link::guest`] refuse anything else.
+    pub token: Option<String>,
+    /// Revision 6 (contract section 6.2). Host: once the control port is bound, write an [`Endpoint`]
+    /// file here with the bound port and the token (generated with [`generate_token`] when
+    /// [`LinkConfig::token`] is `None`), and remove it when the link is dropped. Guest: read the port and
+    /// the token from this file before every connection attempt, instead of
+    /// [`LinkConfig::control_port`] and [`LinkConfig::token`]; while it cannot be read (the host is not
+    /// running yet) the guest just tries again after [`LinkConfig::reconnect`].
+    pub endpoint_file: Option<PathBuf>,
+}
+
+impl fmt::Debug for LinkConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LinkConfig")
+            .field("game", &self.game)
+            .field("control_port", &self.control_port)
+            .field("udp_port", &self.udp_port)
+            .field("heartbeat", &self.heartbeat)
+            .field("timeout", &self.timeout)
+            .field("reconnect", &self.reconnect)
+            .field("token", &self.token.as_ref().map(|_| Redacted))
+            .field("endpoint_file", &self.endpoint_file)
+            .finish()
+    }
 }
 
 impl LinkConfig {
@@ -1032,6 +1102,8 @@ impl LinkConfig {
             heartbeat: Duration::from_millis(250),
             timeout: Duration::from_millis(2000),
             reconnect: Duration::from_millis(500),
+            token: None,
+            endpoint_file: None,
         }
     }
 }
@@ -1302,6 +1374,10 @@ pub struct Link {
     last_collision: Option<u32>,
     assembly: Option<Assembly>,
     last_frame: u64,
+    /// Host: the token a guest must show. Guest: the token sent with the current connection attempt.
+    token: Option<String>,
+    /// Host: the endpoint file this link wrote, removed on drop.
+    endpoint_written: Option<PathBuf>,
 }
 
 fn localhost(port: u16) -> SocketAddr {
@@ -1362,15 +1438,44 @@ fn random_session() -> u32 {
 
 impl Link {
     /// Listens on `127.0.0.1:control_port` and waits, in [`Link::poll`], for one guest at a time.
+    ///
+    /// With [`LinkConfig::token`] the host refuses every guest whose `hello` does not carry that token,
+    /// with `bye` [`UNAUTHORIZED`]. With [`LinkConfig::endpoint_file`] it writes the endpoint file once
+    /// its sockets are bound (generating a token if it has none) and fails if it cannot.
     pub fn host(cfg: LinkConfig) -> io::Result<Self> {
+        if let Some(t) = &cfg.token {
+            check_token(t)?;
+        }
         let listener = TcpListener::bind(localhost(cfg.control_port))?;
         listener.set_nonblocking(true)?;
-        Self::new(Role::Host, cfg, Some(listener))
+        let port = listener.local_addr()?.port();
+        let mut link = Self::new(Role::Host, cfg, Some(listener))?;
+        link.token = link.cfg.token.clone();
+        if let Some(path) = link.cfg.endpoint_file.clone() {
+            // Only now, with the port bound: a process squatting the port makes the bind above fail,
+            // so it never learns the token from a guest that reads this file (contract section 6.2).
+            let token = match link.token.take() {
+                Some(t) => t,
+                None => generate_token()?,
+            };
+            let endpoint = Endpoint {
+                control_port: port,
+                token,
+            };
+            endpoint.write(&path)?;
+            link.token = Some(endpoint.token);
+            link.endpoint_written = Some(path);
+        }
+        Ok(link)
     }
 
     /// Connects, in [`Link::poll`], to a host on `127.0.0.1:control_port`, retrying until one
-    /// answers and reconnecting after a session ends.
+    /// answers and reconnecting after a session ends. It sends [`LinkConfig::token`] in its `hello`,
+    /// or, with [`LinkConfig::endpoint_file`], the port and token it reads there before each attempt.
     pub fn guest(cfg: LinkConfig) -> io::Result<Self> {
+        if let Some(t) = &cfg.token {
+            check_token(t)?;
+        }
         Self::new(Role::Guest, cfg, None)
     }
 
@@ -1406,6 +1511,8 @@ impl Link {
             last_collision: None,
             assembly: None,
             last_frame: 0,
+            token: None,
+            endpoint_written: None,
         })
     }
 
@@ -1467,6 +1574,11 @@ impl Link {
             heartbeat_ms: millis(self.cfg.heartbeat),
             timeout_ms: millis(self.cfg.timeout),
             session,
+            // Only a guest's hello carries a token; a host never sends its own (contract section 6.2).
+            token: match self.role {
+                Role::Guest => self.token.clone(),
+                Role::Host => None,
+            },
         })
     }
 
@@ -1493,7 +1605,26 @@ impl Link {
         }
         match &self.conn {
             Conn::Idle { next_try } if now >= *next_try => {
-                let addr = localhost(self.cfg.control_port);
+                let port = match &self.cfg.endpoint_file {
+                    // Read before every attempt: a restarted host has a new port and a new token.
+                    Some(path) => match Endpoint::read(path) {
+                        Ok(e) => {
+                            self.token = Some(e.token);
+                            e.control_port
+                        }
+                        Err(_) => {
+                            self.conn = Conn::Idle {
+                                next_try: now + self.cfg.reconnect,
+                            };
+                            return;
+                        }
+                    },
+                    None => {
+                        self.token = self.cfg.token.clone();
+                        self.cfg.control_port
+                    }
+                };
+                let addr = localhost(port);
                 let (tx, rx) = mpsc::channel();
                 let spawned = std::thread::Builder::new()
                     .name("rewrite-bridge-connect".into())
@@ -1624,6 +1755,19 @@ impl Link {
     }
 
     fn on_hello(&mut self, h: Hello, now: Instant) -> Result<(), (String, bool)> {
+        // The token first, before any check whose answer would tell an unauthenticated peer something
+        // (contract section 6.2). The answer never quotes either token.
+        if self.role == Role::Host {
+            if let Some(want) = &self.token {
+                let ok = h.token.as_deref().is_some_and(|got| {
+                    (1..=MAX_TOKEN_BYTES).contains(&got.len())
+                        && token_equal(got.as_bytes(), want.as_bytes())
+                });
+                if !ok {
+                    return Err((UNAUTHORIZED.to_owned(), true));
+                }
+            }
+        }
         let expected = match self.role {
             Role::Host => Role::Guest,
             Role::Guest => Role::Host,
@@ -2042,8 +2186,12 @@ impl Link {
 }
 
 impl Drop for Link {
-    /// Says `bye` and closes gracefully, which may block for up to [`LINGER`].
+    /// Removes the endpoint file the host wrote, says `bye` and closes gracefully, which may block
+    /// for up to [`LINGER`].
     fn drop(&mut self) {
+        if let Some(path) = self.endpoint_written.take() {
+            let _ = Endpoint::remove(&path);
+        }
         let now = Instant::now();
         if let Conn::Handshake { ctl, .. } | Conn::Live { ctl, .. } =
             std::mem::replace(&mut self.conn, Conn::Idle { next_try: now })
@@ -2056,6 +2204,266 @@ impl Drop for Link {
             self.closing.retain_mut(|c| c.pump(now));
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Token and endpoint file (contract section 6.2)
+
+/// Compares two tokens in constant time (contract section 6.2): the time depends on neither content
+/// nor on where they differ. Each is taken as if copied into [`MAX_TOKEN_BYTES`] zero bytes, every byte
+/// pair is compared with no early exit, and the lengths are compared too. A token longer than
+/// [`MAX_TOKEN_BYTES`] is never equal to anything.
+pub fn token_equal(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    for i in 0..MAX_TOKEN_BYTES {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= usize::from(x ^ y);
+    }
+    std::hint::black_box(diff) == 0 && a.len() <= MAX_TOKEN_BYTES
+}
+
+/// A new token: 32 bytes from the operating system's cryptographic random number generator, as 64
+/// lowercase hex digits (contract section 6.2). Fails rather than fall back to a weaker source.
+pub fn generate_token() -> io::Result<String> {
+    let mut bytes = [0u8; 32];
+    os_random(&mut bytes)?;
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        s.push(char::from(b"0123456789abcdef"[usize::from(b >> 4)]));
+        s.push(char::from(b"0123456789abcdef"[usize::from(b & 15)]));
+    }
+    Ok(s)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn os_random(buf: &mut [u8]) -> io::Result<()> {
+    let mut done = 0;
+    while done < buf.len() {
+        let rest = &mut buf[done..];
+        // SAFETY: the pointer and length describe `rest`, which lives through the call.
+        let n = unsafe { libc::getrandom(rest.as_mut_ptr().cast(), rest.len(), 0) };
+        if n > 0 {
+            done += n as usize;
+            continue;
+        }
+        let e = io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EINTR) => {}
+            // A kernel older than 3.17: the device is the same generator.
+            Some(libc::ENOSYS) => return File::open("/dev/urandom")?.read_exact(&mut buf[done..]),
+            _ => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn os_random(buf: &mut [u8]) -> io::Result<()> {
+    // macOS and the BSDs: /dev/urandom is the kernel's CSPRNG (the one arc4random and getentropy use),
+    // and never blocks once the system has booted.
+    File::open("/dev/urandom")?.read_exact(buf)
+}
+
+#[cfg(windows)]
+fn os_random(buf: &mut [u8]) -> io::Result<()> {
+    #[link(name = "bcrypt")]
+    extern "system" {
+        fn BCryptGenRandom(alg: *mut u8, buf: *mut u8, len: u32, flags: u32) -> i32;
+    }
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 2;
+    for chunk in buf.chunks_mut(u32::MAX as usize) {
+        // SAFETY: no algorithm handle (the system's preferred generator), and a buffer of `len` bytes.
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                chunk.as_mut_ptr(),
+                chunk.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::other("BCryptGenRandom failed"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn os_random(_buf: &mut [u8]) -> io::Result<()> {
+    Err(io::Error::new(
+        ErrorKind::Unsupported,
+        "no operating system random number generator on this platform",
+    ))
+}
+
+/// A configured token must be 1 to [`MAX_TOKEN_BYTES`] bytes without U+0000 (which the wire cannot
+/// carry). The error does not quote it.
+fn check_token(t: &str) -> io::Result<()> {
+    if !(1..=MAX_TOKEN_BYTES).contains(&t.len()) || t.contains('\0') {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "token must be 1 to 256 bytes of UTF-8 without U+0000",
+        ));
+    }
+    Ok(())
+}
+
+/// The endpoint file of contract section 6.2: the port a host listens on and its token, written by
+/// the host after it has bound the port, owner-only, and read by the guest. `Debug` does not show the
+/// token.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Endpoint {
+    pub control_port: u16,
+    pub token: String,
+}
+
+impl fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Endpoint")
+            .field("control_port", &self.control_port)
+            .field("token", &Redacted)
+            .finish()
+    }
+}
+
+fn endpoint_error(why: &str) -> io::Error {
+    io::Error::new(ErrorKind::InvalidData, format!("endpoint file: {why}"))
+}
+
+impl Endpoint {
+    /// Writes the file atomically: a temporary file in the same directory, created exclusively and
+    /// owner-only (mode 0600 on Unix, from the moment it exists), then renamed over `path`. A reader
+    /// sees no file, the old one or this one, never part of it. The directory must exist; on Windows
+    /// put it under the user's local application data, whose ACL keeps other users out. Errors never
+    /// quote the token.
+    pub fn write(&self, path: &Path) -> io::Result<()> {
+        check_token(&self.token)?;
+        if self.control_port == 0 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "endpoint file: control_port 0",
+            ));
+        }
+        let name = path.file_name().ok_or_else(|| {
+            io::Error::new(ErrorKind::InvalidInput, "endpoint file: no file name")
+        })?;
+        let dir = match path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => Path::new("."),
+        };
+        let mut nonce = [0u8; 4];
+        os_random(&mut nonce)?;
+        let tmp = dir.join(format!(
+            ".{}.{}.{:08x}.tmp",
+            name.to_string_lossy(),
+            std::process::id(),
+            u32::from_le_bytes(nonce)
+        ));
+        let mut text =
+            json!({ "control_port": self.control_port, "token": self.token }).to_string();
+        text.push('\n');
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        let written = f
+            .write_all(text.as_bytes())
+            .and_then(|()| f.sync_all())
+            .and_then(|()| {
+                drop(f);
+                std::fs::rename(&tmp, path)
+            });
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written
+    }
+
+    /// Reads and checks the file (contract section 6.2): a regular file (checked before opening, so a
+    /// FIFO cannot block the reader), on Unix with no permission for group or others, at most
+    /// [`MAX_ENDPOINT_FILE`] bytes, one JSON object in the syntax of a control line with `control_port`
+    /// 1 to 65535 and `token` 1 to [`MAX_TOKEN_BYTES`] bytes. Errors never quote the file.
+    pub fn read(path: &Path) -> io::Result<Self> {
+        check_endpoint_meta(&std::fs::metadata(path)?)?;
+        let mut opts = OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NONBLOCK);
+        }
+        let f = opts.open(path)?;
+        // The opened file is what counts: the path may have been swapped since the check above.
+        check_endpoint_meta(&f.metadata()?)?;
+        let mut data = Vec::with_capacity(512);
+        f.take(MAX_ENDPOINT_FILE as u64 + 1)
+            .read_to_end(&mut data)?;
+        Self::parse(&data)
+    }
+
+    /// Parses the contents of an endpoint file, as [`Endpoint::read`] does after its file checks.
+    pub fn parse(data: &[u8]) -> io::Result<Self> {
+        if data.len() > MAX_ENDPOINT_FILE {
+            return Err(endpoint_error("longer than 4096 bytes"));
+        }
+        let body = data
+            .strip_suffix(b"\r\n")
+            .or_else(|| data.strip_suffix(b"\n"))
+            .unwrap_or(data);
+        if body.contains(&b'\n') {
+            return Err(endpoint_error("more than one line"));
+        }
+        let text = std::str::from_utf8(body).map_err(|_| endpoint_error("not UTF-8"))?;
+        check_line_text(text).map_err(endpoint_error)?;
+        let v: Value =
+            serde_json::from_str(text).map_err(|_| endpoint_error("not a JSON object"))?;
+        let o = v
+            .as_object()
+            .ok_or_else(|| endpoint_error("not a JSON object"))?;
+        let f = Fields(o);
+        let control_port: u16 = f
+            .int("control_port")
+            .ok()
+            .filter(|&p| p != 0)
+            .ok_or_else(|| endpoint_error("control_port is not an integer from 1 to 65535"))?;
+        let token = f
+            .str("token")
+            .ok()
+            .filter(|t| (1..=MAX_TOKEN_BYTES).contains(&t.len()))
+            .ok_or_else(|| endpoint_error("token is not a string of 1 to 256 bytes"))?
+            .to_owned();
+        Ok(Self {
+            control_port,
+            token,
+        })
+    }
+
+    /// Removes the file (what a host does when it shuts down cleanly).
+    pub fn remove(path: &Path) -> io::Result<()> {
+        std::fs::remove_file(path)
+    }
+}
+
+fn check_endpoint_meta(m: &std::fs::Metadata) -> io::Result<()> {
+    if !m.is_file() {
+        return Err(endpoint_error("not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if m.permissions().mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "endpoint file: group or others have permissions on it",
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3009,6 +3417,7 @@ mod tests {
                 heartbeat_ms: 250,
                 timeout_ms: 2000,
                 session: Some(u32::MAX),
+                token: None,
             }),
             Control::Hello(Hello {
                 role: Role::Guest,
@@ -3019,6 +3428,7 @@ mod tests {
                 heartbeat_ms: 1,
                 timeout_ms: 1,
                 session: None,
+                token: None,
             }),
             Control::Spawn(Spawn {
                 entity: u32::MAX,
@@ -3789,6 +4199,7 @@ mod tests {
                 heartbeat_ms: 250,
                 timeout_ms: 2000,
                 session: None,
+                token: None,
             }),
             Control::Spawn(Spawn {
                 entity: 1,

@@ -3,9 +3,10 @@
 //! five lock-step camera/pose/frame rounds with a depth plane, despawns, bye) and prints one result line.
 //!
 //! cargo run --release --features link --example interop_peer -- host|guest --port 47810 --label rust
+//!     [--endpoint FILE] [--expect-unauthorized | --wrong-token]
 
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -117,6 +118,8 @@ struct Outcome {
     frames_bad: u32,
     focus: Vec<String>,
     lost_reason: Option<String>,
+    /// Reasons of the `HandshakeFailed` events, in order.
+    handshake_failed: Vec<String>,
     /// The link's counters when the rounds are over (before the despawns and the bye): a datagram of the
     /// guest that is still in flight when the session ends is legitimately "foreign" to a host that is no
     /// longer in a session.
@@ -147,6 +150,8 @@ struct Peer {
     focus_grant: bool,
     focus_request: bool,
     focus_back: bool,
+    /// A handshake failure is what this run expects (mode `wrong-token`).
+    expect_refusal: bool,
 }
 
 impl Peer {
@@ -167,6 +172,7 @@ impl Peer {
             focus_grant: false,
             focus_request: false,
             focus_back: false,
+            expect_refusal: false,
         }
     }
 
@@ -184,7 +190,10 @@ impl Peer {
                     self.r.lost_reason = Some(reason);
                 }
                 Event::HandshakeFailed { reason } => {
-                    self.r.fail(format!("handshake failed: {reason}"))
+                    if !self.expect_refusal {
+                        self.r.fail(format!("handshake failed: {reason}"));
+                    }
+                    self.r.handshake_failed.push(reason);
                 }
                 Event::Camera { header, camera } => self.cameras.push_back((header, camera)),
                 Event::Poses { poses, .. } => self.poses.push_back(poses),
@@ -297,14 +306,43 @@ fn spawn_of(entity: u32) -> Spawn {
     }
 }
 
-fn run_host(port: u16, label: &str) -> Peer {
+/// Mode `wrong-token`: the handshake must end in `unauthorized` and no session may start.
+fn expect_unauthorized(mut p: Peer) -> Peer {
+    let end = p.started + TOTAL;
+    while p.r.handshake_failed.is_empty() && Instant::now() < end {
+        p.pump();
+        sleep(Duration::from_millis(2));
+    }
+    if p.link.role() == Role::Host {
+        p.for_ms(300);
+    }
+    match p.r.handshake_failed.first() {
+        None => p.r.fail("no handshake_failed event"),
+        Some(r) if !r.contains(UNAUTHORIZED) => {
+            let r = r.clone();
+            p.r.fail(format!("handshake failed with {r:?}, not unauthorized"))
+        }
+        Some(_) => {}
+    }
+    if p.connected {
+        p.r.fail("a session started with a wrong token");
+    }
+    p
+}
+
+fn run_host(port: u16, label: &str, endpoint: Option<PathBuf>, refuse: bool) -> Peer {
     let cfg = LinkConfig {
         control_port: port,
         heartbeat: Duration::from_millis(100),
         timeout: Duration::from_millis(3000),
+        endpoint_file: endpoint,
         ..LinkConfig::new(format!("interop host ({label})"))
     };
     let mut p = Peer::new(Link::host(cfg).expect("listen"));
+    if refuse {
+        p.expect_refusal = true;
+        return expect_unauthorized(p);
+    }
     if !p.connect("interop guest (") {
         return p;
     }
@@ -386,14 +424,44 @@ fn run_host(port: u16, label: &str) -> Peer {
     p
 }
 
-fn run_guest(port: u16, label: &str) -> Peer {
-    let cfg = LinkConfig {
+/// Mode `wrong-token`: the endpoint file's port, and its token with the last character replaced.
+fn wrong_endpoint(path: &Path) -> Option<(u16, String)> {
+    let end = Instant::now() + STEP;
+    loop {
+        if let Ok(e) = Endpoint::read(path) {
+            let mut t = e.token;
+            let last = t.pop()?;
+            t.push(if last == '0' { '1' } else { '0' });
+            return Some((e.control_port, t));
+        }
+        if Instant::now() > end {
+            return None;
+        }
+        sleep(Duration::from_millis(20));
+    }
+}
+
+fn run_guest(port: u16, label: &str, endpoint: Option<PathBuf>, wrong: bool) -> Peer {
+    let mut cfg = LinkConfig {
         control_port: port,
         heartbeat: Duration::from_millis(100),
         timeout: Duration::from_millis(3000),
         reconnect: Duration::from_millis(100),
         ..LinkConfig::new(format!("interop guest ({label})"))
     };
+    if wrong {
+        let Some((port, token)) = endpoint.as_deref().and_then(wrong_endpoint) else {
+            let mut p = Peer::new(Link::guest(cfg).expect("guest"));
+            p.r.fail("cannot read the endpoint file");
+            return p;
+        };
+        cfg.control_port = port;
+        cfg.token = Some(token);
+        let mut p = Peer::new(Link::guest(cfg).expect("guest"));
+        p.expect_refusal = true;
+        return expect_unauthorized(p);
+    }
+    cfg.endpoint_file = endpoint;
     let mut p = Peer::new(Link::guest(cfg).expect("guest"));
     if !p.connect("interop host (") {
         return p;
@@ -476,23 +544,39 @@ fn main() {
             .cloned()
     };
     let role = args.first().map(String::as_str);
+    let flag = |name: &str| args.iter().any(|a| a == name);
+    let usage = || {
+        eprintln!(
+            "usage: interop_peer host|guest --port PORT --label LABEL \
+             [--endpoint FILE [--expect-unauthorized | --wrong-token]]"
+        );
+        exit(2);
+    };
     let (Some(port), Some(label)) = (
         value("--port").and_then(|p| p.parse::<u16>().ok()),
         value("--label"),
     ) else {
-        eprintln!("usage: interop_peer host|guest --port PORT --label LABEL");
-        exit(2);
+        usage()
+    };
+    let endpoint = value("--endpoint").map(PathBuf::from);
+    let (refuse, wrong) = (flag("--expect-unauthorized"), flag("--wrong-token"));
+    if (refuse || wrong) && endpoint.is_none() {
+        usage();
+    }
+    let mode = match (&endpoint, refuse || wrong) {
+        (None, _) => "plain",
+        (Some(_), false) => "token",
+        (Some(_), true) => "wrong-token",
     };
     let mut p = match role {
-        Some("host") => run_host(port, &label),
-        Some("guest") => run_guest(port, &label),
-        _ => {
-            eprintln!("usage: interop_peer host|guest --port PORT --label LABEL");
-            exit(2);
-        }
+        Some("host") if !wrong => run_host(port, &label, endpoint, refuse),
+        Some("guest") if !refuse => run_guest(port, &label, endpoint, wrong),
+        _ => usage(),
     };
     p.pump();
-    if role == Some("host") {
+    if mode == "wrong-token" {
+        // Checked in expect_unauthorized; the session's own checks do not apply.
+    } else if role == Some("host") {
         if p.r.frames_ok != ROUNDS {
             p.r.fail(format!("frames verified: {} of {ROUNDS}", p.r.frames_ok));
         }
@@ -512,6 +596,7 @@ fn main() {
         "spawns": p.r.spawns, "despawns": p.r.despawns, "cameras": p.r.cameras, "poses": p.r.poses,
         "collision_triangles": p.r.collision_triangles, "frames_ok": p.r.frames_ok, "frames_bad": p.r.frames_bad,
         "focus": p.r.focus, "lost_reason": p.r.lost_reason,
+        "mode": mode, "connected": p.connected, "handshake_failed": p.r.handshake_failed,
         "stats": {"malformed": s.malformed, "foreign": s.foreign, "stale": s.stale,
                   "unknown_entity": s.unknown_entity, "spawn_ignored": s.spawn_ignored},
     });

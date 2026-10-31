@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Judges the two result lines of one interop pair (see README.md).
 
-    check_results.py --host-label rust --guest-label java HOST_LOG GUEST_LOG [--host-exit N] [--guest-exit N]
+    check_results.py [--mode plain|token|wrong-token] --host-label rust --guest-label java HOST_LOG GUEST_LOG
+                     [--host-exit N] [--guest-exit N]
 
 Prints one line per problem; exit status 0 if there is none.
 """
@@ -37,6 +38,7 @@ def expect(problems, who, r, key, want):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", default="plain", choices=("plain", "token", "wrong-token"))
     ap.add_argument("--host-label", required=True)
     ap.add_argument("--guest-label", required=True)
     ap.add_argument("--host-exit", type=int, default=0)
@@ -56,6 +58,32 @@ def main():
         problems.append("host exited with %d" % a.host_exit)
     if a.guest_exit != 0:
         problems.append("guest exited with %d" % a.guest_exit)
+    for who, r in (("host", host), ("guest", guest)):
+        if r:
+            expect(problems, who, r, "mode", a.mode)
+    if a.mode == "wrong-token":
+        # The session must not start: the host answers the guest's hello with bye "unauthorized" (section 6.2).
+        for who, r in (("host", host), ("guest", guest)):
+            if not r:
+                continue
+            for f in r.get("failures", []):
+                problems.append("%s reports: %s" % (who, f))
+            expect(problems, who, r, "role", who)
+            expect(problems, who, r, "ok", True)
+            expect(problems, who, r, "connected", False)
+            reasons = r.get("handshake_failed") or []
+            if not reasons:
+                problems.append("%s: no handshake_failed event" % who)
+            for reason in reasons:
+                if "unauthorized" not in reason:
+                    problems.append("%s: handshake_failed reason %r does not mention unauthorized" % (who, reason))
+        for p in problems:
+            print(p)
+        sys.exit(1 if problems else 0)
+    for who, r in (("host", host), ("guest", guest)):
+        if r:
+            expect(problems, who, r, "connected", True)
+            expect(problems, who, r, "handshake_failed", [])
     if host:
         for f in host.get("failures", []):
             problems.append("host reports: " + f)

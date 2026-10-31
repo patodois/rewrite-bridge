@@ -1,7 +1,7 @@
 {
   "format": "rbl-link-vectors/1",
   "kind": "datagrams",
-  "contract": "v1 revision 5",
+  "contract": "v1 revision 6",
   "cases": [
     {"id":"dg.heartbeat.contract_example","section":"9.2, 11","expect":"decode","hex":"52424c4b010001000100cdab0400000000401e18240a0600","header":{"version":1,"flags":0,"session":2882338817,"seq":4,"time_us":"1700000000000000"},"body":{"kind":"heartbeat"},"encode":true},
     {"id":"dg.heartbeat.seq_wraps","section":"9.1","expect":"decode","hex":"52424c4b0100010001000000ffffffff0000000000000000","header":{"version":1,"flags":0,"session":1,"seq":4294967295,"time_us":"0"},"body":{"kind":"heartbeat"},"encode":true},

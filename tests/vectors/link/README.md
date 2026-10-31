@@ -1,6 +1,6 @@
 # Link protocol test vectors
 
-Test vectors for the passthrough link protocol of `docs/CONTRACT.md` (protocol v1, revision 5). Every
+Test vectors for the passthrough link protocol of `docs/CONTRACT.md` (protocol v1, revision 6). Every
 implementation of the link (Rust in this repository, `link-java`, `link-c`, `link-cs`) reads these files in its
 own test suite and must agree with all of them. They are derived from the contract alone: `gen.py` writes them
 with an encoder of its own (standard library only), so no implementation's bug can have leaked into them. Where
@@ -18,11 +18,12 @@ Regenerate with `python3 tests/vectors/link/gen.py`, check that the committed fi
 | `datagrams.json` | one UDP datagram each, as hex: the same |
 | `pixelfiles.json`, `pixelfiles/*.bin` | pixel files to open and read, files that must be refused, and the bytes a writer must produce |
 | `sessions.json` | scripted sessions over real sockets against one side of the link (host or guest) |
+| `endpoints.json` | endpoint files (revision 6, section 6.2): what a reader must accept, with the port and token it gives, and refuse |
 | `SHA256SUMS` | `sha256sum` format, every file of this directory except itself and `gen.py` |
 | `GAPS.md` | what the contract does not say |
 
 Each JSON file is `{"format": "rbl-link-vectors/1", "kind": ..., "contract": ..., "cases": [...]}`. Every case has a
-unique `id` (`ctl.*`, `dg.*`, `pf.*`/`pw.*`, `sess.*`) and a `section` of the contract it comes from. Some have a
+unique `id` (`ctl.*`, `dg.*`, `pf.*`/`pw.*`, `sess.*`, `ep.*`) and a `section` of the contract it comes from. Some have a
 `basis`: `MUST` (the contract says it in so many words, the default), `table` (the contract fixes the value in a
 field table but does not say a reader must refuse anything else; revision 5 states all of those in so many words,
 so none is left) or `derived` (follows from the text by reading it closely). A runner reports a failing `table` or
@@ -113,7 +114,8 @@ creates it at a path that already holds a file, which must stay as it was.
 
 A session case runs one **implementation under test** (UT), host or guest (`role_under_test`), against a raw
 peer driven by the runner with plain sockets. `config` overrides the UT's `heartbeat_ms` (default 250),
-`timeout_ms` (default 2000) and `reconnect_ms` (guest, default 200). The UT is polled continuously (every few
+`timeout_ms` (default 2000) and `reconnect_ms` (guest, default 200), and may set `token` (revision 6, section 6.2;
+default none): for a host UT the token it requires, for a guest UT the token it sends in its `hello`. The UT is polled continuously (every few
 milliseconds) while the runner waits for anything; its events are queued. Cases with `"slow": true` take seconds.
 
 Set-up: for a host UT the runner starts `Link::host` on control port 0 and UDP port 0; for a guest UT it opens a
@@ -160,3 +162,16 @@ Event types and the keys a `match` may use: `connected` (`role` and `game` of th
 
 A session case ends by closing the UT (and its sockets); the next case starts from nothing. Events in the queue
 at the end of a case are ignored.
+
+## `endpoints.json`
+
+Revision 6 (section 6.2). A case has `text` (the whole file, as UTF-8) or `text_hex` (raw bytes), or `path_kind`
+instead of either. The runner writes the bytes to a new file in a fresh temporary directory, exactly as given (no
+newline added), with permissions `mode` (an octal string; default `"0600"`) on Unix, and calls the library's
+endpoint file reader on it. Where the platform has no Unix permissions (Windows) the runner ignores `mode` and skips
+the cases whose `skip_on` names the platform. `path_kind` is `missing` (a path in the temporary directory where
+nothing exists), `directory` (a directory) or `fifo` (a named pipe; the reader must not block on it).
+
+`expect` is `ok`, with the `control_port` and `token` the reader must give, or `refused`: the reader reports an
+error (an exception, an error value: whatever the library does). Its error text must not contain the file's
+token; a runner may check that.

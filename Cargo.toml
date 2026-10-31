@@ -55,6 +55,11 @@ required-features = ["link"]
 name = "link_review"
 required-features = ["link"]
 
+# The token and endpoint file of contract revision 6 (section 6.2), beyond what the vectors cover.
+[[test]]
+name = "link_token"
+required-features = ["link"]
+
 # The shared protocol vectors of tests/vectors/link, also run by link-java, link-c and link-cs.
 [[test]]
 name = "link_vectors"

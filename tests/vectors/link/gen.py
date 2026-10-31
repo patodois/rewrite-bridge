@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generates the link protocol test vectors (everything in this directory except this file and README.md).
 
-Every byte comes from docs/CONTRACT.md (protocol v1, revision 5) through the independent encoder below, which
+Every byte comes from docs/CONTRACT.md (protocol v1, revision 6) through the independent encoder below, which
 uses only the standard library. No implementation of the link (Rust, Java, C, C#) is involved, so a vector
 cannot have inherited a bug from one of them. The implementations are the consumers.
 
@@ -18,8 +18,10 @@ import struct
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CONTRACT = "v1 revision 5"
+CONTRACT = "v1 revision 6"
 INF = float("inf")
+# The token of the revision 6 vectors (section 6.2): 64 lowercase hex digits, the form a host generates.
+TOKEN = "0123456789abcdef" * 4
 
 # ---------------------------------------------------------------------------------------------
 # Constants of the contract (section numbers in the comments)
@@ -707,6 +709,35 @@ def control_cases():
     reject("ctl.bad.nesting_30000_levels_unclosed", "8", '{"type":"despawn","entity":1,"x":' + "[" * 30000,
            "the limit is checked before the line ends")
     reject("ctl.bad.nesting_10000_objects", "8", deep(10000, "{", "}", "1"), "at most 127 levels (the line is 50 KB, under the line limit)")
+
+    # =========================== revision 6: the token of a guest's hello (sections 6.2, 8) ===========================
+    JU = lambda d: json.dumps(d, separators=(",", ":"), ensure_ascii=False)
+    accept("ctl.hello.guest_with_token", "6.2, 8", JU(dict(hg, token=TOKEN)), dict(hg, token=TOKEN), True,
+           "64 lowercase hex digits, the form a host generates")
+    accept("ctl.hello.token_1_byte", "8", JU(dict(hg, token="a")), dict(hg, token="a"), True)
+    accept("ctl.hello.token_256_bytes", "8", JU(dict(hg, token="t" * 256)), dict(hg, token="t" * 256), True)
+    accept("ctl.hello.token_multibyte_256_bytes", "8", JU(dict(hg, token="\u00e9" * 128)),
+           dict(hg, token="\u00e9" * 128), True, "128 characters of 2 bytes each: lengths are in UTF-8 bytes")
+    accept("ctl.hello.token_any_characters", "8", JU(dict(hg, token="not hex, \"quoted\" \\ \u65e5\U0001f600")),
+           dict(hg, token="not hex, \"quoted\" \\ \u65e5\U0001f600"), True, "receivers do not check the format")
+    accept("ctl.hello.token_escaped", "8", hello_text[:-1] + ',"token":"\\u0030\\u0031\\u00e9"}',
+           dict(hg, token="01\u00e9"), note="the value is the string after its escapes are decoded")
+    accept("ctl.hello.token_null_is_absent", "8", hello_text[:-1] + ',"token":null}', hg)
+    accept("ctl.hello.token_empty_is_a_range_error_not_a_parse_error", "8", JU(dict(hg, token="")), dict(hg, token=""),
+           True, "any string parses; a host with a token refuses one outside 1 ..= 256 bytes")
+    accept("ctl.hello.token_257_bytes_is_a_range_error_not_a_parse_error", "8", JU(dict(hg, token="t" * 257)),
+           dict(hg, token="t" * 257), True, "any string parses; a host with a token refuses one outside 1 ..= 256 bytes")
+    accept("ctl.hello.token_duplicate_key_last_wins", "8", hello_text[:-1] + ',"token":"a","token":"b"}',
+           dict(hg, token="b"))
+    accept("ctl.hello.host_with_token_is_parsed", "6.2, 8", JU(dict(hh, token=TOKEN)), dict(hh, token=TOKEN),
+           note="a host never sends one; a guest parses it like any field and ignores it")
+    for tag, v in (("number", 12345), ("true", True), ("array", [TOKEN]), ("object", {"token": TOKEN})):
+        reject("ctl.bad.hello_token_" + tag, "8", JU(dict(hg, token=v)), "token is an optional string")
+    reject("ctl.bad.hello_token_nul", "8", hello_text[:-1] + ',"token":"ab\\u0000cd"}', "U+0000 in a string is an error")
+    reject("ctl.bad.hello_token_duplicate_last_is_a_number", "8", hello_text[:-1] + ',"token":"a","token":1}',
+           "the last value wins and must be a string")
+    accept("ctl.hello.token_duplicate_first_is_a_number_last_wins", "8", hello_text[:-1] + ',"token":1,"token":"a"}',
+           dict(hg, token="a"), note="the last value wins; an overridden value is only checked for syntax (rule 5)")
     return cases
 
 
@@ -1877,6 +1908,162 @@ def sessions():
         noev("lost", 10), ev("lost")],
          config={"timeout_ms": 1000, "heartbeat_ms": 100}, slow=True,
          note="an unknown kind is ignored at any length and still proves the peer is there")
+
+    # =========================== revision 6: the token (sections 6, 6.2, 8) ===========================
+    TK = {"token": TOKEN}
+    unauthorized = [expect_line({"type": "bye", "reason": "unauthorized"}, exact=True), closed(),
+                    ev("handshake_failed"), noev("connected", 100)]
+    exact_reply = expect_line(host_reply, capture={"session": "session", "ut_udp_port": "udp_port"}, exact=True)
+    case("sess.host.token.correct_token_accepted", "6.2", "host", [
+        {"op": "connect"}, send(hello(token=TOKEN)), exact_reply, ev("connected", {"role": "guest", "protocol": 1}),
+        {"op": "expect_no_line", "ms": 200}], config=TK,
+         note="the reply has exactly the fields of a host's hello: never a token")
+    for tag, line, why in (
+            ("missing", hello(), "a host with a token refuses a hello without one"),
+            ("null", hello(token=None), "null is absent"),
+            ("wrong_last_byte", hello(token=TOKEN[:-1] + "e"), "not equal"),
+            ("wrong_first_byte", hello(token="1" + TOKEN[1:]), "not equal"),
+            ("prefix", hello(token=TOKEN[:-1]), "a prefix is not equal"),
+            ("longer", hello(token=TOKEN + "0"), "the token followed by more is not equal"),
+            ("upper_case", hello(token=TOKEN.upper()), "compared byte for byte"),
+            ("empty", hello(token=""), "outside 1 ..= 256 bytes"),
+            ("257_bytes", hello(token=TOKEN * 4 + "0"), "outside 1 ..= 256 bytes, and starts with the token"),
+            ("before_role", hello(role="host"), "the token is checked before anything else of section 6"),
+            ("before_version", hello(protocol=7, min_protocol=7), "the token is checked before the version ranges"),
+            ("before_heartbeat", hello(heartbeat_ms=0, token=TOKEN[:-1] + "e"), "the token is checked before the ranges"),
+            ("before_udp_port", hello(udp_port=0), "the token is checked before the ranges")):
+        case("sess.host.token.%s_unauthorized" % tag, "6.2", "host", [{"op": "connect"}, send(line)] + unauthorized,
+             config=TK, note=why + "; the answer is the fixed bye and nothing else")
+    case("sess.host.token.not_a_string_is_a_protocol_error", "6.2, 8", "host", [
+        {"op": "connect"}, send(hello(token=12345))] + bye_closed + [ev("handshake_failed")], config=TK,
+         note="a token that is not a string fails to parse; the reason is free")
+    case("sess.host.token.correct_token_then_bad_heartbeat_refused", "6.2, 8", "host", [
+        {"op": "connect"}, send(hello(token=TOKEN, heartbeat_ms=0))] + bye_closed + [ev("handshake_failed")],
+         config=TK, note="after the token the other checks apply as before")
+    case("sess.host.token.escaped_token_is_equal", "6.2, 8", "host", [
+        {"op": "connect"}, send(hello()[:-2] + ',"token":"\\u0030' + TOKEN[1:] + '"}\n'), exact_reply,
+        ev("connected")], config=TK, note="the token is compared after its escapes are decoded")
+    mb = "\u00e9" * 128
+    case("sess.host.token.multibyte_256_bytes_accepted", "6.2, 8", "host", [
+        {"op": "connect"}, send(hello(token=mb).replace("\\u00e9", "\u00e9")), exact_reply, ev("connected")],
+         config={"token": mb}, note="a token of 128 characters and 256 bytes: lengths and comparison are in UTF-8 bytes")
+    case("sess.host.token.multibyte_one_byte_short_unauthorized", "6.2, 8", "host", [
+        {"op": "connect"}, send(hello(token="\u00e9" * 127 + "e"))] + unauthorized, config={"token": mb})
+    t256 = {"token": "t" * 256}
+    case("sess.host.token.256_bytes_accepted", "6.2, 8", "host", [
+        {"op": "connect"}, send(hello(token="t" * 256)), exact_reply, ev("connected")], config=t256,
+         note="the longest valid token")
+    case("sess.host.token.256_bytes_and_one_more_unauthorized", "6.2, 8", "host", [
+        {"op": "connect"}, send(hello(token="t" * 257))] + unauthorized, config=t256,
+         note="a receiver that cut the received token to 256 bytes would let this one in")
+    case("sess.host.token.new_guest_after_unauthorized", "6.2", "host", [
+        {"op": "connect"}, send(hello(token="nope"))] + unauthorized + [
+        {"op": "connect", "conn": "b"}, send(hello(token=TOKEN), conn="b"),
+        expect_line(host_reply, conn="b", exact=True), ev("connected")], config=TK,
+         note="a refused guest does not hold the host; the next one with the token gets in")
+    case("sess.host.token.busy_is_answered_without_a_token", "2, 6.2", "host", [
+        {"op": "connect"}, send(hello(token=TOKEN)), exact_reply, ev("connected"),
+        {"op": "connect", "conn": "b"}, expect_line({"type": "bye", "reason": "busy"}, conn="b"), closed(conn="b"),
+        send(spawn_line(5)), ev("spawn", {"entity": 5})], config=TK,
+         note="a second connection still gets busy before its hello is read")
+    for tag, v in (("any", "anything at all"), ("empty", ""), ("300_bytes", "t" * 300), ("null", None)):
+        case("sess.host.no_token.token_%s_ignored" % tag, "6.2, 8", "host", [
+            {"op": "connect"}, send(hello(token=v)), expect_line(host_reply, exact=True), ev("connected")],
+             note="a host without a token does not look at the field's value or length")
+    case("sess.host.no_token.token_not_a_string_is_a_protocol_error", "6.2, 8", "host", [
+        {"op": "connect"}, send(hello(token=True))] + bye_closed + [ev("handshake_failed")],
+         note="the field is parsed like any other even when it is not used")
+    case("sess.guest.token.hello_carries_token", "6.2", "guest", [
+        {"op": "accept"}, expect_line(dict(guest_hello, token=TOKEN), exact=True),
+        send(hello(role="host", game="vector host", session=SESSION)), ev("connected", {"session": SESSION})],
+         config=TK, note="a guest with a token sends it, and nothing else is added")
+    case("sess.guest.token.hello_carries_multibyte_token", "6.2", "guest", [
+        {"op": "accept"}, expect_line(dict(guest_hello, token=mb), exact=True)], config={"token": mb})
+    case("sess.guest.token.no_token_no_field", "6.2", "guest", [
+        {"op": "accept"}, expect_line(guest_hello, exact=True)], note="a guest without a token sends no token field")
+    case("sess.guest.token.unauthorized_ends_the_handshake", "6.2, 6.1", "guest", [
+        {"op": "accept"}, expect_line(dict(guest_hello, token=TOKEN)),
+        send('{"type":"bye","reason":"unauthorized"}\n'), closed(), ev("handshake_failed"), noev("connected", 100)],
+         config=TK, note="the guest closes without a bye of its own")
+    case("sess.guest.token.host_hello_with_token_is_ignored", "6.2, 8", "guest", [
+        {"op": "accept"}, expect_line(guest_hello),
+        send(hello(role="host", session=SESSION, token="the host never sends this")), ev("connected")],
+         note="a guest parses a token in a host's hello and ignores it")
+    case("sess.guest.token.host_hello_with_token_not_a_string_refused", "6.2, 8", "guest", [
+        {"op": "accept"}, expect_line(guest_hello), send(hello(role="host", session=SESSION, token=7))]
+         + bye_closed + [ev("handshake_failed")])
+    return cases
+
+
+# ---------------------------------------------------------------------------------------------
+# endpoints.json (revision 6, section 6.2)
+
+def endpoint_cases():
+    cases = []
+
+    def ok(id_, text, port, token, note=None, **kw):
+        c = {"id": id_, "section": "6.2", "expect": "ok", "text": text, "control_port": port, "token": token}
+        c.update(kw)
+        if note:
+            c["note"] = note
+        cases.append(c)
+
+    def refused(id_, why, text=None, text_hex=None, **kw):
+        c = {"id": id_, "section": "6.2", "expect": "refused", "why": why}
+        if text_hex is not None:
+            c["text_hex"] = text_hex
+        elif text is not None:
+            c["text"] = text
+        c.update(kw)
+        cases.append(c)
+
+    E = lambda **kw: json.dumps(kw, separators=(",", ":"), ensure_ascii=False)
+    base = E(control_port=47800, token=TOKEN)
+    ok("ep.ok.contract_example_form", base, 47800, TOKEN, "what a host writes")
+    ok("ep.ok.trailing_newline", base + "\n", 47800, TOKEN)
+    ok("ep.ok.trailing_crlf", base + "\r\n", 47800, TOKEN)
+    ok("ep.ok.key_order_and_spaces", ' { "token" : "%s" ,\t"control_port" : 47800 } ' % TOKEN, 47800, TOKEN)
+    ok("ep.ok.unknown_fields_ignored", E(control_port=47800, token=TOKEN, pid=1234, extra={"a": [1, 2]}), 47800, TOKEN)
+    ok("ep.ok.port_1", E(control_port=1, token=TOKEN), 1, TOKEN)
+    ok("ep.ok.port_65535", E(control_port=65535, token=TOKEN), 65535, TOKEN)
+    ok("ep.ok.token_1_byte", E(control_port=47800, token="a"), 47800, "a")
+    ok("ep.ok.token_256_bytes", E(control_port=47800, token="t" * 256), 47800, "t" * 256)
+    ok("ep.ok.token_multibyte_256_bytes", E(control_port=47800, token="\u00e9" * 128), 47800, "\u00e9" * 128)
+    ok("ep.ok.token_escaped", '{"control_port":47800,"token":"\\u0030\\u0031"}', 47800, "01")
+    ok("ep.ok.duplicate_key_last_wins", '{"control_port":1,"token":"a","control_port":2,"token":"b"}', 2, "b")
+    pad = 4096 - len(E(control_port=47800, token=TOKEN, pad=""))
+    ok("ep.ok.exactly_4096_bytes", E(control_port=47800, token=TOKEN, pad="p" * pad), 47800, TOKEN)
+    ok("ep.ok.mode_0400", base, 47800, TOKEN, "owner read only is fine", mode="0400")
+    refused("ep.bad.4097_bytes", "at most 4096 bytes", E(control_port=47800, token=TOKEN, pad="p" * (pad + 1)))
+    refused("ep.bad.4096_bytes_and_a_newline", "at most 4096 bytes, newline included",
+            E(control_port=47800, token=TOKEN, pad="p" * pad) + "\n")
+    refused("ep.bad.empty_file", "not a JSON object", "")
+    refused("ep.bad.not_json", "not a JSON object", "control_port=47800 token=%s" % TOKEN)
+    refused("ep.bad.array", "not a JSON object", "[47800,\"%s\"]" % TOKEN)
+    refused("ep.bad.two_objects", "one object", base + "\n" + base + "\n")
+    refused("ep.bad.newline_inside", "the text is one control line: a newline ends it",
+            '{"control_port":47800,\n"token":"%s"}' % TOKEN)
+    refused("ep.bad.byte_order_mark", "a byte order mark is not whitespace",
+            text_hex=(b"\xef\xbb\xbf" + base.encode()).hex())
+    refused("ep.bad.not_utf8", "the file is UTF-8", text_hex=(b'{"control_port":47800,"token":"\xff"}').hex())
+    for tag, v in (("0", 0), ("65536", 65536), ("negative", -1), ("string", "47800"), ("fraction", 47800.5),
+                   ("null", None), ("bool", True)):
+        refused("ep.bad.port_" + tag, "control_port is an integer, 1 ..= 65535", E(control_port=v, token=TOKEN))
+    refused("ep.bad.port_not_an_integer_literal", "an integer is digits only", '{"control_port":4.78e4,"token":"%s"}' % TOKEN)
+    refused("ep.bad.port_missing", "control_port is required", E(token=TOKEN))
+    for tag, v in (("empty", ""), ("257_bytes", "t" * 257), ("multibyte_258_bytes", "\u00e9" * 129), ("number", 7),
+                   ("null", None), ("array", [TOKEN])):
+        refused("ep.bad.token_" + tag, "token is a string of 1 ..= 256 bytes", E(control_port=47800, token=v))
+    refused("ep.bad.token_missing", "token is required", E(control_port=47800))
+    refused("ep.bad.token_nul", "U+0000 in a string is an error", '{"control_port":47800,"token":"a\\u0000b"}')
+    refused("ep.bad.lone_surrogate", "a surrogate escape must be a pair", '{"control_port":47800,"token":"\\ud800"}')
+    refused("ep.bad.mode_0644", "readable by others", base, mode="0644", skip_on=["windows"])
+    refused("ep.bad.mode_0640", "readable by the group", base, mode="0640", skip_on=["windows"])
+    refused("ep.bad.mode_0602", "writable by others", base, mode="0602", skip_on=["windows"])
+    refused("ep.bad.missing", "no file: the host is not running", path_kind="missing")
+    refused("ep.bad.directory", "not a regular file", path_kind="directory")
+    refused("ep.bad.fifo", "not a regular file, and opening a FIFO for reading would block", path_kind="fifo",
+            skip_on=["windows"])
     return cases
 
 
@@ -1905,6 +2092,7 @@ def main():
         "datagrams.json": ("datagrams", datagram_cases()),
         "pixelfiles.json": ("pixelfiles", pixel),
         "sessions.json": ("sessions", sessions()),
+        "endpoints.json": ("endpoints", endpoint_cases()),
     }
     for c in docs["control.json"][1]:
         if "line" in c:

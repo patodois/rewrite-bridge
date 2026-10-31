@@ -2,7 +2,7 @@
 
 Every host/guest pair among the four implementations of the link (Rust in `examples/interop_peer.rs`, Java in
 `link-java`, C in `link-c`, C# in `link-cs`) runs the same scripted session over real sockets and a real pixel
-file, 16 pairs in all. `run.sh` runs the matrix; `check_results.py` judges the two result lines of each pair.
+file, 16 pairs in all, each in three modes (below): 48 runs. `run.sh` runs the matrix; `check_results.py` judges the two result lines of each pair.
 `.github/workflows/link-interop.yml` runs it on Linux with the other repositories checked out at the revisions
 pinned in `pins.txt`.
 
@@ -10,10 +10,14 @@ pinned in `pins.txt`.
 
 Each implementation provides a program, `interop_peer`, with one command line:
 
-    interop_peer host|guest --port PORT --label LABEL
+    interop_peer host  --port PORT --label LABEL [--endpoint FILE [--expect-unauthorized]]
+    interop_peer guest --port PORT --label LABEL [--endpoint FILE [--wrong-token]]
 
 `host` listens on control port `PORT` (UDP port 0). `guest` connects to `PORT` (UDP port 0), retrying until a
-host answers. Both use heartbeat 100 ms and timeout 3000 ms, and the game name `interop host (LABEL)` or
+host answers. With `--endpoint` (contract revision 6, section 6.2) the host has a token, which its library generates,
+and the library writes `FILE` after binding (`PORT` is 0 then, so the file is the only place the port can be read
+from) and removes it when the host closes its link; the guest gives its library `FILE` as its endpoint file, so the
+library reads the port and the token from it before connecting, and ignores `PORT`. See "Modes". Both use heartbeat 100 ms and timeout 3000 ms, and the game name `interop host (LABEL)` or
 `interop guest (LABEL)`. A peer gives up, and fails, 30 seconds after it started or when a step below waits more
 than 10 seconds. It prints log lines of its own choosing, and as its **last stdout line** exactly one line
 
@@ -39,6 +43,9 @@ keys (a count is an integer; `stats` is `null` when the library has no counters)
 | `frames_bad` | frames announced but missing or wrong |
 | `focus` | focus events seen, in order, as strings `"<focus>:<kind>"`: `<focus>` is the `focus` value the event carries (`host` or `guest`), `<kind>` is `request` when the event says the peer asked for it (what a host sees) and `set` when the peer set it (what a guest sees) |
 | `lost_reason` | the reason text of the `Lost` event, or `null` |
+| `mode` | `plain` (no `--endpoint`), `token` (`--endpoint`) or `wrong-token` (`--expect-unauthorized`, `--wrong-token`) |
+| `connected` | whether a `Connected` event was seen |
+| `handshake_failed` | the reason texts of the `HandshakeFailed` events, in order |
 | `stats` | `{"malformed","foreign","stale","unknown_entity","spawn_ignored"}` from the library's counters, or `null`. Read when the rounds are over: by the host just before it sends its `despawn` of 3, by the guest on seeing that despawn. (Later, a heartbeat of the other side still in flight when the session ends is legitimately "foreign" to a link that is no longer in a session.) `check_results.py` expects every counter to be 0, except that a guest may count one `foreign`: the host sends a `Heartbeat` immediately after its `hello` line, on another socket, and the guest can read that datagram before the line, when it has no session yet. |
 
 ## The session
@@ -93,11 +100,29 @@ guest's is 7 (provider `Warframe`, asset `/Lotus/Characters/Excalibur`, name `Ex
 * `Pixels k` (`W = 64`, `H = 48`, `i` = byte index): `rgba[i] = (37 i + 11 k + 5) mod 256`, except that pixel 0
   (bytes 0 to 3) is `0,0,0,0`. `depth[p]` for pixel `p`: `+inf` for `p` = 0, else `0.5 (p + 1) + k`.
 
+## Modes
+
+* `plain`: no token, as before revision 6.
+* `token`: the host runs with `--port 0 --endpoint FILE`, the guest with `--endpoint FILE`. The session is the one
+  above, with the same checks. The driver also checks that the file has mode 0600 while the host runs, that it is
+  gone after the host exits, and that neither peer's output contains the token.
+* `wrong-token`: the host runs with `--port 0 --endpoint FILE --expect-unauthorized`, the guest with
+  `--endpoint FILE --wrong-token`. The guest reads `FILE` with its library's reader and connects to its port with the
+  file's token with the last character replaced (`0` by `1`, anything else by `0`), without giving its library the
+  file. The host's link answers with `bye` `unauthorized`. The guest waits for its `HandshakeFailed` event, checks that
+  the reason contains `unauthorized` and that no `Connected` came, and closes its link at once (before its library
+  would reconnect). The host waits for a `HandshakeFailed` event, checks that its reason contains `unauthorized`,
+  polls 300 ms more, checks that no `Connected` came, and closes its link. Both print a result line with `ok`,
+  `failures`, `mode`, `connected` (false), `handshake_failed` and the other keys at their empty values (counts 0,
+  lists empty, `peer_game`, `protocol`, `session` and `lost_reason` null, `stats` null or the counters). The driver
+  checks the file as in `token` mode, and that neither peer's output contains the right token or the wrong one.
+
 ## The driver
 
-    tests/interop/run.sh [--build] [--no-matrix] [HOST_IMPL:GUEST_IMPL ...]
+    tests/interop/run.sh [--build] [--modes plain,token,wrong-token] [HOST_IMPL:GUEST_IMPL ...]
 
-`HOST_IMPL` and `GUEST_IMPL` are `rust`, `java`, `c`, `cs`; without arguments all 16 pairs run. Where the
+`HOST_IMPL` and `GUEST_IMPL` are `rust`, `java`, `c`, `cs`; without arguments all 16 pairs run, in every mode named
+by `--modes` (default: all three). Where the
 peers are:
 
 * `--build` builds them first: `cargo build --release --features link --example interop_peer` here, and in the
@@ -108,7 +133,8 @@ peers are:
   (the driver appends `host|guest --port ... --label ...`), for example
   `RBL_PEER_JAVA="java -cp link-java/build/classes/java/main:link-java/build/classes/java/test dev.patodois.rewritelink.InteropPeer"`.
 
-Each pair gets its own port from 47810 and its logs in `$RBL_LOG_DIR` (default: a new temporary directory,
-printed). A pair passes when both peers exit 0 and `check_results.py` accepts their result lines: the cross
+Each plain run gets its own port from 47810 (the other modes use port 0), and its logs in `$RBL_LOG_DIR` (default: a
+new temporary directory, printed). The endpoint files go to a private temporary directory of their own, never into
+the log directory. A pair passes when both peers exit 0 and `check_results.py` accepts their result lines: the cross
 checks (equal sessions, the expected counts of each side, `lost_reason` containing `bye`, every `stats` counter
 that exists zero) are in that script.

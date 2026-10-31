@@ -13,7 +13,7 @@ on:
 
 jobs:
   interop:
-    name: 16 host/guest pairs (ubuntu-latest)
+    name: 16 host/guest pairs x 3 modes (ubuntu-latest)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,7 +52,7 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 8.0.x
-      - name: Build the four peers and run the 16 pairs
+      - name: Build the four peers and run the 16 pairs in three modes (48 runs)
         run: tests/interop/run.sh --build
         env:
           RBL_LINK_JAVA_DIR: ${{ github.workspace }}/peers/link-java
