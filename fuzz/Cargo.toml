@@ -1,0 +1,64 @@
+[package]
+name = "rewrite-bridge-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "cargo-fuzz targets for the decoders of rewrite-bridge (nightly toolchain; not part of the published package or of CI)"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+rewrite-bridge = { path = "..", features = ["link"] }
+
+# Not a member of the root workspace: the stable build and CI never see this crate.
+[workspace]
+
+[profile.release]
+debug = 1
+# Arithmetic overflow is one of the failures this crate hunts for.
+overflow-checks = true
+
+[[bin]]
+name = "decode_datagram"
+path = "fuzz_targets/decode_datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_parse"
+path = "fuzz_targets/control_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "endpoint_parse"
+path = "fuzz_targets/endpoint_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_reader"
+path = "fuzz_targets/frame_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake"
+path = "fuzz_targets/handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reproject"
+path = "fuzz_targets/reproject.rs"
+test = false
+doc = false
+bench = false
