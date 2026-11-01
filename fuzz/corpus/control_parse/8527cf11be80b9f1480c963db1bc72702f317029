@@ -1,0 +1,1 @@
+{"type":"hello","role":"guest","game":"e","protocol":1,"min_protocol":1,"udp_port":0,"heartbeat_ms":50,"timeout_ms":2}

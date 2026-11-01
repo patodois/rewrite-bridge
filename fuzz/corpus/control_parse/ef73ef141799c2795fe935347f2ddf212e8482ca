@@ -1,0 +1,1 @@
+{"type":"hello","role":"guest","game":"Warfite","protocol":1,"min_protocol":1,"udp_port":53001,"heartbeat_ms":2,"timeout_ms":2000,"session":7}

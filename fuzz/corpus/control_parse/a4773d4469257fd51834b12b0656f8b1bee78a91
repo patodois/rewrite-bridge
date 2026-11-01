@@ -1,0 +1,1 @@
+{"type":"hello","role":"guest","game":"Wwrie","protocol":0,"min_protocol":1,"udp_port":0,"heartbeat_ms":250,"timeout_ms":2000}

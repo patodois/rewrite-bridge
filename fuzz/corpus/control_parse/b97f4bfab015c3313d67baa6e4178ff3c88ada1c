@@ -1,0 +1,1 @@
+{"type":"hello","role":"host","game":"dere","protocol":1,"min_protocol":1,"udp_port":5,"heartbeat_ms":250,"timeout_ms":200,"session":280001,"token":""}

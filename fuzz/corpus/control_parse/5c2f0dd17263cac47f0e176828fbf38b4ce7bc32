@@ -1,0 +1,1 @@
+{"type":"hello","role":"guest","game":"Warframerewrite","protocol":2,"min_protocol":1,"udp_port":53001,"heartin_protocol":1,"naderudp_port":53001,"heartbeat_ms":250,"tbeat_m~":250,"timeout_ms":2,"typetoken":"0122f"}

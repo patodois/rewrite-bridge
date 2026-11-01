@@ -1,0 +1,1 @@
+{"type":"hello","role":"guest","game":"Warme rewrite","protocol":65535,"min_protocol":65535,"udp_port":53001,"heartbeat_ms":250,"timeout_ms":2000}

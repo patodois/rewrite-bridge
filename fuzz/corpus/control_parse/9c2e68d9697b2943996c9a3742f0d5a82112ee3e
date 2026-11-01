@@ -1,0 +1,1 @@
+{"type":"hello","role":"guest","game":"Warfe","protocol":1,"min_protocol":1,"udp_port":5301,"heartbeat_ms":250,"timeout_ms":2000,"session":null}
