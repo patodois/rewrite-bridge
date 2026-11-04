@@ -10,6 +10,9 @@ assets from the player's own install, like IW4L) and **passthrough or mash-up mo
 games that share one world). It gives them one set of model, animation and scene types, a `Provider`
 trait that each game's reader implements, and a small protocol for linking two running games.
 
+**Adding a game to a passthrough?** [`docs/INTEGRATING.md`](docs/INTEGRATING.md) says whether to build a host, a guest or a
+provider, gives a working loop in Rust, C, C# and Java, and tests it with no second game.
+
 - A **game rewrite** runs an existing game on a new engine. It ships no game data: it reads the files
   of the copy the player already owns. A reader for one game's formats is called a *provider* here.
 - A **passthrough** (or **mash-up**) puts one game's things into another, like the mod that lets a
@@ -49,7 +52,7 @@ the [glossary](#glossary).
 | [hytale-unpack](https://github.com/patodois/hytale-unpack) | Provider for Hytale: entity models, animations, blocks and prefabs. |
 | [nocturne-unpack](https://github.com/patodois/nocturne-unpack) | Provider for Shin Megami Tensei III Nocturne HD Remaster: demons with their animations, and fields. |
 | [bridge-testbed](https://github.com/patodois/bridge-testbed) | The visual and physics testbed: loads items from every provider side by side. |
-| Host plugins for Hytale and Minecraft | Not published yet. |
+| [minecraft-link](https://github.com/patodois/minecraft-link) | Host and guest mod for Minecraft: Java Edition on Fabric, Quilt, NeoForge and Forge. The Hytale plugin is not public. |
 
 Add yours with a pull request or an issue once it is public.
 
@@ -515,7 +518,7 @@ cargo run --release --features link --example fake_guest -- --frames --seconds 1
 - **`--in-front` on the guest** is for a real game's host. By default the cube stands at the world
   origin, which is where `fake_host` expects it. With `--in-front` it stands 4 m ahead of the first
   camera the host sends, on the ground the host reports as collision, because a real game's player is
-  rarely near the origin. Host plugins for real games are not published yet; any host that speaks
+  rarely near the origin. The Minecraft host is [minecraft-link](https://github.com/patodois/minecraft-link) and the Hytale plugin is not public; any host that speaks
   [`docs/CONTRACT.md`](docs/CONTRACT.md) will do, in any language.
 
 ## Glossary
