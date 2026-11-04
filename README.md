@@ -426,13 +426,19 @@ same user; the contract says what it protects and what it does not.
 threads, no process ids and no `/dev/urandom`, and only the sockets and folders its runtime grants (TCP and
 UDP on `127.0.0.1`, and a folder for the endpoint file). There:
 
-- a guest connects inside `poll`, waiting at most 100 ms for it (an accept or a refusal takes well under a
-  millisecond on loopback, but a host that never accepts leaves the connect hanging), instead of on a helper
-  thread with a one-second timeout. A poll can therefore take 100 ms in that case, after every
-  `reconnect`;
-- random bytes come from WASI through the `getrandom` crate, a dependency of WASI targets only;
-- there are no memory-mapped files, so `FrameWriter` and `FrameReader` return an `Unsupported` error, and the
-  4 MiB receive buffer is not requested;
+- a guest connects inside `poll`, waiting at most 100 ms for it, instead of on a helper thread with a
+  one-second timeout. A connect to a listener with room took 0.2 to 0.7 ms and a refusal 0.2 ms in the
+  measurements on macOS, but a host that never accepts leaves the connect hanging, so a poll can take 100 ms
+  after every `reconnect`. Where a refusal is slow (a refused connect to localhost can take about two seconds
+  on Windows) the guest reports `timed out` after each 100 ms, not `connection refused`;
+- random bytes come from WASI through the `getrandom` crate, and the UDP socket is the WASI one through the
+  `wasip2` crate (receiving through `std` leaks the payload of every datagram there); both are dependencies
+  of WASI targets only, and the 4 MiB receive buffer of section 2 is asked for and granted;
+- there are no memory-mapped files, so `FrameWriter` and `FrameReader` return an `Unsupported` error;
+- a connection whose peer holds the socket open and stops reading is not closed at once, because closing it
+  would wait for the peer: it is set aside and closed when the peer reads or exits. With four of them set aside
+  a `Link` takes no new connection (`last_error` says so). The four are counted for the whole component, not
+  per `Link`, so unrelated `Link`s in it share them; native has no such limit;
 - a component cannot ask for a file mode, so the endpoint file cannot be created `0600` as section 6.2 asks.
   It gets what the host process's umask leaves: 0644 under the usual umask 022, 0600 under 077, 0666 under
   000 (measured). Under 022 the token is readable by other users and a native guest refuses the file, so
@@ -445,7 +451,7 @@ that no host is listening. CI runs `tests/link_wasi.rs`, both roles in one threa
 wasmtime.
 
 Without the feature the crate still has no dependencies; with it, it uses `memmap2` and
-`serde_json` (and `libc` on Unix, `getrandom` on WASI). The link only exchanges what each process publishes about itself: it never reads
+`serde_json` (and `libc` on Unix, `getrandom` and `wasip2` on WASI). The link only exchanges what each process publishes about itself: it never reads
 another process's memory or injects code.
 
 The four implementations of the link (this crate, [link-java](https://github.com/patodois/link-java),
