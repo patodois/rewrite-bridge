@@ -419,8 +419,24 @@ let guest = Link::guest(LinkConfig { endpoint_file: Some(path), ..LinkConfig::ne
 The token keeps out other users and processes that cannot read the file, not programs running as the
 same user; the contract says what it protects and what it does not.
 
+**In a component on `wasm32-wasip2`.** The link also runs in a WebAssembly component, which has no
+threads, no process ids and no `/dev/urandom`, and only the sockets and folders its runtime grants (TCP and
+UDP on `127.0.0.1`, and a folder for the endpoint file). There:
+
+- a guest connects inside `poll`, blocking for as long as loopback takes to answer, instead of on a helper
+  thread with a one-second timeout;
+- random bytes come from WASI through the `getrandom` crate, a dependency of WASI targets only;
+- there are no memory-mapped files, so `FrameWriter` and `FrameReader` return an `Unsupported` error, and the
+  4 MiB receive buffer is not requested;
+- WASI has no file mode bits, so the endpoint file cannot be created `0600` as section 6.2 asks. It gets
+  the mode the process's umask gives; start the process with `umask 077`.
+
+`Link::last_error` says why a guest's last attempt to connect failed, which is how a plugin can show
+that no host is listening. CI runs `tests/link_wasi.rs`, both roles in one thread, on that target under
+wasmtime.
+
 Without the feature the crate still has no dependencies; with it, it uses `memmap2` and
-`serde_json`. The link only exchanges what each process publishes about itself: it never reads
+`serde_json` (and `libc` on Unix, `getrandom` on WASI). The link only exchanges what each process publishes about itself: it never reads
 another process's memory or injects code.
 
 The four implementations of the link (this crate, [link-java](https://github.com/patodois/link-java),

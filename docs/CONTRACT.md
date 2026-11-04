@@ -248,6 +248,12 @@ refuses a file that breaks any of this.
   per-user ACL of that directory is what keeps other users out. The host removes the file when it shuts
   down cleanly. A host that crashes leaves it behind; its token dies with it, since the next run makes a
   new one.
+
+  *Implementation note, no rule changes.* Where the platform has no mode bits at all, as for a WebAssembly
+  component on WASI, the file cannot be created `0600`. The rule above stands; an implementation there can
+  only create it exclusively and let the process's umask decide the mode, so the operator starts the
+  process with `umask 077`. That is a deviation the platform forces, which the implementation should
+  document, and it does not relax the rule for a platform that can set the mode.
 - **Reading (guest).** The guest reads the file and takes `control_port` and `token` from it. It refuses
   a path that does not name a regular file (symbolic links followed), and checks that before it opens the
   path, since opening a FIFO for reading would block. On Unix it also refuses a file whose permissions

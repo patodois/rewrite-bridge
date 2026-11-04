@@ -16,6 +16,9 @@
 //! [`LinkConfig::endpoint_file`] to have the host generate one and hand it, with the port, to the guest
 //! through an owner-only [`Endpoint`] file.
 //!
+//! The link also runs in a component on `wasm32-wasip2`, which has no threads and no memory-mapped files:
+//! a guest connects inside [`Link::poll`], and the pixel file is an `Unsupported` error there.
+//!
 //! The link only exchanges what each process chooses to publish. It never touches another process.
 
 use std::collections::hash_map::RandomState;
@@ -2375,8 +2378,9 @@ impl Endpoint {
     /// Writes the file atomically: a temporary file in the same directory, created exclusively and
     /// owner-only (mode 0600 on Unix, from the moment it exists), then renamed over `path`. A reader
     /// sees no file, the old one or this one, never part of it. The directory must exist; on Windows
-    /// put it under the user's local application data, whose ACL keeps other users out. Errors never
-    /// quote the token.
+    /// put it under the user's local application data, whose ACL keeps other users out. On WASI there
+    /// are no mode bits to ask for, so the file gets the mode of the process's umask (run it with `umask
+    /// 077`); that is a deviation the platform forces from section 6.2. Errors never quote the token.
     pub fn write(&self, path: &Path) -> io::Result<()> {
         check_token(&self.token)?;
         if self.control_port == 0 {
