@@ -2392,12 +2392,13 @@ impl Endpoint {
             Some(d) if !d.as_os_str().is_empty() => d,
             _ => Path::new("."),
         };
+        // The nonce keeps two writers apart (so does `create_new`, which fails rather than share a file);
+        // no process id is in the name, since `wasm32-wasip2` has none and `std::process::id` panics there.
         let mut nonce = [0u8; 4];
         os_random(&mut nonce)?;
         let tmp = dir.join(format!(
-            ".{}.{}.{:08x}.tmp",
+            ".{}.{:08x}.tmp",
             name.to_string_lossy(),
-            std::process::id(),
             u32::from_le_bytes(nonce)
         ));
         let mut text =
