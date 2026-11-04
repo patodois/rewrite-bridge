@@ -30,10 +30,14 @@ libc = { version = "0.2", optional = true }
 # target's dependency tree gets it.
 getrandom = { version = "0.3", optional = true }
 
+[target.'cfg(all(target_os = "wasi", target_env = "p2"))'.dependencies]
+# The UDP socket of the link on wasm32-wasip2: receiving through std leaks every datagram's payload there.
+wasip2 = { version = "1", optional = true }
+
 [features]
 # The passthrough link (docs/CONTRACT.md): UDP + TCP on 127.0.0.1 and a memory-mapped pixel file (not on WASI,
 # which has no memory-mapped files).
-link = ["dep:memmap2", "dep:serde_json", "dep:libc", "dep:getrandom"]
+link = ["dep:memmap2", "dep:serde_json", "dep:libc", "dep:getrandom", "dep:wasip2"]
 
 # The worked example of docs/WRITING_A_PROVIDER.md; `test = true` makes `cargo test` run its tests.
 [[example]]

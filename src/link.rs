@@ -31,7 +31,9 @@ use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
 use std::io::{self, ErrorKind, Read, Write};
 use std::mem::ManuallyDrop;
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+use std::net::UdpSocket;
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -1429,7 +1431,7 @@ pub struct Link {
     role: Role,
     cfg: LinkConfig,
     listener: Option<TcpListener>,
-    udp: UdpSocket,
+    udp: Udp,
     conn: Conn,
     focus: Role,
     seq: u32,
@@ -1466,8 +1468,42 @@ fn millis(d: Duration) -> u32 {
     d.as_millis().min(u128::from(u32::MAX)) as u32
 }
 
+/// The link's UDP socket, bound to 127.0.0.1 and non-blocking.
+///
+/// Everywhere but `wasm32-wasip2` it is a `std` socket. There the C library's `recvfrom` does not free the
+/// payload of the datagram it returns, so every datagram received through `std` leaves its own length (and the
+/// allocator's overhead) in the component's memory for good: measured with rustc 1.99.1 and wasmtime 50.0.1,
+/// 8208 bytes for one of 8192 and 32 for one of 24, with `recv`, `recv_from` and any buffer size alike, until
+/// the memory is exhausted. The same loop through the WASI interface directly stays flat, so this goes through
+/// it.
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+struct Udp(UdpSocket);
+
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+impl Udp {
+    fn bind(addr: SocketAddr) -> io::Result<Self> {
+        let udp = UdpSocket::bind(addr)?;
+        request_recv_buffer(&udp, RECV_BUFFER_BYTES);
+        udp.set_nonblocking(true)?;
+        Ok(Self(udp))
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.0.local_addr()
+    }
+
+    fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.0.recv_from(buf)
+    }
+
+    fn send_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<usize> {
+        self.0.send_to(data, addr)
+    }
+}
+
 /// Asks the OS for a UDP receive buffer of `bytes` (contract section 2: collision snapshots
 /// arrive in bursts). Best effort: the OS may grant less, or refuse, and the link works either way.
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
 fn request_recv_buffer(udp: &UdpSocket, bytes: usize) {
     let bytes = i32::try_from(bytes).unwrap_or(i32::MAX);
     #[cfg(unix)]
@@ -1505,6 +1541,124 @@ fn request_recv_buffer(udp: &UdpSocket, bytes: usize) {
     }
     #[cfg(not(any(unix, windows)))]
     let _ = (udp, bytes);
+}
+
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
+use wasip2::sockets::{
+    instance_network::instance_network,
+    network::{ErrorCode, IpAddressFamily, IpSocketAddress, Ipv4SocketAddress},
+    udp::{IncomingDatagramStream, OutgoingDatagram, OutgoingDatagramStream, UdpSocket as WasiUdp},
+    udp_create_socket::create_udp_socket,
+};
+
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
+struct Udp {
+    // Fields drop in this order, and the streams must go before the socket they came from.
+    incoming: IncomingDatagramStream,
+    outgoing: OutgoingDatagramStream,
+    _socket: WasiUdp,
+    local: SocketAddr,
+}
+
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
+impl Udp {
+    fn bind(addr: SocketAddr) -> io::Result<Self> {
+        let SocketAddr::V4(v4) = addr else {
+            return Err(ErrorKind::Unsupported.into());
+        };
+        let net = instance_network();
+        let socket = create_udp_socket(IpAddressFamily::Ipv4).map_err(wasi_error)?;
+        socket.start_bind(&net, wasi_addr(v4)).map_err(wasi_error)?;
+        loop {
+            match socket.finish_bind() {
+                Ok(()) => break,
+                Err(ErrorCode::WouldBlock) => socket.subscribe().block(),
+                Err(e) => return Err(wasi_error(e)),
+            }
+        }
+        // A receive buffer of RECV_BUFFER_BYTES (section 2); best effort, the host may grant less.
+        let _ = socket.set_receive_buffer_size(RECV_BUFFER_BYTES as u64);
+        let local = match socket.local_address().map_err(wasi_error)? {
+            IpSocketAddress::Ipv4(a) => SocketAddr::from((
+                Ipv4Addr::new(a.address.0, a.address.1, a.address.2, a.address.3),
+                a.port,
+            )),
+            IpSocketAddress::Ipv6(_) => return Err(ErrorKind::Unsupported.into()),
+        };
+        let (incoming, outgoing) = socket.stream(None).map_err(wasi_error)?;
+        Ok(Self {
+            incoming,
+            outgoing,
+            _socket: socket,
+            local,
+        })
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local)
+    }
+
+    /// One datagram, or `WouldBlock`. Like the OS, it cuts a datagram that does not fit `buf` and says so
+    /// only by the length it returns.
+    fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let mut received = self.incoming.receive(1).map_err(wasi_error)?;
+        let Some(d) = received.pop() else {
+            return Err(ErrorKind::WouldBlock.into());
+        };
+        let n = d.data.len().min(buf.len());
+        buf[..n].copy_from_slice(&d.data[..n]);
+        let from = match d.remote_address {
+            IpSocketAddress::Ipv4(a) => SocketAddr::from((
+                Ipv4Addr::new(a.address.0, a.address.1, a.address.2, a.address.3),
+                a.port,
+            )),
+            // never sent to an IPv4 socket; a source that matches no peer
+            IpSocketAddress::Ipv6(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        };
+        Ok((n, from))
+    }
+
+    fn send_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<usize> {
+        let SocketAddr::V4(v4) = addr else {
+            return Err(ErrorKind::Unsupported.into());
+        };
+        if self.outgoing.check_send().map_err(wasi_error)? == 0 {
+            return Err(ErrorKind::WouldBlock.into());
+        }
+        let datagram = OutgoingDatagram {
+            data: data.to_vec(),
+            remote_address: Some(wasi_addr(v4)),
+        };
+        match self.outgoing.send(&[datagram]).map_err(wasi_error)? {
+            0 => Err(ErrorKind::WouldBlock.into()),
+            _ => Ok(data.len()),
+        }
+    }
+}
+
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
+fn wasi_addr(a: std::net::SocketAddrV4) -> IpSocketAddress {
+    IpSocketAddress::Ipv4(Ipv4SocketAddress {
+        port: a.port(),
+        address: {
+            let [a, b, c, d] = a.ip().octets();
+            (a, b, c, d)
+        },
+    })
+}
+
+/// The kinds of error the link tells apart (would block, refused, reset); anything else keeps its WASI name.
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
+fn wasi_error(e: ErrorCode) -> io::Error {
+    let kind = match e {
+        ErrorCode::WouldBlock => ErrorKind::WouldBlock,
+        ErrorCode::ConnectionRefused => ErrorKind::ConnectionRefused,
+        ErrorCode::ConnectionReset => ErrorKind::ConnectionReset,
+        ErrorCode::AddressInUse => ErrorKind::AddrInUse,
+        ErrorCode::AccessDenied => ErrorKind::PermissionDenied,
+        _ => ErrorKind::Other,
+    };
+    io::Error::new(kind, format!("{e:?}"))
 }
 
 fn random_session() -> u32 {
@@ -1572,9 +1726,7 @@ impl Link {
             Duration::from_millis(u64::from(*lo)),
             Duration::from_millis(u64::from(*hi)),
         );
-        let udp = UdpSocket::bind(localhost(cfg.udp_port))?;
-        request_recv_buffer(&udp, RECV_BUFFER_BYTES);
-        udp.set_nonblocking(true)?;
+        let udp = Udp::bind(localhost(cfg.udp_port))?;
         let now = Instant::now();
         Ok(Self {
             role,
