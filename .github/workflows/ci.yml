@@ -98,6 +98,9 @@ jobs:
   wasm:
     name: Link on wasm32-wasip2
     runs-on: ubuntu-latest
+    # The whole job takes a few minutes. A test binary that hangs (a wasm component cannot be interrupted
+    # from inside) must fail the job, not hold it for the six hours a job may run.
+    timeout-minutes: 25
     env:
       WASMTIME_VERSION: 50.0.1
       WASMTIME_SHA256: 685466455dd42a14774a86c36c8f2e45cbb9bd6d92a850139315df60a75498a5
@@ -117,8 +120,11 @@ jobs:
       - run: wasmtime --version
       - run: cargo clippy --target wasm32-wasip2 --features link -- -D warnings
       - name: Run the link test under wasmtime
+        timeout-minutes: 12
         env:
-          CARGO_TARGET_WASM32_WASIP2_RUNNER: "wasmtime run -S inherit-network --dir /tmp::/tmp"
+          # `timeout` kills a test binary that has not finished in 5 minutes (about 10 seconds is normal) and
+          # the step fails with status 124.
+          CARGO_TARGET_WASM32_WASIP2_RUNNER: "timeout 300 wasmtime run -S inherit-network --dir /tmp::/tmp"
         run: cargo test --target wasm32-wasip2 --features link --test link_wasi
 
   # Game files, decompiled or third-party code and secrets must never reach this public repository: this runs
