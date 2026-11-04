@@ -7,7 +7,8 @@
 //! - the wire codec: [`encode_datagram`] / [`decode_datagram`] for the binary UDP datagrams and
 //!   [`Control::to_line`] / [`Control::parse`] for the JSON-lines control channel;
 //! - [`Link`], which owns the sockets, does the handshake, heartbeat and watchdog, and is driven by
-//!   a non-blocking [`Link::poll`] from a game loop or a Bevy system;
+//!   a [`Link::poll`] that does not wait on the network, from a game loop or a Bevy system (but see the
+//!   guest's connect on a target with no threads, below);
 //! - [`FrameWriter`] / [`FrameReader`] for RGBA frames, and optionally their linear depth, in a
 //!   memory-mapped file; [`compose`] has the reference CPU reprojection and depth compositing for
 //!   such frames.
@@ -17,7 +18,8 @@
 //! through an owner-only [`Endpoint`] file.
 //!
 //! The link also runs in a component on `wasm32-wasip2`, which has no threads and no memory-mapped files:
-//! a guest connects inside [`Link::poll`], and the pixel file is an `Unsupported` error there.
+//! a guest connects inside [`Link::poll`], which can wait up to 100 ms for it (a host that never accepts), and
+//! the pixel file is an `Unsupported` error there.
 //!
 //! The link only exchanges what each process chooses to publish. It never touches another process.
 
@@ -95,6 +97,13 @@ pub const RECV_BUFFER_BYTES: usize = 4 << 20;
 /// How long one connection attempt of a guest may take. It runs on a helper thread, so a slow
 /// refusal (Windows retries a refused localhost SYN for about two seconds) never blocks a poll.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a guest on a target with no threads (`wasm32-wasip2`) waits inside [`Link::poll`] for its
+/// connection. A poll is one tick of the caller's loop (50 ms at 20 ticks a second), a loopback connect to a
+/// listener with room in its accept queue takes well under a millisecond (0.2 to 0.7 ms in 20 attempts under
+/// wasmtime), and a host that never accepts
+/// (a full accept queue drops the SYN, and the system retries it for seconds) must not hold more than two
+/// ticks of that loop, repeated after every [`LinkConfig::reconnect`].
+const INLINE_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// [`Pose::flags`] bit: do not interpolate from the entity's previous pose.
 pub const POSE_TELEPORT: u32 = 1;
@@ -1354,7 +1363,8 @@ struct Assembly {
 }
 
 /// One side of a passthrough link. Create it with [`Link::host`] or [`Link::guest`], then call
-/// [`Link::poll`] once per frame or tick; it never blocks.
+/// [`Link::poll`] once per frame or tick; it does not wait on the network, except that a guest on a target with
+/// no threads (`wasm32-wasip2`) waits up to 100 ms for its connection.
 pub struct Link {
     role: Role,
     cfg: LinkConfig,
@@ -1568,9 +1578,10 @@ impl Link {
         self.stats
     }
 
-    /// Does all pending network work without blocking and returns what happened since the last
+    /// Does all pending network work without waiting for the peer and returns what happened since the last
     /// call. Call it every frame; heartbeats are sent from here, so a side that stops polling
-    /// looks dead to its peer, as intended.
+    /// looks dead to its peer, as intended. The one wait: a guest on a target with no threads
+    /// (`wasm32-wasip2`) connects here and waits up to 100 ms for a host that does not accept.
     pub fn poll(&mut self) -> Vec<Event> {
         let now = Instant::now();
         self.closing.retain_mut(|c| c.pump(now));
@@ -1645,11 +1656,17 @@ impl Link {
                     }
                 };
                 let addr = localhost(port);
-                // A target with no threads (`wasm32-wasip2`) connects right here, blocking. On loopback the
-                // answer comes at once, an accept or a refusal, so the poll is not held up; the helper thread
-                // below is for a platform that is slow to refuse.
+                // A target with no threads (`wasm32-wasip2`) connects right here, for at most
+                // `INLINE_CONNECT_TIMEOUT`; the helper thread below does not exist there.
                 if cfg!(target_os = "wasi") {
-                    let connected = TcpStream::connect(addr).and_then(Ctl::new);
+                    let connected = TcpStream::connect_timeout(&addr, INLINE_CONNECT_TIMEOUT)
+                        // On `wasm32-wasip2` this returns `Ok` for a port that refuses; only the socket's own
+                        // error tells.
+                        .and_then(|s| match s.take_error() {
+                            Ok(None) => Ok(s),
+                            Ok(Some(e)) | Err(e) => Err(e),
+                        })
+                        .and_then(Ctl::new);
                     self.conn = self.connect_done(connected, port, now);
                     return;
                 }
