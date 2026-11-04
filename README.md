@@ -57,7 +57,7 @@ Add yours with a pull request or an issue once it is public.
 
 ```toml
 [dependencies]
-rewrite-bridge = "0.2"
+rewrite-bridge = "0.3"
 ```
 
 ### One copy for the whole build
@@ -72,9 +72,9 @@ rewrite-bridge = "0.2"
 > ```
 >
 > From crates.io this takes care of itself. Cargo gives every requirement that agrees with the others
-> (`"0.2"`, `"0.2.1"`, `"^0.2.1"`) the same release and builds it once, so the `rewrite-bridge = "0.2"`
-> in your crate and the `0.2.1` that a provider asks for are one crate. Before 1.0 the minor number is
-> the breaking one: a `"0.3"` anywhere in the build would be a second copy, and the error above. Stay
+> (`"0.3"`, `"0.3.1"`, `"^0.3.1"`) the same release and builds it once, so the `rewrite-bridge = "0.3"`
+> in your crate and the `0.3.1` that a provider asks for are one crate. Before 1.0 the minor number is
+> the breaking one: a `"0.4"` anywhere in the build would be a second copy, and the error above. Stay
 > on one `0.x` line, as the providers and `rewrite-bridge-bevy` do.
 >
 > A second copy can still come from another source. Cargo treats a `git` dependency (such as the
@@ -86,12 +86,12 @@ rewrite-bridge = "0.2"
 > error: specification `rewrite-bridge` is ambiguous
 > help: re-run this command with one of the following specifications
 >   rewrite-bridge@0.1.0
->   rewrite-bridge@0.2.1
+>   rewrite-bridge@0.3.1
 > ```
 >
 > `cargo tree -d` lists the duplicated crates and the crates that pull each copy in. Fix it by moving
 > every dependency to crates.io: replace the `git` and `tag` lines of `rewrite-bridge` and
-> `rewrite-bridge-bevy` with `"0.2"`, and use a provider revision that does the same.
+> `rewrite-bridge-bevy` with `"0.3"`, and use a provider revision that does the same.
 
 ### Rust and build times
 
@@ -329,8 +329,8 @@ models with skins, animations with sockets, and scenes. A Rust game rewrite need
 
 ```toml
 [dependencies]
-rewrite-bridge = "0.2"
-rewrite-bridge-bevy = "0.2"
+rewrite-bridge = "0.3"
+rewrite-bridge-bevy = "0.3"
 ```
 
 Both come from crates.io and are built once whatever else you combine, providers included (see
@@ -393,7 +393,7 @@ use rewrite_bridge::link::{Event, Link, LinkConfig};
 
 let mut link = Link::guest(LinkConfig::new("My Game"))?;
 // Every frame or tick, e.g. in a Bevy system:
-for event in link.poll() {            // never blocks
+for event in link.poll() {            // does not wait on the network
     if let Event::Camera { camera, .. } = event {
         // place your world relative to the host's camera, then link.send_poses(&[...])
     }
@@ -423,13 +423,19 @@ same user; the contract says what it protects and what it does not.
 threads, no process ids and no `/dev/urandom`, and only the sockets and folders its runtime grants (TCP and
 UDP on `127.0.0.1`, and a folder for the endpoint file). There:
 
-- a guest connects inside `poll`, blocking for as long as loopback takes to answer, instead of on a helper
-  thread with a one-second timeout;
+- a guest connects inside `poll`, waiting at most 100 ms for it (an accept or a refusal takes well under a
+  millisecond on loopback, but a host that never accepts leaves the connect hanging), instead of on a helper
+  thread with a one-second timeout. A poll can therefore take 100 ms in that case, after every
+  `reconnect`;
 - random bytes come from WASI through the `getrandom` crate, a dependency of WASI targets only;
 - there are no memory-mapped files, so `FrameWriter` and `FrameReader` return an `Unsupported` error, and the
   4 MiB receive buffer is not requested;
-- WASI has no file mode bits, so the endpoint file cannot be created `0600` as section 6.2 asks. It gets
-  the mode the process's umask gives; start the process with `umask 077`.
+- a component cannot ask for a file mode, so the endpoint file cannot be created `0600` as section 6.2 asks.
+  It gets what the host process's umask leaves: 0644 under the usual umask 022, 0600 under 077, 0666 under
+  000 (measured). Under 022 the token is readable by other users and a native guest refuses the file, so
+  that host cannot serve it, and a guest on this target has no mode check to lose or apply. Start the process
+  with `umask 077`, or keep the file in a folder only you can enter. On a Windows host there is no umask: the
+  folder's ACL is what counts.
 
 `Link::last_error` says why a guest's last attempt to connect failed, which is how a plugin can show
 that no host is listening. CI runs `tests/link_wasi.rs`, both roles in one thread, on that target under
