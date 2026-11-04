@@ -2323,7 +2323,13 @@ fn os_random(buf: &mut [u8]) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(target_os = "wasi")]
+fn os_random(buf: &mut [u8]) -> io::Result<()> {
+    // WASI `random`, which the runtime fills from the operating system's generator.
+    getrandom::fill(buf).map_err(|_| io::Error::other("the WASI random number generator failed"))
+}
+
+#[cfg(not(any(unix, windows, target_os = "wasi")))]
 fn os_random(_buf: &mut [u8]) -> io::Result<()> {
     Err(io::Error::new(
         ErrorKind::Unsupported,

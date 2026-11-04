@@ -25,9 +25,15 @@ serde_json = { version = "1", optional = true }
 # O_NONBLOCK and setsockopt (SO_RCVBUF) for the link; memmap2 already brings libc in on Unix.
 libc = { version = "0.2", optional = true }
 
+[target.'cfg(target_os = "wasi")'.dependencies]
+# Random bytes for the link's token (WASI has no /dev/urandom and no libc::getrandom); WASI only, so no other
+# target's dependency tree gets it.
+getrandom = { version = "0.3", optional = true }
+
 [features]
-# The passthrough link (docs/CONTRACT.md): UDP + TCP on 127.0.0.1 and a memory-mapped pixel file.
-link = ["dep:memmap2", "dep:serde_json", "dep:libc"]
+# The passthrough link (docs/CONTRACT.md): UDP + TCP on 127.0.0.1 and a memory-mapped pixel file (not on WASI,
+# which has no memory-mapped files).
+link = ["dep:memmap2", "dep:serde_json", "dep:libc", "dep:getrandom"]
 
 # The worked example of docs/WRITING_A_PROVIDER.md; `test = true` makes `cargo test` run its tests.
 [[example]]
