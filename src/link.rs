@@ -2609,6 +2609,18 @@ pub enum FrameMiss {
     Gone,
 }
 
+/// Fails where the pixel file cannot work: it is memory-mapped, and where the platform has no memory-mapped
+/// files (`wasm32-wasip2`) memmap2 is a stub that fails, but only after a writer has made the file.
+fn pixel_file_supported() -> io::Result<()> {
+    if cfg!(not(any(unix, windows))) {
+        return Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "the pixel file needs memory-mapped files, which this platform does not have",
+        ));
+    }
+    Ok(())
+}
+
 /// Writes RGBA frames, and optionally their depth, into a memory-mapped pixel file (contract
 /// section 9.6).
 pub struct FrameWriter {
@@ -2634,6 +2646,7 @@ impl FrameWriter {
 
     /// Like [`create`](Self::create), with the options of [`FrameFileOptions`], e.g. a depth plane.
     pub fn create_with(path: &Path, opts: &FrameFileOptions) -> io::Result<Self> {
+        pixel_file_supported()?;
         let invalid = |m: &str| io::Error::new(ErrorKind::InvalidInput, m.to_owned());
         let FrameFileOptions {
             width,
@@ -2719,6 +2732,7 @@ impl FrameWriter {
 
     /// [`create_temp`](Self::create_temp) with [`FrameFileOptions`].
     pub fn create_temp_with(tag: &str, opts: &FrameFileOptions) -> io::Result<Self> {
+        pixel_file_supported()?;
         static NEXT: AtomicU32 = AtomicU32::new(0);
         // A crashed run may have left a file with this process id's name behind; skip its path.
         for _ in 0..64 {
@@ -2965,6 +2979,7 @@ impl FrameReader {
     /// is opened and the file is opened non-blocking where the OS has that, so a FIFO the peer
     /// names cannot stall the caller.
     pub fn open(path: &Path) -> io::Result<Self> {
+        pixel_file_supported()?;
         let bad = |m: &str| io::Error::new(ErrorKind::InvalidData, m.to_owned());
         let file = open_regular(path)?;
         let file_len = file.metadata()?.len();
