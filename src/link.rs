@@ -23,12 +23,10 @@
 //!
 //! The link only exchanges what each process chooses to publish. It never touches another process.
 
-use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::hash::{BuildHasher, Hasher};
 use std::io::{self, ErrorKind, Read, Write};
 use std::mem::ManuallyDrop;
 #[cfg(not(all(target_os = "wasi", target_env = "p2")))]
@@ -1661,19 +1659,15 @@ fn wasi_error(e: ErrorCode) -> io::Error {
     io::Error::new(kind, format!("{e:?}"))
 }
 
-fn random_session() -> u32 {
-    // A session number is a fresh random one (contract section 6, step 3): from the operating system's
-    // generator, like a token.
+/// A fresh random session number (contract section 6, step 3), from the operating system's generator, like a
+/// token. If the generator fails there is no number: the handshake fails with a `bye` rather than go on with a
+/// weaker one. The number is what binds the datagrams to the session (section 6.2), `generate_token` makes the
+/// same choice, and a generator that fails is a machine the link should not be trusted on. (The hash of
+/// `RandomState`, which was the fallback, may be deterministic on WASI: `wasi:random/insecure-seed` says so.)
+fn random_session() -> Option<u32> {
     let mut b = [0u8; 4];
-    if os_random(&mut b).is_ok() {
-        return u32::from_le_bytes(b).max(1);
-    }
-    // Only if that fails. `RandomState` has per-process keys from the platform's seed source, which on some
-    // targets may be deterministic (WASI's `insecure-seed`), so this is the weaker choice. It has no process
-    // id: `wasm32-wasip2` has none, and `std::process::id` panics there.
-    let mut h = RandomState::new().build_hasher();
-    h.write_u64(now_us());
-    (h.finish() as u32).max(1)
+    os_random(&mut b).ok()?;
+    Some(u32::from_le_bytes(b).max(1))
 }
 
 impl Link {
@@ -1785,9 +1779,10 @@ impl Link {
     /// port failed. The text never holds a token. A host that refuses the guest after the connection is up
     /// is reported by [`Event::HandshakeFailed`] instead.
     ///
-    /// Either role, on `wasm32-wasip2`: why it is taking no new connection, while four connections whose
-    /// peers stopped reading are still set aside. A host has no other reason, and clears it
-    /// when it is under the limit again.
+    /// Either role, on `wasm32-wasip2` only: why it is taking no new connection, while four connections whose
+    /// peers stopped reading are still set aside. The four are counted for the whole component, not per `Link`:
+    /// unrelated `Link`s in it share them, and one can be held up by another's peers. A host has no other
+    /// reason, and clears it when it is under the limit again. Elsewhere there is no such limit.
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
@@ -2109,7 +2104,10 @@ impl Link {
                         true,
                     )
                 })?;
-                (v, random_session())
+                let session = random_session().ok_or_else(|| {
+                    ("no source of random bytes for the session".to_owned(), true)
+                })?;
+                (v, session)
             }
             Role::Guest => {
                 if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&h.protocol) {
