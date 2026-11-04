@@ -1448,8 +1448,15 @@ fn request_recv_buffer(udp: &UdpSocket, bytes: usize) {
 }
 
 fn random_session() -> u32 {
-    // `RandomState` has keys the operating system chose for this process, so no process id is needed (and
-    // `wasm32-wasip2` has none: `std::process::id` panics there).
+    // A session number is a fresh random one (contract section 6, step 3): from the operating system's
+    // generator, like a token.
+    let mut b = [0u8; 4];
+    if os_random(&mut b).is_ok() {
+        return u32::from_le_bytes(b).max(1);
+    }
+    // Only if that fails. `RandomState` has per-process keys from the platform's seed source, which on some
+    // targets may be deterministic (WASI's `insecure-seed`), so this is the weaker choice. It has no process
+    // id: `wasm32-wasip2` has none, and `std::process::id` panics there.
     let mut h = RandomState::new().build_hasher();
     h.write_u64(now_us());
     (h.finish() as u32).max(1)
