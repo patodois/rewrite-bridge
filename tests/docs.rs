@@ -51,9 +51,12 @@ fn anchors(text: &str) -> Vec<String> {
 }
 
 /// Every relative link of the Markdown files points at a file or folder that exists, and a link to
-/// a heading points at a heading that exists.
+/// a heading points at a heading that exists. The Bevy plugin is a separate package of the workspace and
+/// is not in the package of this crate (see `Cargo.toml`), so where it is absent, as in the crate
+/// downloaded from crates.io, its README and the links that lead into it are left out.
 #[test]
 fn relative_links_resolve() {
+    let with_bevy = root().join("rewrite-bridge-bevy").exists();
     for file in [
         "README.md",
         "docs/WRITING_A_PROVIDER.md",
@@ -61,6 +64,9 @@ fn relative_links_resolve() {
         "docs/INTEGRATING.md",
         "rewrite-bridge-bevy/README.md",
     ] {
+        if !with_bevy && file.starts_with("rewrite-bridge-bevy") {
+            continue;
+        }
         let text = read(file);
         let dir = Path::new(file).parent().unwrap();
         let mut in_code = false;
@@ -80,6 +86,9 @@ fn relative_links_resolve() {
                     continue;
                 }
                 let (path, anchor) = target.split_once('#').unwrap_or((target, ""));
+                if !with_bevy && path.contains("rewrite-bridge-bevy") {
+                    continue;
+                }
                 let full = if path.is_empty() {
                     root().join(file)
                 } else {
