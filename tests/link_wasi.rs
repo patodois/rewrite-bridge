@@ -927,6 +927,88 @@ fn four_stalled_peers_fill_the_limit_and_a_fifth_connection_waits_for_one_to_let
     assert!(guest_connects());
 }
 
+/// Pages of linear memory the component has, 64 KiB each.
+#[cfg(target_os = "wasi")]
+fn memory_pages() -> usize {
+    core::arch::wasm32::memory_size(0)
+}
+
+/// Receiving datagrams must not grow the component's memory: through `std`, `wasm32-wasip2` leaves the payload of
+/// every datagram it receives in memory for good (8208 bytes for one of 8192, 32 for one of 24), so a link
+/// running for a day at 60 datagrams a second would use a gigabyte. 4000 datagrams of five sizes from a
+/// sender with no session, then 2000 of a live session, leaked about 20 MB (300 pages) that way; the 8 pages
+/// allowed are for the allocator's own slack.
+#[cfg(target_os = "wasi")]
+#[test]
+fn receiving_datagrams_does_not_grow_memory() {
+    let _serial = serial();
+    const SIZES: [usize; 5] = [24, 100, 1000, 8192, 9000];
+    const SLACK_PAGES: usize = 8;
+    let mut host = Link::host(cfg("Host", 0)).unwrap();
+    let host_udp = host.udp_addr().unwrap();
+    let mut guest = Link::guest(cfg("Guest", host.control_addr().unwrap().port())).unwrap();
+    let foreign = UdpSocket::bind(localhost(0)).unwrap();
+
+    // The foreign datagrams come first, with no session: they are read before anything is checked.
+    let mut send_foreign = |host: &mut Link, count: usize| {
+        for i in 0..count {
+            let _ = foreign.send_to(&vec![7u8; SIZES[i % SIZES.len()]], host_udp);
+            if i % 50 == 49 {
+                host.poll();
+            }
+        }
+        host.poll();
+    };
+    send_foreign(&mut host, 400); // warm-up: the allocator takes what it will keep
+    let (before, foreign_before) = (memory_pages(), host.stats().foreign);
+    send_foreign(&mut host, 4000);
+    let after = memory_pages();
+    let seen = host.stats().foreign - foreign_before;
+    eprintln!("{seen} foreign datagrams: memory {before} -> {after} pages");
+    assert!(seen > 3000, "only {seen} of 4000 datagrams were read");
+    assert!(
+        after <= before + SLACK_PAGES,
+        "4000 datagrams grew memory from {before} to {after} pages"
+    );
+
+    // Then a live session: the guest's poses and both sides' heartbeats.
+    let (eh, eg) = run_until(&mut host, &mut guest, both_connected);
+    assert!(both_connected(&eh, &eg));
+    guest
+        .spawn(&Spawn {
+            entity: 1,
+            provider: "p".into(),
+            asset: "a".into(),
+            name: None,
+        })
+        .unwrap();
+    run_until(&mut host, &mut guest, |h, _| {
+        h.iter().any(|e| matches!(e, Event::Spawn(_)))
+    });
+    let warm = |host: &mut Link, guest: &mut Link, n: usize| {
+        for i in 0..n {
+            let _ = guest.send_poses(&[Pose::new(1, now_us())]);
+            if i % 20 == 19 {
+                host.poll();
+                guest.poll();
+            }
+        }
+        host.poll();
+        guest.poll();
+    };
+    warm(&mut host, &mut guest, 200);
+    let (before, received) = (memory_pages(), host.stats().datagrams_received);
+    warm(&mut host, &mut guest, 2000);
+    let after = memory_pages();
+    let got = host.stats().datagrams_received - received;
+    eprintln!("{got} session datagrams: memory {before} -> {after} pages");
+    assert!(got > 1500, "only {got} of 2000 poses were read");
+    assert!(
+        after <= before + SLACK_PAGES,
+        "{got} datagrams of a session grew memory from {before} to {after} pages"
+    );
+}
+
 fn chunk(query: u32, index: u16, count: u16, tag: f32) -> Datagram {
     Datagram::Collision(CollisionChunk {
         query,
