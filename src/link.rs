@@ -1435,9 +1435,10 @@ fn request_recv_buffer(udp: &UdpSocket, bytes: usize) {
 }
 
 fn random_session() -> u32 {
+    // `RandomState` has keys the operating system chose for this process, so no process id is needed (and
+    // `wasm32-wasip2` has none: `std::process::id` panics there).
     let mut h = RandomState::new().build_hasher();
     h.write_u64(now_us());
-    h.write_u32(std::process::id());
     (h.finish() as u32).max(1)
 }
 
