@@ -535,6 +535,14 @@ fn localhost(port: u16) -> SocketAddr {
 impl Raw {
     /// Connects to `host` as a guest and completes the handshake, polling `host` meanwhile.
     fn connect(host: &mut Link) -> Self {
+        let mut raw = Self::start(host);
+        assert!(raw.finish(host, WAIT), "no hello from the host");
+        assert!(host.is_connected());
+        raw
+    }
+
+    /// Connects and sends the `hello`, and does not wait for the host's.
+    fn start(host: &Link) -> Self {
         let tcp = TcpStream::connect(localhost(host.control_addr().unwrap().port())).unwrap();
         tcp.set_nonblocking(true).unwrap();
         let udp = UdpSocket::bind(localhost(0)).unwrap();
@@ -551,19 +559,22 @@ impl Raw {
             inbox: Vec::new(),
         };
         raw.tcp.write_all(hello.as_bytes()).unwrap();
-        let end = Instant::now() + WAIT;
-        while Instant::now() < end && raw.session == 0 {
+        raw
+    }
+
+    /// Polls `host` for up to `within` for the host's `hello`; false if it did not come.
+    fn finish(&mut self, host: &mut Link, within: Duration) -> bool {
+        let end = Instant::now() + within;
+        while Instant::now() < end && self.session == 0 {
             host.poll();
-            raw.read();
-            if let Some(Ok(Control::Hello(h))) = raw.lines().first().map(|l| Control::parse(l)) {
-                raw.session = h.session.unwrap();
-                raw.udp.connect(localhost(h.udp_port)).unwrap();
+            self.read();
+            if let Some(Ok(Control::Hello(h))) = self.lines().first().map(|l| Control::parse(l)) {
+                self.session = h.session.unwrap();
+                self.udp.connect(localhost(h.udp_port)).unwrap();
             }
             sleep(Duration::from_millis(2));
         }
-        assert!(raw.session != 0, "no hello from the host");
-        assert!(host.is_connected());
-        raw
+        self.session != 0
     }
 
     /// Takes in whatever the host has sent.
@@ -824,6 +835,96 @@ fn dropping_a_link_whose_peer_stopped_reading_waits_only_the_linger_time() {
     eprintln!("drop while the peer held its socket without reading: {took:?}");
     assert!(took < STALLED_CALL_LIMIT, "the drop took {took:?}");
     drop(raw);
+}
+
+/// Polls a scratch host for `ms`, so that parked sockets whose peers have gone are closed by it: the list of
+/// parked sockets belongs to the process, and the tests of this file share one.
+#[cfg(target_os = "wasi")]
+fn reap(ms: u64) {
+    let mut host = Link::host(cfg("Reap", 0)).unwrap();
+    let end = Instant::now() + Duration::from_millis(ms);
+    while Instant::now() < end {
+        host.poll();
+        sleep(Duration::from_millis(2));
+    }
+}
+
+/// Does a guest `Link` still go and connect? It does only while fewer than the limit of sockets are parked,
+/// and it shows by reaching a plain listener that never answers.
+#[cfg(target_os = "wasi")]
+fn guest_connects() -> bool {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut guest = Link::guest(cfg("Probe", port)).unwrap();
+    let end = Instant::now() + Duration::from_millis(600);
+    while Instant::now() < end {
+        guest.poll();
+        if listener.accept().is_ok() {
+            return true;
+        }
+        sleep(Duration::from_millis(2));
+    }
+    false
+}
+
+/// Four sessions whose peers stall and stay open leave four sockets parked, which is the limit. Then a fifth
+/// connection to a host is not answered, and a guest does not connect, each saying why in `last_error`; when
+/// one of the peers lets go, the next `poll` closes its socket and the fifth is answered.
+#[cfg(target_os = "wasi")]
+#[test]
+fn four_stalled_peers_fill_the_limit_and_a_fifth_connection_waits_for_one_to_let_go() {
+    let _serial = serial();
+    reap(300);
+    assert!(guest_connects(), "sockets are parked from before this test");
+
+    let mut host = Link::host(cfg("Host", 0)).unwrap();
+    let mut stalled = Vec::new();
+    for _ in 0..4 {
+        let (raw, _, _) = stall(&mut host);
+        stalled.push(raw);
+    }
+
+    // The host is at the limit: a guest written by hand is not answered, however long it waits (well within
+    // the 2 s a hello may take), and the host says why.
+    let mut fifth = Raw::start(&host);
+    assert!(
+        !fifth.finish(&mut host, Duration::from_millis(600)),
+        "a host with four parked sockets answered a fifth guest"
+    );
+    assert!(!host.is_connected());
+    let why = host.last_error().expect("a host at the limit says nothing");
+    assert!(why.contains("not accepting"), "{why}");
+
+    // A guest `Link` is at the limit too: it never reaches the listener, and says why.
+    assert!(!guest_connects());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut guest = Link::guest(cfg("Guest", listener.local_addr().unwrap().port())).unwrap();
+    guest.poll();
+    let why = guest
+        .last_error()
+        .expect("a guest at the limit says nothing");
+    assert!(why.contains("not connecting"), "{why}");
+    drop(guest);
+
+    // One peer lets go: the next poll closes its socket, the host is under the limit again, answers the
+    // fifth guest and drops what it said.
+    drop(stalled.pop());
+    assert!(
+        fifth.finish(&mut host, WAIT),
+        "the fifth guest was not answered after a peer let go"
+    );
+    assert!(host.is_connected());
+    host.poll();
+    assert_eq!(host.last_error(), None);
+    assert!(guest_connects(), "a guest still does not connect");
+
+    // The rest let go, and nothing stays parked for the tests after this one.
+    drop(fifth);
+    drop(stalled);
+    drop(host);
+    reap(300);
+    assert!(guest_connects());
 }
 
 fn chunk(query: u32, index: u16, count: u16, tag: f32) -> Datagram {
