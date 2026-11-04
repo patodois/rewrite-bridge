@@ -91,6 +91,36 @@ jobs:
       - run: cargo check -p rewrite-bridge-bevy --all-targets --features compose,viewer
       - run: cargo clippy -p rewrite-bridge-bevy --all-targets --features compose,viewer -- -D warnings
 
+  # The link in a WebAssembly component: wasm32-wasip2 has no threads, no process ids and no /dev/urandom. This lints
+  # it for that target and runs tests/link_wasi.rs (both roles in one thread, over loopback) under wasmtime, which
+  # gives the component the network and a /tmp for the endpoint file. wasmtime is the Bytecode Alliance's release,
+  # pinned by version and by the SHA-256 of its tarball.
+  wasm:
+    name: Link on wasm32-wasip2
+    runs-on: ubuntu-latest
+    env:
+      WASMTIME_VERSION: 50.0.1
+      WASMTIME_SHA256: 685466455dd42a14774a86c36c8f2e45cbb9bd6d92a850139315df60a75498a5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+          components: clippy
+      - name: Install wasmtime
+        run: |
+          name="wasmtime-v${WASMTIME_VERSION}-x86_64-linux"
+          curl -sSfL -o "$name.tar.xz" "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_VERSION}/$name.tar.xz"
+          echo "$WASMTIME_SHA256  $name.tar.xz" | sha256sum --check
+          tar -xJf "$name.tar.xz"
+          echo "$PWD/$name" >> "$GITHUB_PATH"
+      - run: wasmtime --version
+      - run: cargo clippy --target wasm32-wasip2 --features link -- -D warnings
+      - name: Run the link test under wasmtime
+        env:
+          CARGO_TARGET_WASM32_WASIP2_RUNNER: "wasmtime run -S inherit-network --dir /tmp::/tmp"
+        run: cargo test --target wasm32-wasip2 --features link --test link_wasi
+
   # Game files, decompiled or third-party code and secrets must never reach this public repository: this runs
   # tools/check_public_tree.py on the commits of the push or pull request (a new branch: all of its history).
   public-tree:
