@@ -10,6 +10,9 @@ assets from the player's own install, like IW4L) and **passthrough or mash-up mo
 games that share one world). It gives them one set of model, animation and scene types, a `Provider`
 trait that each game's reader implements, and a small protocol for linking two running games.
 
+**Adding a game to a passthrough?** [`docs/INTEGRATING.md`](docs/INTEGRATING.md) says whether to build a host, a guest or a
+provider, gives a working loop in Rust, C, C# and Java, and tests it with no second game.
+
 - A **game rewrite** runs an existing game on a new engine. It ships no game data: it reads the files
   of the copy the player already owns. A reader for one game's formats is called a *provider* here.
 - A **passthrough** (or **mash-up**) puts one game's things into another, like the mod that lets a

@@ -58,6 +58,7 @@ fn relative_links_resolve() {
         "README.md",
         "docs/WRITING_A_PROVIDER.md",
         "docs/CONTRACT.md",
+        "docs/INTEGRATING.md",
         "rewrite-bridge-bevy/README.md",
     ] {
         let text = read(file);
