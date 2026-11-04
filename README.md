@@ -433,7 +433,7 @@ UDP on `127.0.0.1`, and a folder for the endpoint file). There:
 - a component cannot ask for a file mode, so the endpoint file cannot be created `0600` as section 6.2 asks.
   It gets what the host process's umask leaves: 0644 under the usual umask 022, 0600 under 077, 0666 under
   000 (measured). Under 022 the token is readable by other users and a native guest refuses the file, so
-  that host cannot serve it, and a guest on this target has no mode check to lose or apply. Start the process
+  that host cannot serve it. A guest on this target cannot check the file's mode at all. Start the process
   with `umask 077`, or keep the file in a folder only you can enter. On a Windows host there is no umask: the
   folder's ACL is what counts.
 
