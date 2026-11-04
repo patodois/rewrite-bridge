@@ -514,7 +514,18 @@ All from the contract or from running the code.
 
 ## Test with no second game
 
-Real reference peers ship with the crate. Build them once (or `cargo install rewrite-bridge --version 0.3.0
+**Fastest peer, no Rust build.** link-c's demo is a real host or guest and needs only a C compiler:
+
+```sh
+git clone https://github.com/patodois/link-c && make -C link-c build/demo
+link-c/build/demo guest --seconds 4 --frames   # a guest that sends colour and depth; against your host
+link-c/build/demo host --seconds 6             # a host that sends cameras and collision; against your guest
+```
+
+It writes its pixel file in the system temp folder; set `TMPDIR` to keep it elsewhere. Building the Rust peers
+below can take a while at `Updating crates.io index`, or fail where crates.io cannot be reached: use this one then.
+
+The Rust peers ship with the crate and have more options. Build them once (or `cargo install rewrite-bridge --version 0.3.0
 --features link --examples`, which put them in `~/.cargo/bin`; checked offline here):
 
 ```sh
