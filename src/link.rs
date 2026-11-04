@@ -1641,6 +1641,14 @@ impl Link {
                     }
                 };
                 let addr = localhost(port);
+                // A target with no threads (`wasm32-wasip2`) connects right here, blocking. On loopback the
+                // answer comes at once, an accept or a refusal, so the poll is not held up; the helper thread
+                // below is for a platform that is slow to refuse.
+                if cfg!(target_os = "wasi") {
+                    let connected = TcpStream::connect(addr).and_then(Ctl::new);
+                    self.conn = self.connect_done(connected, port, now);
+                    return;
+                }
                 let (tx, rx) = mpsc::channel();
                 let spawned = std::thread::Builder::new()
                     .name("rewrite-bridge-connect".into())
