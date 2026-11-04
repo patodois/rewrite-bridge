@@ -9,8 +9,10 @@ with no second game, and what is not proven.
   and links to the section that decides each point. If the contract and this page disagree, the contract wins.
 - **Checked against** rewrite-bridge `main` at `1bc3b02` and the `main` branches of link-c, link-cs and link-java
   (all revision 6), on macOS 26 (arm64) with Rust 1.99.1, Apple clang 21, .NET SDK 8.0.426 and JDK 25 (Java code
-  compiled with `--release 8`). Every command and snippet below was run there, except where a section says it was not. Nothing was run on Linux or
-  Windows.
+  compiled with `--release 8`). Every command and snippet below was run there, except where a section says it was not.
+  The guide's own commands were not run on Linux or Windows; what those systems' CI runs is listed under "Not supported or not
+  proven". What rewrite-bridge 0.3.1 adds (`Link::last_error`, and the link on `wasm32-wasip2`) was run on the branch that
+  becomes 0.3.1: on macOS, under wasmtime 50.0.1, and for the stalled-peer tests on GitHub's `ubuntu-latest`.
 
 ## Shortest path
 
@@ -40,7 +42,17 @@ tested against each other.
 ### Rust rewrite or Bevy game
 
 - **Library:** the `rewrite-bridge` crate with its `link` feature. In `Cargo.toml`:
-  `rewrite-bridge = { version = "0.3", features = ["link"] }`. The token (revision 6) exists from 0.3.0 only.
+  `rewrite-bridge = { version = "0.3", features = ["link"] }`. The token (revision 6) exists from 0.3.0 only. 0.3.1 adds `Link::last_error()` (below), the link on `wasm32-wasip2`
+  (a component plugin), and the temporary file of the endpoint file no longer carries a process id in its name.
+- **A component plugin (`wasm32-wasip2`, no threads), 0.3.1.** `Link` runs there, host and guest, run under wasmtime 50.0.1:
+  a guest connects inside `poll` and waits at most 100 ms for a host that does not accept (the poll that finds a
+  refusal or an accept takes well under a millisecond on macOS; a refusal can take longer on Windows), the pixel
+  file is an `Unsupported` error, and the UDP socket is the WASI one, because `std` leaks the payload of every
+  datagram it receives there. The token and the endpoint file work (the host's `generate_token` and
+  `Endpoint::write` ran), but a component cannot ask for a file mode: the file gets the mode of the host
+  process's umask (0644 under 022, 0600 under 077, 0666 under 000, measured), so under the usual umask a native
+  guest refuses it and the token is readable by other users. Start the process with `umask 077`.
+  Details: the README of rewrite-bridge, "In a component on `wasm32-wasip2`".
 - **Bevy 0.20:** `rewrite-bridge-bevy` loads provider output; with its `compose` feature `HostLinkPlugin` and
   `GuestComposePlugin` make a Bevy camera a host that depth-composites a guest's frames. Run against
   `fake_guest --frames` here (see [Bevy host](#bevy-host)). Details: [its README](../rewrite-bridge-bevy/README.md).
@@ -53,10 +65,12 @@ tested against each other.
 
 ### C or C++ mod: Skyrim (SKSE), Fallout 4 (F4SE), GTA V (ScriptHookV), Unreal
 
-- **Library:** [link-c](https://github.com/patodois/link-c), one header `rewrite_link.h`, C99, compiles as C++.
+- **Library:** [link-c](https://github.com/patodois/link-c), one header `rewrite_link.h`, C99; its CI compiles the header
+  as C++ too (`make cxx` on Linux and macOS, the `cxx` test on Windows).
 - **Untested in these frameworks.** Its README lists SKSE, F4SE, ScriptHookV and Unreal modules as the intended
-  users and says it was not built or run inside any of them. It was run as a plain program on macOS only. Its
-  Windows code is written against documentation, not run. 32-bit x86 is not a target.
+  users and says it was not built or run inside any of them. Its CI builds it with MSVC (x64, Release) on
+  `windows-latest` and passes the unit, vector and C++ checks there; no program of link-c was run as a two-process
+  session on Windows. 32-bit x86 is not a target.
 
 ### C# mod: Unity with BepInEx or MelonLoader, Valheim, Unturned
 
@@ -272,7 +286,8 @@ int main(int argc, char** argv) { /* usage: host SECONDS [ENDPOINT_FILE] */
 
 Build (the header is `rewrite_link.h` in the link-c clone):
 `cc -Wall -I/path/to/link-c -o guest guest.c`. Both compiled with no warnings under `-Wall`, and also with
-`-std=c99 -Wall -Wextra` (add `-D_POSIX_C_SOURCE=200809L` there, for `nanosleep`). They were not compiled as C++.
+`-std=c99 -Wall -Wextra` (add `-D_POSIX_C_SOURCE=200809L` there, for `nanosleep`). These two snippets were not
+compiled as C++; link-c's CI compiles its header as C++ with its own check.
 
 ### C#: guest
 
@@ -647,8 +662,9 @@ Text below is what the code printed when run. Wording is each library's own and 
 | What you see | Cause | Fix |
 |---|---|---|
 | Host: `Error: Os { code: 48, kind: AddrInUse, message: "Address already in use" }` (Rust `Link::host`; code 98 on Linux). C: `rbl_link_host` returns a non-zero status, print `rbl_strerror` (text not captured here) | Another process holds the control port (often a previous run, or a second host) | Stop it, or pick another `control_port`; with an endpoint file use port 0, the file carries the real one |
-| Guest: no output, no event, never connects (`connected=false`) | No host is listening, or the endpoint file is missing or unusable. A guest retries every 500 ms for ever and reports nothing | Start the host first; print your own "waiting for host" after a timeout; check the file as in the next row |
-| Guest silent with an endpoint file | The guest cannot use the file and says nothing. Diagnose with `Endpoint::read(path)` (Rust, public), which printed: `PermissionDenied: endpoint file: group or others have permissions on it` (fix: `chmod 600`), `InvalidData: endpoint file: not a JSON object`, `InvalidData: endpoint file: control_port is not an integer from 1 to 65535`, `NotFound: No such file or directory (os error 2)` (the host is not running yet, or the path differs) | Fix the named problem; the guest re-reads the file before every attempt |
+| Guest: no event, never connects (`connected=false`) | No host is listening, or the endpoint file is missing or unusable. A guest retries every 500 ms for ever. A Rust guest (0.3.1) says why in `Link::last_error()`: `cannot connect to 127.0.0.1:<port>: connection refused` when nothing listens. The C, C# and Java guests, as run for this guide, print nothing | Start the host first; in Rust print `last_error()` after a timeout, in the others print your own "waiting for host"; check the file as in the next row |
+| Guest silent with an endpoint file | The guest cannot use the file. A Rust guest (0.3.1) puts the reason in `last_error()`, and these were printed: `endpoint file: group or others have permissions on it` (fix: `chmod 600`), `endpoint file: not a JSON object`, `endpoint file: No such file or directory (os error 2)` (the host is not running yet, or the path differs). The other libraries say nothing; diagnose with `Endpoint::read(path)` (Rust, public), which printed for a file with a bad `control_port`: `InvalidData: endpoint file: control_port is not an integer from 1 to 65535` | Fix the named problem; the guest re-reads the file before every attempt |
+| On `wasm32-wasip2`, `last_error()` says `not accepting: peers that stopped reading still hold earlier connections` (a host) or `not connecting: …` (a guest) | Four earlier connections whose peers held the socket open and stopped reading are still set aside, counted for the whole component (see the README of rewrite-bridge, "In a component") | Make the peers read or exit; the text goes away when one lets go. Run in the test `four_stalled_peers_fill_the_limit_and_a_fifth_connection_waits_for_one_to_let_go` |
 | Guest: `peer said bye: unauthorized` (the host's own event says just `unauthorized`) | Wrong or missing token. The host makes a new token each run, so a copy of an old file is useless | Read the file the running host wrote; never copy or cache the token |
 | Guest: `peer said bye: busy` | The host already has a guest | Stop the first guest |
 | Host fails to start with an endpoint file: Rust `Error: Os { code: 2, kind: NotFound, ... }`; C#: `EndpointException: cannot write the endpoint file: the directory does not exist`; Java: `NoSuchFileException: .../.my-game.json.<pid>.<hex>.tmp`; C: `rbl_link_host` fails | The endpoint file's directory does not exist; no library creates it | `mkdir` it with mode 0700 first |
@@ -723,8 +739,14 @@ about finding the install.
   server plugin has loaded these libraries as far as the READMEs say. No host or guest for Skyrim, Fallout 4, GTA V
   or Warframe exists in these repositories. The libraries were run as plain programs; the one game-side host and
   guest that was run live is Minecraft, through `minecraft-link`, by its own README.
-- **Windows and Linux:** the Windows code of link-c, link-cs and link-java was written against documentation and
-  not run. The Rust crate's CI is configured for Linux, macOS and Windows; only macOS was run for this guide. link-c on GCC is untried.
+- **Windows and Linux.** What CI runs on `windows-latest`, checked on the runs of 2026-11-04 (all green) and in the
+  workflow files: rewrite-bridge, `cargo test` and `cargo test --features link` (the tests that run a host and a
+  guest in one process over loopback, the vectors, the token and endpoint file tests) and a Clippy build of the Bevy
+  plugin; link-c, a CMake build with MSVC (x64, Release) and `ctest` (unit, vectors, and the header compiled as C++);
+  link-cs, `dotnet build` and the test project (74 checks in the run read; its demo step is skipped on Windows);
+  link-java, `./gradlew check` on JDK 21. Never run on Windows: the two-process demo and the cross-language interop
+  job (they run on `ubuntu-latest` only, and the demos of link-c and link-cs on Linux and macOS), any game process,
+  and Wine. link-c with GCC or MinGW is untried. This guide's own commands ran on macOS only.
 - **Gameplay:** no combat, damage or interaction events; no collision response between the two games' entities
   (see [Who owns what](#who-owns-what)).
 - **Scope of the link:** the same machine only (`127.0.0.1`), one guest per host, 1024 entities per peer, no
