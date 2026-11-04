@@ -1327,8 +1327,11 @@ impl Closing {
 enum Conn {
     /// No connection. A guest retries at `next_try`; a host waits for one.
     Idle { next_try: Instant },
-    /// Guest: a helper thread is connecting.
-    Connecting { rx: Receiver<io::Result<TcpStream>> },
+    /// Guest: a helper thread is connecting to `port`.
+    Connecting {
+        rx: Receiver<io::Result<TcpStream>>,
+        port: u16,
+    },
     /// Connected, waiting for the peer's `hello`.
     Handshake { ctl: Ctl, since: Instant },
     Live {
@@ -1378,6 +1381,8 @@ pub struct Link {
     token: Option<String>,
     /// Host: the endpoint file this link wrote, removed on drop.
     endpoint_written: Option<PathBuf>,
+    /// Guest: why the last connection attempt failed, see [`Link::last_error`].
+    last_error: Option<String>,
 }
 
 fn localhost(port: u16) -> SocketAddr {
@@ -1513,6 +1518,7 @@ impl Link {
             last_frame: 0,
             token: None,
             endpoint_written: None,
+            last_error: None,
         })
     }
 
@@ -1539,6 +1545,14 @@ impl Link {
 
     pub fn is_connected(&self) -> bool {
         self.peer().is_some()
+    }
+
+    /// Guest: why the last attempt to connect failed, or `None` before the first attempt, after one that
+    /// connected, and always for a host. Either the endpoint file could not be read or was refused, or the
+    /// connection to the host's port failed. The text never holds a token. A host that refuses the guest
+    /// after the connection is up is reported by [`Event::HandshakeFailed`] instead.
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
     }
 
     /// Which side currently has input focus.
@@ -1612,7 +1626,9 @@ impl Link {
                             self.token = Some(e.token);
                             e.control_port
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            // `Endpoint::read` never quotes the file, so this holds no token.
+                            self.last_error = Some(format!("endpoint file: {e}"));
                             self.conn = Conn::Idle {
                                 next_try: now + self.cfg.reconnect,
                             };
@@ -1632,29 +1648,38 @@ impl Link {
                         let _ = tx.send(TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT));
                     });
                 self.conn = match spawned {
-                    Ok(_) => Conn::Connecting { rx },
-                    Err(_) => Conn::Idle {
-                        next_try: now + self.cfg.reconnect,
-                    },
+                    Ok(_) => Conn::Connecting { rx, port },
+                    Err(e) => self.connect_done(Err(e), port, now),
                 };
             }
-            Conn::Connecting { rx } => {
+            Conn::Connecting { rx, port } => {
+                let port = *port;
                 let connected = match rx.try_recv() {
                     Err(TryRecvError::Empty) => return,
                     Ok(r) => r.and_then(Ctl::new),
                     Err(TryRecvError::Disconnected) => Err(ErrorKind::BrokenPipe.into()),
                 };
-                self.conn = match connected {
-                    Ok(mut ctl) => {
-                        ctl.queue(&self.hello(PROTOCOL_VERSION, None));
-                        Conn::Handshake { ctl, since: now }
-                    }
-                    Err(_) => Conn::Idle {
-                        next_try: now + self.cfg.reconnect,
-                    },
-                };
+                self.conn = self.connect_done(connected, port, now);
             }
             _ => {}
+        }
+    }
+
+    /// What follows an attempt to connect to `port`: our `hello` and the handshake, or, after recording why
+    /// it failed (the kind of the error only, which quotes nothing), a pause before the next try.
+    fn connect_done(&mut self, connected: io::Result<Ctl>, port: u16, now: Instant) -> Conn {
+        match connected {
+            Ok(mut ctl) => {
+                self.last_error = None;
+                ctl.queue(&self.hello(PROTOCOL_VERSION, None));
+                Conn::Handshake { ctl, since: now }
+            }
+            Err(e) => {
+                self.last_error = Some(format!("cannot connect to 127.0.0.1:{port}: {}", e.kind()));
+                Conn::Idle {
+                    next_try: now + self.cfg.reconnect,
+                }
+            }
         }
     }
 
