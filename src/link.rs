@@ -1628,10 +1628,14 @@ impl Link {
         self.peer().is_some()
     }
 
-    /// Guest: why the last attempt to connect failed, or `None` before the first attempt, after one that
-    /// connected, and always for a host. Either the endpoint file could not be read or was refused, or the
-    /// connection to the host's port failed. The text never holds a token. A host that refuses the guest
-    /// after the connection is up is reported by [`Event::HandshakeFailed`] instead.
+    /// Guest: why the last attempt to connect failed, or `None` before the first attempt and after one that
+    /// connected. Either the endpoint file could not be read or was refused, or the connection to the host's
+    /// port failed. The text never holds a token. A host that refuses the guest after the connection is up
+    /// is reported by [`Event::HandshakeFailed`] instead.
+    ///
+    /// Either role, on `wasm32-wasip2`: why it is taking no new connection, while four connections whose
+    /// peers stopped reading are still set aside. A host has no other reason, and clears it
+    /// when it is under the limit again.
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
@@ -1686,6 +1690,10 @@ impl Link {
     fn poll_connect(&mut self, now: Instant, full: bool) {
         if let Some(listener) = &self.listener {
             let mut busy = Vec::new();
+            // Said while it lasts, and gone when the host is under the limit again.
+            self.last_error = full.then(|| {
+                "not accepting: peers that stopped reading still hold earlier connections".into()
+            });
             loop {
                 // With [`PARKED_LIMIT`] sockets parked nobody is taken in; a guest waits in the backlog.
                 if full {
@@ -2333,7 +2341,7 @@ impl Link {
 impl Drop for Link {
     /// Removes the endpoint file the host wrote, says `bye` and closes gracefully, which may block
     /// for up to [`LINGER`]. A connection whose peer has stopped reading is not waited for beyond that, even
-    /// on `wasm32-wasip2` (see [`Stream`]): it is left to the runtime, which frees it with the component.
+    /// on `wasm32-wasip2`: it is set aside and closed later, as the runtime allows, or left to the runtime, which frees it with the component.
     fn drop(&mut self) {
         if let Some(path) = self.endpoint_written.take() {
             let _ = Endpoint::remove(&path);
