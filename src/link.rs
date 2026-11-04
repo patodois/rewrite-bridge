@@ -35,6 +35,7 @@ use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use memmap2::{Mmap, MmapMut};
@@ -1204,9 +1205,68 @@ pub struct Stats {
 }
 
 struct Ctl {
-    stream: TcpStream,
+    stream: Stream,
     rbuf: Vec<u8>,
     wbuf: Vec<u8>,
+}
+
+/// The socket of a control connection, closed so that closing it never waits.
+///
+/// On `wasm32-wasip2` the runtime takes a write of up to 64 KiB at once and delivers it to the kernel in the
+/// background, and closing the socket waits until it has. While the peer neither reads nor closes and the
+/// kernel's buffers are full, that is until the peer does: measured with wasmtime 50.0.1, 5 s on macOS and
+/// for ever on Linux. A `poll` that closed such a connection, or a `Drop`, would hold its caller that long. A
+/// socket that would wait is parked in [`PARKED`] instead and closed by a later [`Link::poll`] once its bytes
+/// have gone. Everywhere else the field is closed on drop, as a `TcpStream` always is.
+struct Stream(Option<TcpStream>);
+
+impl std::ops::Deref for Stream {
+    type Target = TcpStream;
+    fn deref(&self) -> &TcpStream {
+        self.0.as_ref().expect("a stream is only taken in drop")
+    }
+}
+
+impl std::ops::DerefMut for Stream {
+    fn deref_mut(&mut self) -> &mut TcpStream {
+        self.0.as_mut().expect("a stream is only taken in drop")
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        if let Some(s) = self.0.take() {
+            if cfg!(target_os = "wasi") && !closes_at_once(&s) {
+                PARKED
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(s);
+            }
+        }
+    }
+}
+
+/// Sockets that could not be closed without waiting, see [`Stream`].
+static PARKED: Mutex<Vec<TcpStream>> = Mutex::new(Vec::new());
+
+/// Most parked sockets before a `Link` takes no new connection. A host serves one guest at a time, so each
+/// parked socket is a session whose peer stopped reading and then stayed; a peer that keeps doing that would
+/// otherwise pile up a socket and its kernel buffers (megabytes) per session. A few is already a peer that
+/// is not going to read.
+const PARKED_LIMIT: usize = 4;
+
+/// Can `s` be closed at once? On `wasm32-wasip2` a write of no bytes asks the runtime whether it still holds
+/// bytes for the kernel: it answers `WouldBlock` then, and changes nothing otherwise.
+fn closes_at_once(s: &TcpStream) -> bool {
+    let mut s = s;
+    !matches!(s.write(&[]), Err(e) if e.kind() == ErrorKind::WouldBlock)
+}
+
+/// Closes the parked sockets that have nothing left to wait for, and returns how many remain.
+fn reap_parked() -> usize {
+    let mut parked = PARKED.lock().unwrap_or_else(PoisonError::into_inner);
+    parked.retain(|s| !closes_at_once(s));
+    parked.len()
 }
 
 impl Ctl {
@@ -1214,7 +1274,7 @@ impl Ctl {
         stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
         Ok(Self {
-            stream,
+            stream: Stream(Some(stream)),
             rbuf: Vec::new(),
             wbuf: Vec::new(),
         })
@@ -1592,7 +1652,12 @@ impl Link {
     pub fn poll(&mut self) -> Vec<Event> {
         let now = Instant::now();
         self.closing.retain_mut(|c| c.pump(now));
-        self.poll_connect(now);
+        let parked = if cfg!(target_os = "wasi") {
+            reap_parked()
+        } else {
+            0
+        };
+        self.poll_connect(now, parked >= PARKED_LIMIT);
         self.poll_control(now);
         self.poll_udp(now);
         self.pump_collision();
@@ -1618,10 +1683,14 @@ impl Link {
         })
     }
 
-    fn poll_connect(&mut self, now: Instant) {
+    fn poll_connect(&mut self, now: Instant, full: bool) {
         if let Some(listener) = &self.listener {
             let mut busy = Vec::new();
             loop {
+                // With [`PARKED_LIMIT`] sockets parked nobody is taken in; a guest waits in the backlog.
+                if full {
+                    break;
+                }
                 let stream = match listener.accept() {
                     Ok((s, _)) => s,
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -1640,6 +1709,15 @@ impl Link {
             return;
         }
         match &self.conn {
+            Conn::Idle { next_try } if now >= *next_try && full => {
+                self.last_error = Some(
+                    "not connecting: peers that stopped reading still hold earlier connections"
+                        .into(),
+                );
+                self.conn = Conn::Idle {
+                    next_try: now + self.cfg.reconnect,
+                };
+            }
             Conn::Idle { next_try } if now >= *next_try => {
                 let port = match &self.cfg.endpoint_file {
                     // Read before every attempt: a restarted host has a new port and a new token.
@@ -2254,7 +2332,8 @@ impl Link {
 
 impl Drop for Link {
     /// Removes the endpoint file the host wrote, says `bye` and closes gracefully, which may block
-    /// for up to [`LINGER`].
+    /// for up to [`LINGER`]. A connection whose peer has stopped reading is not waited for beyond that, even
+    /// on `wasm32-wasip2` (see [`Stream`]): it is left to the runtime, which frees it with the component.
     fn drop(&mut self) {
         if let Some(path) = self.endpoint_written.take() {
             let _ = Endpoint::remove(&path);
@@ -2269,6 +2348,9 @@ impl Drop for Link {
             std::thread::sleep(Duration::from_millis(2));
             let now = Instant::now();
             self.closing.retain_mut(|c| c.pump(now));
+        }
+        if cfg!(target_os = "wasi") {
+            reap_parked();
         }
     }
 }
