@@ -813,28 +813,49 @@ fn dropping_a_link_whose_peer_stopped_reading_waits_only_the_linger_time() {
     let (raw, sent, _) = stall(&mut first);
     drop(first);
     drop(raw);
-    // ...then a second one is filled to a little short of that. Its connection is live, the kernel's buffers
-    // and the runtime's are full, and what it still holds is under the 1 MiB that would end the session
-    // (four spawns of 60 kB are 240 kB less than the refusal; the capacity moves by less between two runs),
-    // so dropping it has to say `bye`, which cannot go out, and give up after the 200 ms of section 6.1.
-    let mut host = Link::host(cfg("Host", 0)).unwrap();
-    let raw = Raw::connect(&mut host);
+    // ...then a host is filled to a little short of that, so that its connection is live, the buffers of the
+    // kernel and of the runtime are full, and what the link itself still holds is under the 1 MiB that would end
+    // the session. Dropping it then has to say `bye`, which cannot go out, and give up after the 200 ms of
+    // section 6.1. How far short is right moves from run to run (the capacity varied by 26 to 37 spawns of 60 kB
+    // under load), so the margin is tried from small to large until a drop has had to wait (200 ms), and every
+    // drop must be quick whatever the margin.
     let name = "x".repeat(60_000);
-    for entity in 0..sent.saturating_sub(4) {
-        let spawn = Spawn {
-            entity: entity as u32,
-            provider: "p".into(),
-            asset: "a".into(),
-            name: Some(name.clone()),
-        };
-        host.spawn(&spawn).unwrap();
+    let mut waited = false;
+    for margin in [2, 6, 12, 24, 48, 96] {
+        let mut host = Link::host(cfg("Host", 0)).unwrap();
+        let raw = Raw::connect(&mut host);
+        let mut overshot = false;
+        for entity in 0..sent.saturating_sub(margin) {
+            let spawn = Spawn {
+                entity: entity as u32,
+                provider: "p".into(),
+                asset: "a".into(),
+                name: Some(name.clone()),
+            };
+            if host.spawn(&spawn).is_err() {
+                overshot = true;
+                break;
+            }
+        }
+        let began = Instant::now();
+        drop(host);
+        let took = began.elapsed();
+        eprintln!("drop with margin {margin} (overshot: {overshot}): {took:?}");
+        assert!(took < STALLED_CALL_LIMIT, "the drop took {took:?}");
+        drop(raw);
+        if !overshot && took >= Duration::from_millis(150) {
+            waited = true;
+            break;
+        }
     }
-    let began = Instant::now();
-    drop(host);
-    let took = began.elapsed();
-    eprintln!("drop while the peer held its socket without reading: {took:?}");
-    assert!(took < STALLED_CALL_LIMIT, "the drop took {took:?}");
-    drop(raw);
+    // Only where the runtime's buffers add to the kernel's does the state exist that this checks.
+    #[cfg(target_os = "wasi")]
+    assert!(
+        waited,
+        "no margin left the connection live with its buffers full"
+    );
+    #[cfg(not(target_os = "wasi"))]
+    let _ = waited;
 }
 
 /// Polls a scratch host for `ms`, so that parked sockets whose peers have gone are closed by it: the list of
@@ -950,7 +971,7 @@ fn receiving_datagrams_does_not_grow_memory() {
     let foreign = UdpSocket::bind(localhost(0)).unwrap();
 
     // The foreign datagrams come first, with no session: they are read before anything is checked.
-    let mut send_foreign = |host: &mut Link, count: usize| {
+    let send_foreign = |host: &mut Link, count: usize| {
         for i in 0..count {
             let _ = foreign.send_to(&vec![7u8; SIZES[i % SIZES.len()]], host_udp);
             if i % 50 == 49 {
@@ -1185,15 +1206,26 @@ fn a_host_that_never_accepts_holds_a_poll_for_a_moment_only() {
         ..cfg("Guest", addr.port())
     })
     .unwrap();
+    // The wait is 100 ms (INLINE_CONNECT_TIMEOUT), pinned from both sides: not shorter (a poll cannot be
+    // faster than the wait, however loaded the machine) and, at least once of three, not much longer (a
+    // longer wait, or the system's own timeout of seconds, would show in every one).
+    let mut shortest = Duration::MAX;
     for _ in 0..3 {
         let began = Instant::now();
         guest.poll();
         let took = began.elapsed();
-        // 100 ms is the wait; a poll that waited for the system's own connect timeout takes seconds
-        assert!(took < Duration::from_millis(500), "a poll took {took:?}");
+        assert!(
+            took >= Duration::from_millis(80),
+            "a poll took only {took:?}"
+        );
+        shortest = shortest.min(took);
         let why = guest.last_error().expect("no reason for the failure");
         assert!(why.contains("timed out"), "{why}");
         sleep(Duration::from_millis(60));
     }
+    assert!(
+        shortest < Duration::from_millis(350),
+        "the shortest of three polls took {shortest:?}"
+    );
     drop(held);
 }
