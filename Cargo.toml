@@ -60,6 +60,11 @@ required-features = ["link"]
 name = "link_token"
 required-features = ["link"]
 
+# Both roles in one thread, driven by `poll`: the test CI runs on wasm32-wasip2 under wasmtime.
+[[test]]
+name = "link_wasi"
+required-features = ["link"]
+
 # The shared protocol vectors of tests/vectors/link, also run by link-java, link-c and link-cs.
 [[test]]
 name = "link_vectors"
