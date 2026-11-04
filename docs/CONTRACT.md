@@ -249,11 +249,16 @@ refuses a file that breaks any of this.
   down cleanly. A host that crashes leaves it behind; its token dies with it, since the next run makes a
   new one.
 
-  *Implementation note, no rule changes.* Where the platform has no mode bits at all, as for a WebAssembly
-  component on WASI, the file cannot be created `0600`. The rule above stands; an implementation there can
-  only create it exclusively and let the process's umask decide the mode, so the operator starts the
-  process with `umask 077`. That is a deviation the platform forces, which the implementation should
-  document, and it does not relax the rule for a platform that can set the mode.
+  *Implementation note, no rule changes.* A WebAssembly component on WASI cannot ask for a mode when it
+  creates a file: the file gets what the host process's umask leaves (on a Unix host, 0666 minus the umask).
+  Measured from such a writer: umask 022 gives 0644, 077 gives 0600, 000 gives 0666. The rule above stands;
+  such an implementation can only create the file exclusively, and it should tell its operator the
+  consequences. Under the default umask 022 the token is readable by other users, and a guest that checks
+  the mode (the rule below) refuses the file, so that host cannot serve it. A component that reads the file
+  cannot check the mode either, so for it the check below is lost. The mitigation is `umask 077` for the
+  process, or a folder that only the user can enter (0700). On a Windows host no umask applies: the folder's
+  per-user ACL is what keeps other users out, as above. This is a deviation the platform forces, not a
+  relaxation of the rule for a platform that can set the mode.
 - **Reading (guest).** The guest reads the file and takes `control_port` and `token` from it. It refuses
   a path that does not name a regular file (symbolic links followed), and checks that before it opens the
   path, since opening a FIFO for reading would block. On Unix it also refuses a file whose permissions
@@ -276,7 +281,9 @@ refuses a file that breaks any of this.
 
 - It keeps out **other users** of the machine, and **any process that cannot read the endpoint file**: a
   sandboxed program, a service running under another account, anything that can open a TCP connection
-  to `127.0.0.1` but cannot read the user's files.
+  to `127.0.0.1` but cannot read the user's files. That holds when the file is owner-only; a host that
+  cannot create it with mode 0600 (the implementation note under "Writing") keeps others out only as far as
+  its umask or its folder does.
 - It defeats a process that **squats the control port** before the host starts. The host's bind then
   fails, so the host writes no file, and a guest that reads the file never hands the token to the
   squatter. (A host that wrote the file before binding would send the guest to whoever holds the port,
