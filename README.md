@@ -52,7 +52,7 @@ the [glossary](#glossary).
 | [hytale-unpack](https://github.com/patodois/hytale-unpack) | Provider for Hytale: entity models, animations, blocks and prefabs. |
 | [nocturne-unpack](https://github.com/patodois/nocturne-unpack) | Provider for Shin Megami Tensei III Nocturne HD Remaster: demons with their animations, and fields. |
 | [bridge-testbed](https://github.com/patodois/bridge-testbed) | The visual and physics testbed: loads items from every provider side by side. |
-| Host plugins for Hytale and Minecraft | Not published yet. |
+| [minecraft-link](https://github.com/patodois/minecraft-link) | Host and guest mod for Minecraft: Java Edition on Fabric, Quilt, NeoForge and Forge. The Hytale plugin is not public. |
 
 Add yours with a pull request or an issue once it is public.
 
@@ -496,7 +496,7 @@ cargo run --release --features link --example fake_guest -- --frames --seconds 1
 - **`--in-front` on the guest** is for a real game's host. By default the cube stands at the world
   origin, which is where `fake_host` expects it. With `--in-front` it stands 4 m ahead of the first
   camera the host sends, on the ground the host reports as collision, because a real game's player is
-  rarely near the origin. Host plugins for real games are not published yet; any host that speaks
+  rarely near the origin. The Minecraft host is [minecraft-link](https://github.com/patodois/minecraft-link) and the Hytale plugin is not public; any host that speaks
   [`docs/CONTRACT.md`](docs/CONTRACT.md) will do, in any language.
 
 ## Glossary

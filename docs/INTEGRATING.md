@@ -12,6 +12,14 @@ with no second game, and what is not proven.
   compiled with `--release 8`). Every command and snippet below was run there, except where a section says it was not. Nothing was run on Linux or
   Windows.
 
+## Shortest path
+
+1. Choose the role: [Decide what you are building](#decide-what-you-are-building).
+2. Choose the library: [Pick the library](#pick-the-library).
+3. Copy the loop: [Minimal loops](#minimal-loops).
+4. Test with the fake peer: [Test with no second game](#test-with-no-second-game).
+5. Pass [Done means both games take part](#done-means-both-games-take-part) before calling it finished.
+
 ## Decide what you are building
 
 | You are building | Meaning | What you write | Where to start |
@@ -472,8 +480,8 @@ and write the mapping down in your code as a comment per game. Decide each of th
   ahead of the first camera and on the ground your `Collision` reports). Then turn and walk: the cube must stay
   where it is in the world, ahead at first and moving the correct way on screen. A cube behind you, mirrored
   motion, or floating at eye height means the axes, the handedness or the collision conversion is wrong. For a
-  guest, move your entity and check in the host that it moves the same way. I could not run this check without
-  a real host game; the rest of this guide is run.
+  guest, move your entity and check in the host that it moves the same way. This check needs a real host game
+  and has not been run; the other commands in this guide have.
 
 ## Common mistakes
 
@@ -705,7 +713,7 @@ about finding the install.
   or Warframe exists in these repositories. The libraries were run as plain programs; the one game-side host and
   guest that was run live is Minecraft, through `minecraft-link`, by its own README.
 - **Windows and Linux:** the Windows code of link-c, link-cs and link-java was written against documentation and
-  not run. The Rust crate's CI is configured for Linux, macOS and Windows; I ran macOS only. link-c on GCC is untried.
+  not run. The Rust crate's CI is configured for Linux, macOS and Windows; only macOS was run for this guide. link-c on GCC is untried.
 - **Gameplay:** no combat, damage or interaction events; no collision response between the two games' entities
   (see [Who owns what](#who-owns-what)).
 - **Scope of the link:** the same machine only (`127.0.0.1`), one guest per host, 1024 entities per peer, no
@@ -715,7 +723,6 @@ about finding the install.
 - **What a guest can show:** `bridge-guest`, the real guest, draws one surface per pixel (translucent materials
   become cut-outs), has no anti-aliasing, supports perspective hosts only, and one entity with no scenes or
   sockets.
-- **The wasm link work** is not on `main` and is not covered.
 
 ## Game data
 
