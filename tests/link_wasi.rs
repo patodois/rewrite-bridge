@@ -717,15 +717,27 @@ fn a_line_with_no_newline_is_too_long_at_65536_bytes_but_not_at_65535() {
     assert!(lost.contains("too long"), "{lost}");
 }
 
-#[test]
-fn a_peer_that_stops_reading_is_lost_once_a_mebibyte_is_waiting() {
-    let _serial = serial();
-    let mut host = Link::host(cfg("Host", 0)).unwrap();
-    let raw = Raw::connect(&mut host);
-    // `raw` holds its socket open and never reads it: the socket buffers fill, then the host's own queue
+/// The longest any one call of `poll`, `spawn` or a drop may take while a peer holds its socket open and never
+/// reads it. `Link` waits nothing for such a peer except the 200 ms of section 6.1 in a drop; the code without
+/// the fix took 5 s on macOS and never returned on Linux, so 2 s is far from both and leaves ten times the
+/// 200 ms for a slow CI machine.
+const STALLED_CALL_LIMIT: Duration = Duration::from_secs(2);
+
+/// Runs `f`, keeps the longest time any call took in `worst`.
+fn timed<T>(worst: &mut Duration, f: impl FnOnce() -> T) -> T {
+    let began = Instant::now();
+    let out = f();
+    *worst = (*worst).max(began.elapsed());
+    out
+}
+
+/// A host whose peer holds its socket open and never reads it, spawned at until it refuses: the kernel's
+/// buffers fill, then the link's own queue passes the 1 MiB of section 7. Returns the peer, the number of
+/// spawns taken, and the longest call.
+fn stall(host: &mut Link) -> (Raw, usize, Duration) {
+    let raw = Raw::connect(host);
     let name = "x".repeat(60_000);
-    let mut sent = 0;
-    let mut refused = false;
+    let (mut sent, mut worst) = (0, Duration::ZERO);
     for entity in 0..1000 {
         let spawn = Spawn {
             entity,
@@ -733,21 +745,84 @@ fn a_peer_that_stops_reading_is_lost_once_a_mebibyte_is_waiting() {
             asset: "a".into(),
             name: Some(name.clone()),
         };
-        if host.spawn(&spawn).is_err() {
-            refused = true;
-            break;
+        if timed(&mut worst, || host.spawn(&spawn)).is_err() {
+            return (raw, sent, worst);
         }
         sent += 1;
     }
-    assert!(
-        refused,
-        "{sent} spawns of 60 kB went into a socket nobody reads"
-    );
+    panic!("{sent} spawns of 60 kB went into a socket nobody reads");
+}
+
+#[test]
+fn a_peer_that_stops_reading_is_lost_once_a_mebibyte_is_waiting_and_no_poll_waits_for_it() {
+    let _serial = serial();
+    let mut host = Link::host(cfg("Host", 0)).unwrap();
+    let (raw, sent, mut worst) = stall(&mut host);
     // more than the 1 MiB that may wait (section 7), and not absurdly more: the rule fires as soon as the
     // queue passes it
     assert!(sent * 60_000 > MAX_PENDING_CONTROL, "{sent} spawns");
-    let lost = lost_reason(&mut host);
+    let lost = {
+        let end = Instant::now() + WAIT;
+        let mut reason = None;
+        while reason.is_none() && Instant::now() < end {
+            for e in timed(&mut worst, || host.poll()) {
+                if let Event::Lost { reason: r } = e {
+                    reason = Some(r);
+                }
+            }
+            sleep(Duration::from_millis(2));
+        }
+        reason.expect("the session never ended")
+    };
     assert!(lost.contains("stopped reading"), "{lost}");
+    // the closing connection is given its 200 ms and then let go; the peer still has its socket open
+    for _ in 0..150 {
+        timed(&mut worst, || host.poll());
+        sleep(Duration::from_millis(2));
+    }
+    eprintln!("longest call while the peer held its socket without reading: {worst:?}");
+    assert!(worst < STALLED_CALL_LIMIT, "a call took {worst:?}");
+
+    // a guest that comes after is served, once the stalled peer has gone
+    drop(raw);
+    let mut guest = Link::guest(cfg("Guest", host.control_addr().unwrap().port())).unwrap();
+    let (eh, eg) = run_until(&mut host, &mut guest, both_connected);
+    assert!(both_connected(&eh, &eg), "{eh:?} {eg:?}");
+    let mut dropping = Duration::ZERO;
+    timed(&mut dropping, || drop(guest));
+    timed(&mut dropping, || drop(host));
+    assert!(dropping < STALLED_CALL_LIMIT, "a drop took {dropping:?}");
+}
+
+#[test]
+fn dropping_a_link_whose_peer_stopped_reading_waits_only_the_linger_time() {
+    let _serial = serial();
+    // How much goes into a socket nobody reads before the link refuses: found out with a first host...
+    let mut first = Link::host(cfg("Host", 0)).unwrap();
+    let (raw, sent, _) = stall(&mut first);
+    drop(first);
+    drop(raw);
+    // ...then a second one is filled to a little short of that. Its connection is live, the kernel's buffers
+    // and the runtime's are full, and what it still holds is under the 1 MiB that would end the session
+    // (four spawns of 60 kB are 240 kB less than the refusal; the capacity moves by less between two runs),
+    // so dropping it has to say `bye`, which cannot go out, and give up after the 200 ms of section 6.1.
+    let mut host = Link::host(cfg("Host", 0)).unwrap();
+    let raw = Raw::connect(&mut host);
+    let name = "x".repeat(60_000);
+    for entity in 0..sent.saturating_sub(4) {
+        let spawn = Spawn {
+            entity: entity as u32,
+            provider: "p".into(),
+            asset: "a".into(),
+            name: Some(name.clone()),
+        };
+        host.spawn(&spawn).unwrap();
+    }
+    let began = Instant::now();
+    drop(host);
+    let took = began.elapsed();
+    eprintln!("drop while the peer held its socket without reading: {took:?}");
+    assert!(took < STALLED_CALL_LIMIT, "the drop took {took:?}");
     drop(raw);
 }
 
