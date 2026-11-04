@@ -1649,8 +1649,14 @@ impl Link {
                             e.control_port
                         }
                         Err(e) => {
-                            // `Endpoint::read` never quotes the file, so this holds no token.
-                            self.last_error = Some(format!("endpoint file: {e}"));
+                            // `Endpoint::read` never quotes the file, so this holds no token. Its own
+                            // refusals already begin with "endpoint file: ".
+                            let why = e.to_string();
+                            self.last_error = Some(if why.starts_with("endpoint file: ") {
+                                why
+                            } else {
+                                format!("endpoint file: {why}")
+                            });
                             self.conn = Conn::Idle {
                                 next_try: now + self.cfg.reconnect,
                             };
