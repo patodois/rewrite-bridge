@@ -1,6 +1,6 @@
 # Passthrough link contract, protocol v1
 
-This is revision 6 of the contract for protocol v1 (section 12 lists what each revision changed). This
+This is revision 7 of the contract for protocol v1 (section 12 lists what each revision changed). This
 document is the whole protocol. A host plugin written in C, C++, C# or anything else should be
 able to implement it from this page alone; the Rust implementation in `src/link.rs` (cargo feature
 `link`) is one implementation of it, not the definition.
@@ -16,7 +16,7 @@ reads or writes another process's memory, injects code, or touches anti-cheat.
 |---|---|---|---|
 | control | TCP, `127.0.0.1` | JSON lines (UTF-8) | `hello`, `spawn`, `despawn`, `input`, `frame_channel`, `bye` |
 | state | UDP, `127.0.0.1` | binary, little-endian | `Heartbeat`, `Camera`, `Pose`, `Collision`, `Frame` |
-| pixels | memory-mapped file | binary, little-endian | RGBA frames, optional linear depth, announced by `Frame` |
+| pixels | shared pixel file | binary, little-endian | RGBA frames, optional linear depth, announced by `Frame` |
 
 Who sends what:
 
@@ -715,8 +715,9 @@ fields are not checked by the decoder; the reader below checks them against the 
 section 9.7 says how it uses them to hide latency.
 
 **Pixel file.** A regular file in the sender's temp directory, created exclusively and sized by the
-sender, mapped read-write by the sender and read-only by the receiver. The receiver treats the
-file as untrusted input (see "Opening and creating" below). Layout:
+sender and mapped read-write by the sender. The receiver uses bounded positional I/O on Unix,
+or a read-only mapping where an active mapping prevents ordinary file truncation (Windows).
+It treats every byte as untrusted input (see "Opening and creating" below). Layout:
 
 File header, 64 bytes:
 
@@ -778,7 +779,9 @@ another.
 The `Camera` that the frame was rendered with is the one named by `camera_seq`. Section 9.7 says
 how the depth is converted to and from a depth buffer and how the host reprojects and composites.
 
-`lock` is 8-byte aligned in the file and must be accessed with atomic 64-bit operations.
+`lock` is 8-byte aligned in the file. Writers and mapped readers access it with atomic 64-bit
+operations. A positional reader obtains complete little-endian lock values into owned storage,
+with the observations and checks below; it never dereferences peer-owned file pages.
 
 Writer:
 1. Store `lock + 1` (now odd), then issue a release fence
@@ -787,19 +790,43 @@ Writer:
 3. Store `lock + 1` again (even), with release ordering.
 4. Send the `Frame` datagram.
 
+**Announcements and presentation (revision 7).** A `Frame` datagram is an unvalidated
+announcement. Receiving it does not advance presentation order. A receiver rejects duplicates
+and older numbers relative to the newest valid copy accepted for presentation from the current
+file (sections 7 and 8), and advances that number only after the copy passes every check below.
+A rejected copy cannot advance it. Opening a replacement starts a new order and invalidates the
+previous image, including when the replacement cannot be opened. A reader reported gone also
+invalidates its image. Raw inspection/re-read APIs may remain unordered; applications presenting
+frames must use the ordered operation or apply this rule themselves.
+
 Reader, on a `Frame` datagram:
 0. If `frame` is 0 (a datagram never carries it, section 9.6, but a caller can hand a reader one, and an
    unwritten or odd slot may hold frame 0) or `slot` is not below the file's `slots`, skip this frame. (The reader finds the slot by `slot`
    and does not require `slot == frame % slots`; a writer produces that, and step 3 is what ties the
    slot to the frame.)
-1. `l1 = lock` (acquire). If `l1` is odd, skip this frame.
+1. Observe `l1 = lock`, then acquire ordering. If `l1` is odd, skip this frame.
 2. Read the slot header's `width` and `height`. They must each be at least 1 and at most the file's, and
    equal the datagram's `width` and `height`; if not, skip this frame, before anything is copied. Then
    copy the header fields, the pixels and the depth plane (if wanted) out.
-3. Acquire fence, then `l2 = lock`. If `l2 != l1` or the copied `frame` is not the datagram's
-   `frame`, the slot was overwritten while copying: discard the copy and wait for the next frame.
+3. Acquire fence, then observe `l2 = lock` and read the slot's `frame` again. If `l2 != l1`,
+   or either the copied or final `frame` is not the datagram's `frame`, the slot was overwritten while copying: discard the copy and wait for the next frame.
    (The overwritten case cannot be written as a static file, so no vector shows it; the live tests of
    each implementation do.)
+
+**Positional I/O (revision 7).** Complete every requested read, retrying interruptions and
+continuing short reads; EOF or an I/O failure discards the entire copy. The first observation
+precedes copying the planes, and the final lock/frame observation follows them. Accept only
+an unchanged even lock and matching frame identities, with the existing size checks. Buffers
+may contain partial or previous bytes after failure and are valid only on success. Depth may
+be omitted without changing the order rule. Adjacent rows may be read in a bounded span into
+owned scratch storage and then packed; padding is never presented.
+
+This avoids a process fault if the peer truncates after a length check. POSIX does not specify
+that a pread of eight bytes is an atomic acquire load from the writer's address space. The
+observations reject detected overlapping writes; they are not a proof of an indivisible snapshot
+on every OS and filesystem, nor protection against a writer that violates publication or reuses
+lock values. Writers still follow the atomic publication rules above. No wire field or file
+layout changes in this revision.
 
 With 3 or more slots the writer rarely reaches the slot being read.
 
@@ -851,12 +878,18 @@ does every byte of the file. A receiver MUST:
    the sums in "Compatibility and checks" above. A header whose numbers overflow is malformed. (A
    `slot_size` chosen so that `slots * slot_size` wraps in 64 bits once passed the file-length
    check of a reader that multiplied unchecked.)
-4. compare the file's current length (`fstat`, `FileChannel.size()`) with the length it mapped
-   **before each read**, and treat a shorter file as gone: skip the frame, drop the mapping, wait
-   for a new `frame_channel`. A file that shrinks under a live mapping makes the next access
-   fault (SIGBUS), which ends the process. The check narrows that window but cannot close it: a
-   truncation between the check and the copy still faults. The other half is on the sender (next
-   paragraph); the check guards against a broken or hostile peer, not a correct one.
+4. compare the file's current length (`fstat`, `FileChannel.size()`) with its length when
+   opened **before each read**, and treat a shorter file as gone: discard the copy and image,
+   close the reader, and wait for a new `frame_channel`. On Unix, additionally use bounded
+   positional I/O for the header and planes, so a later truncation returns EOF/error rather
+   than a mapping fault. On Windows, validate the actual mapping extent or recheck the length
+   once the section prevents further ordinary truncation, before accessing any slot.
+
+Revision 7 supersedes revision 6's section 9.6 statements "read-only by the receiver"
+(original line 718), "must be accessed with atomic 64-bit operations" as applied to positional
+readers (original line 781), and item 4's mapping-only length-check mitigation (original lines
+854 to 859). Mapped readers and writers retain the atomic requirements; a length check alone
+is not a substitute for safe I/O on a platform where files can shrink under mappings.
 
 A writer that is asked to create a file with a number of slots outside 1 to 16, a width or height
 of 0 or above 16384, or more than 67108864 pixels (the limits above) fails and creates nothing; one
@@ -1225,3 +1258,10 @@ A change that alters any layout or meaning above needs a new protocol version. A
 message type or field, or a new datagram `kind`, does not, because receivers ignore what they do
 not know. Neither does giving a meaning to `reserved` bytes, as revision 3 does, as long as zero
 keeps the old meaning.
+
+- v1, revision 7: clarify that Frame is an announcement and presentation order advances only
+  after a valid current-file copy (sections 7, 8 and 9.6); invalidate the previous image on channel
+  replacement or a gone reader. Section 9.6 permits bounded positional reads on Unix, specifies
+  complete reads, lock/frame observations and their guarantees and limitations, and supersedes
+  the mapping-only reader and truncation mitigation wording of revision 6. Raw re-read APIs may
+  remain unordered. Protocol version 1, every wire field and every file offset remain unchanged.
