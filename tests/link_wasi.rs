@@ -861,6 +861,9 @@ fn dropping_a_link_whose_peer_stopped_reading_waits_only_the_linger_time() {
 /// A received `bye` decides how a session ended (contract section 6.1), even when the peer closed the connection
 /// before the host wrote again: the next write fails, and the `bye` that is waiting to be read must not be lost
 /// to the write error. The peer says `bye` and closes; the host writes until a write fails.
+// Not on Windows: a peer that closes with data it has not read sends a reset there, and the reset discards the
+// `bye` waiting in the host's socket (os errors 10053 and 10054), so no read can find it.
+#[cfg(not(windows))]
 #[test]
 fn a_bye_that_came_before_the_close_decides_how_the_session_ended_when_a_write_fails() {
     let _serial = serial();
@@ -898,6 +901,8 @@ fn a_bye_that_came_before_the_close_decides_how_the_session_ended_when_a_write_f
 /// of the peer, which does not read, are full), the peer says `bye` and closes, and the next `poll` flushes
 /// first. How far short of the refusal the host stops varies (see the drop test), so several margins are tried;
 /// each must end with the peer's reason.
+// Not on Windows, for the reason above.
+#[cfg(not(windows))]
 #[test]
 fn a_bye_that_came_before_the_close_decides_how_the_session_ended_when_poll_finds_the_write_failing(
 ) {
@@ -1216,7 +1221,9 @@ fn a_collision_of_9000_bytes_that_starts_as_a_full_valid_chunk_is_malformed() {
 }
 
 /// One poll reads at most 1024 datagrams on this target (4096 natively), however many are waiting: the cost of
-/// reading them, sustained, is what the limit is for. The rest are read by the polls that follow.
+/// reading them, sustained, is what the limit is for. The rest are read by the polls that follow. How many of
+/// the datagrams sent are waiting depends on the system: Linux caps the receive buffer and drops the rest as they
+/// arrive, so the limit can only be seen where the buffer holds more than 1024.
 #[cfg(target_os = "wasi")]
 #[test]
 fn a_poll_reads_at_most_1024_foreign_datagrams_and_the_next_polls_read_the_rest() {
@@ -1228,14 +1235,18 @@ fn a_poll_reads_at_most_1024_foreign_datagrams_and_the_next_polls_read_the_rest(
     while queued < 3000 && foreign.send_to(&[7u8; 24], to).is_ok() {
         queued += 1;
     }
-    assert!(queued >= 2500, "only {queued} datagrams could be queued");
+    assert!(queued >= 2500, "only {queued} datagrams could be sent");
     host.poll();
     let first = host.stats().foreign;
-    assert_eq!(first, 1024, "the first poll read {first} datagrams");
+    assert!(first <= 1024, "the first poll read {first} datagrams");
     for _ in 0..10 {
         host.poll();
     }
-    assert_eq!(host.stats().foreign, queued as u64);
+    let all = host.stats().foreign;
+    assert!(all >= first && all <= queued as u64, "read {all} of {queued}");
+    if all > 1024 {
+        assert_eq!(first, 1024, "more than 1024 were waiting, and the first poll read {first}");
+    }
 }
 
 fn chunk(query: u32, index: u16, count: u16, tag: f32) -> Datagram {
