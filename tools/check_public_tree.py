@@ -65,7 +65,7 @@ KIB = 1024
 MIB = 1024 * KIB
 DEFAULT_MAX_BINARY = 256 * KIB
 DEFAULT_MAX_TEXT = 2 * MIB
-SCAN_CAP = 1 * MIB          # content rules read at most this much of a blob; bigger blobs hit the size rules
+SCAN_CAP = 1 * MIB          # always inspect small blobs; accepted larger text is scanned up to its limit
 BINARY_PROBE = 8000
 HEADER_LINES = 60           # copyright headers are looked for in the first lines of a file
 CHUNK_BYTES = 32 * MIB      # blobs are read in batches of at most this many bytes (RAM bound)
@@ -524,13 +524,24 @@ def audit(git, rules, repo, entries):
         else:
             record(rule, path, detail, blob, size, commit)
 
-    # 1. content of the blobs small enough to read, once per blob
+    # 1. Scan every accepted text blob completely, once per blob. Larger rejected text
+    # needs only a size finding; large binaries need only a classification probe. Explicit
+    # text limits and size allowances also extend scanning, not just acceptance.
     content_by_blob, lfs, binary = {}, {}, {}
-    small = [s for s in shas if sizes[s] <= SCAN_CAP]
-    paths_of = {}
+    scan_limits = {sha: rules.max_text for sha in shas}
     for path, sha, _mode, _commit in entries:
-        paths_of.setdefault(sha, set()).add(path)
-    for sha, data in git.read_blobs(small, sizes):
+        caps = [a.max_bytes for a in rules.allow_for(path, sha, False) if a.max_bytes is not None]
+        if caps:
+            scan_limits[sha] = max(scan_limits[sha], max(caps))
+    scan = []
+    for sha in shas:
+        if sizes[sha] <= SCAN_CAP:
+            scan.append(sha)
+        else:
+            binary[sha] = is_binary(git.probe(sha, BINARY_PROBE))
+            if not binary[sha] and sizes[sha] <= scan_limits[sha]:
+                scan.append(sha)
+    for sha, data in git.read_blobs(scan, sizes):
         declared = lfs_size(data)
         if declared is not None:
             lfs[sha] = declared
