@@ -3878,6 +3878,40 @@ mod tests {
         drop(peer);
     }
 
+    #[test]
+    fn pixel_widths_can_shrink_and_grow_without_stale_pixels() {
+        for want_depth in [false, true] {
+            let mut w = FrameWriter::create_temp_with(
+                "widths",
+                &FrameFileOptions::new(16, 16, 1).with_depth(),
+            )
+            .unwrap();
+            let r = FrameReader::open(w.path()).unwrap();
+            let (mut rgba, mut depth) = (vec![], vec![]);
+            for (index, width) in [15, 14, 15, 8, 7, 16, 1, 14, 15].into_iter().enumerate() {
+                let frame = index + 1;
+                let count = (width * 9) as usize;
+                let pixels: Vec<u8> = (0..count * 4)
+                    .map(|j| (j * 37 + frame * 11) as u8)
+                    .collect();
+                let expected: Vec<f32> = (0..count).map(|j| (j + frame * 1000) as f32).collect();
+                let ready = w
+                    .write_depth(&pixels, Some(&expected), width, 9, 0, frame as u64)
+                    .unwrap();
+                r.read_latest(
+                    &ready,
+                    &mut rgba,
+                    if want_depth { Some(&mut depth) } else { None },
+                )
+                .unwrap();
+                assert_eq!(rgba, pixels, "frame {frame}, width {width}");
+                if want_depth {
+                    assert_eq!(depth, expected);
+                }
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn presentation_can_skip_depth_and_counts_only_nonzero_stale_frames() {
