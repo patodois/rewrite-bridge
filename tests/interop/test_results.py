@@ -22,12 +22,12 @@ def reports():
 
 
 class ResultsTests(unittest.TestCase):
-    def judge(self, host, guest):
+    def judge(self, host, guest, mode="plain"):
         with tempfile.TemporaryDirectory(prefix="interop-judge-") as directory:
             paths = [Path(directory) / "host.log", Path(directory) / "guest.log"]
             for path, value in zip(paths, (host, guest)):
                 path.write_text("RBL-INTEROP-RESULT " + json.dumps(value) + "\n")
-            return subprocess.run([sys.executable, str(JUDGE), "--host-label", "rust", "--guest-label", "java",
+            return subprocess.run([sys.executable, str(JUDGE), "--mode", mode, "--host-label", "rust", "--guest-label", "java",
                                    str(paths[0]), str(paths[1])], capture_output=True, text=True)
 
     def test_valid_measured_session(self):
@@ -46,9 +46,10 @@ class ResultsTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, "an unmeasured presentation path passed")
 
     def test_empty_or_nonobject_reports_do_not_pass(self):
-        for value in ({}, [], None, False):
-            with self.subTest(value=value):
-                self.assertNotEqual(self.judge(value, value).returncode, 0)
+        for mode in ("plain", "token", "wrong-token"):
+            for value in ({}, [], None, False):
+                with self.subTest(mode=mode, value=value):
+                    self.assertNotEqual(self.judge(value, value, mode).returncode, 0)
 
 
 if __name__ == "__main__":
