@@ -75,6 +75,11 @@ required-features = ["link"]
 name = "link_wasi"
 required-features = ["link"]
 
+# A host out of file descriptors still takes a guest (Unix only; lowers its own descriptor limit).
+[[test]]
+name = "link_fds"
+required-features = ["link"]
+
 # The shared protocol vectors of tests/vectors/link, also run by link-java, link-c and link-cs.
 [[test]]
 name = "link_vectors"

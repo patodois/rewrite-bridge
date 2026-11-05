@@ -894,6 +894,51 @@ fn a_bye_that_came_before_the_close_decides_how_the_session_ended_when_a_write_f
     );
 }
 
+/// The same when it is `poll` that finds the write failing: the host has data it could not write yet (the buffers
+/// of the peer, which does not read, are full), the peer says `bye` and closes, and the next `poll` flushes
+/// first. How far short of the refusal the host stops varies (see the drop test), so several margins are tried;
+/// each must end with the peer's reason.
+#[test]
+fn a_bye_that_came_before_the_close_decides_how_the_session_ended_when_poll_finds_the_write_failing(
+) {
+    let _serial = serial();
+    let mut first = Link::host(cfg("Host", 0)).unwrap();
+    let (raw, sent, _) = stall(&mut first);
+    drop(first);
+    drop(raw);
+    let name = "x".repeat(60_000);
+    for margin in [2, 6, 12, 24, 48] {
+        let mut host = Link::host(cfg("Host", 0)).unwrap();
+        let mut raw = Raw::connect(&mut host);
+        let mut overshot = false;
+        for entity in 0..sent.saturating_sub(margin) {
+            let spawn = Spawn {
+                entity: entity as u32,
+                provider: "p".into(),
+                asset: "a".into(),
+                name: Some(name.clone()),
+            };
+            if host.spawn(&spawn).is_err() {
+                overshot = true;
+                break;
+            }
+        }
+        if overshot {
+            continue;
+        }
+        raw.tcp
+            .write_all(b"{\"type\":\"bye\",\"reason\":\"peer is done\"}\n")
+            .unwrap();
+        drop(raw);
+        sleep(Duration::from_millis(50));
+        let lost = lost_reason(&mut host);
+        assert!(
+            lost.contains("peer said bye"),
+            "margin {margin}: the session ended with {lost:?}"
+        );
+    }
+}
+
 /// Polls a scratch host for `ms`, so that parked sockets whose peers have gone are closed by it: the list of
 /// parked sockets belongs to the process, and the tests of this file share one.
 #[cfg(target_os = "wasi")]
@@ -1064,6 +1109,110 @@ fn receiving_datagrams_does_not_grow_memory() {
         after <= before + SLACK_PAGES,
         "{got} datagrams of a session grew memory from {before} to {after} pages"
     );
+}
+
+/// A session goes on through a flood of datagrams from a process that is not its peer, and no poll is held up by it:
+/// 300 foreign datagrams of three sizes (6000 a second at 20 polls a second, 2.5 MB a tick) arrive with each of 100
+/// polls, while the guest's poses keep coming. (A flood of 3000 a tick fills the 4 MiB socket and the system drops
+/// the poses with it, whatever the link does.)
+#[cfg(target_os = "wasi")]
+#[test]
+fn a_session_survives_a_flood_of_foreign_datagrams_and_no_poll_takes_long() {
+    let _serial = serial();
+    let mut host = Link::host(cfg("Host", 0)).unwrap();
+    let mut guest = Link::guest(cfg("Guest", host.control_addr().unwrap().port())).unwrap();
+    let (eh, eg) = run_until(&mut host, &mut guest, both_connected);
+    assert!(both_connected(&eh, &eg));
+    guest
+        .spawn(&Spawn {
+            entity: 1,
+            provider: "p".into(),
+            asset: "a".into(),
+            name: None,
+        })
+        .unwrap();
+    run_until(&mut host, &mut guest, |h, _| {
+        h.iter().any(|e| matches!(e, Event::Spawn(_)))
+    });
+    let host_udp = host.udp_addr().unwrap();
+    let flood = UdpSocket::bind(localhost(0)).unwrap();
+    let sizes = [24usize, 1000, 8192];
+    let (mut worst, mut poses) = (Duration::ZERO, 0usize);
+    for tick in 0..100 {
+        guest.send_poses(&[Pose::new(1, now_us())]).unwrap();
+        for i in 0..300 {
+            let _ = flood.send_to(&vec![7u8; sizes[i % 3]], host_udp);
+        }
+        let events = timed(&mut worst, || host.poll());
+        poses += events
+            .iter()
+            .filter(|e| matches!(e, Event::Poses { .. }))
+            .count();
+        guest.poll();
+        assert!(host.is_connected(), "the session ended in tick {tick}");
+    }
+    eprintln!("flood: longest poll {worst:?}, {poses} pose datagrams of 100 reached the host");
+    assert!(worst < Duration::from_millis(100), "a poll took {worst:?}");
+    assert!(
+        poses >= 50,
+        "only {poses} of 100 pose datagrams got through the flood"
+    );
+}
+
+/// Section 2: a receiver reads into a buffer of at least 8193 bytes, because the system cuts a datagram that does
+/// not fit without a word, and a Collision of 9000 bytes whose first 8192 are a full valid chunk would arrive as
+/// that chunk. It is malformed (no kind may be longer than 8192 bytes) and is dropped. The chunk alone is taken.
+#[test]
+fn a_collision_of_9000_bytes_that_starts_as_a_full_valid_chunk_is_malformed() {
+    let _serial = serial();
+    let mut host = Link::host(cfg("Host", 0)).unwrap();
+    let raw = Raw::connect(&mut host);
+    let full = |query| {
+        Datagram::Collision(CollisionChunk {
+            query,
+            chunk_index: 0,
+            chunk_count: 1,
+            center: [0.0; 3],
+            radius: 4.0,
+            triangles: vec![[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]; 226],
+        })
+    };
+    let datagram = |session, query| {
+        let header = Header {
+            version: 1,
+            flags: 0,
+            session,
+            seq: 1,
+            time_us: now_us(),
+        };
+        let mut out = Vec::new();
+        encode_datagram(&header, &full(query), &mut out).unwrap();
+        out
+    };
+    let settle = |host: &mut Link| {
+        let mut events = Vec::new();
+        for _ in 0..40 {
+            events.extend(host.poll());
+            sleep(Duration::from_millis(2));
+        }
+        events
+    };
+    let mut ok = datagram(raw.session, 1);
+    assert_eq!(ok.len(), MAX_DATAGRAM);
+    raw.udp.send(&ok).unwrap();
+    let events = settle(&mut host);
+    assert!(events.iter().any(|e| matches!(e, Event::Collision(_))));
+    assert_eq!(host.stats().malformed, 0);
+
+    ok = datagram(raw.session, 2);
+    ok.resize(9000, 0);
+    raw.udp.send(&ok).unwrap();
+    let events = settle(&mut host);
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Collision(_))),
+        "the first 8192 bytes of a datagram of 9000 were taken for a chunk"
+    );
+    assert_eq!(host.stats().malformed, 1);
 }
 
 fn chunk(query: u32, index: u16, count: u16, tag: f32) -> Datagram {
