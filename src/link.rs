@@ -1979,9 +1979,16 @@ impl Link {
 
     fn poll_control(&mut self, now: Instant) {
         let Some(ctl) = self.ctl() else { return };
-        if let Err(reason) = ctl.flush() {
-            return self.end(reason, false);
-        }
+        let write_failed = ctl.flush().err();
+        self.read_control(now, write_failed);
+    }
+
+    /// Reads and handles what the peer sent, then ends the session if a write failed (`write_failed`) or the
+    /// connection did. The reading comes first even after a failed write: a `bye` that is waiting decides how
+    /// the session ended (contract section 6.1), so a peer that said `bye` and closed is a clean end, not a
+    /// broken write.
+    fn read_control(&mut self, now: Instant, write_failed: Option<String>) {
+        let Some(ctl) = self.ctl() else { return };
         let (lines, end) = ctl.read_lines();
         for line in lines {
             self.stats.lines_received += 1;
@@ -1991,6 +1998,9 @@ impl Link {
             if matches!(self.conn, Conn::Idle { .. }) {
                 return;
             }
+        }
+        if let Some(reason) = write_failed {
+            return self.end(reason, false);
         }
         if let Some((reason, bye)) = end {
             self.end(reason, bye);
@@ -2387,7 +2397,7 @@ impl Link {
         let ctl = self.ctl().expect("connected");
         ctl.queue(c);
         if let Err(reason) = ctl.flush() {
-            self.end(reason, false);
+            self.read_control(Instant::now(), Some(reason));
             return Err(LinkError::NotConnected);
         }
         Ok(())

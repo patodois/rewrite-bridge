@@ -858,6 +858,42 @@ fn dropping_a_link_whose_peer_stopped_reading_waits_only_the_linger_time() {
     let _ = waited;
 }
 
+/// A received `bye` decides how a session ended (contract section 6.1), even when the peer closed the connection
+/// before the host wrote again: the next write fails, and the `bye` that is waiting to be read must not be lost
+/// to the write error. The peer says `bye` and closes; the host writes until a write fails.
+#[test]
+fn a_bye_that_came_before_the_close_decides_how_the_session_ended_when_a_write_fails() {
+    let _serial = serial();
+    let mut host = Link::host(cfg("Host", 0)).unwrap();
+    let mut raw = Raw::connect(&mut host);
+    raw.tcp
+        .write_all(b"{\"type\":\"bye\",\"reason\":\"peer is done\"}\n")
+        .unwrap();
+    drop(raw);
+    sleep(Duration::from_millis(50));
+    // The first write after the close goes into the kernel and brings back a reset; a later one fails.
+    let mut failed = false;
+    for entity in 0..200 {
+        let spawn = Spawn {
+            entity,
+            provider: "p".into(),
+            asset: "a".into(),
+            name: None,
+        };
+        if host.spawn(&spawn).is_err() {
+            failed = true;
+            break;
+        }
+        sleep(Duration::from_millis(5));
+    }
+    assert!(failed, "writes to a closed peer never failed");
+    let lost = lost_reason(&mut host);
+    assert!(
+        lost.contains("peer said bye") && lost.contains("peer is done"),
+        "the session ended with {lost:?}"
+    );
+}
+
 /// Polls a scratch host for `ms`, so that parked sockets whose peers have gone are closed by it: the list of
 /// parked sockets belongs to the process, and the tests of this file share one.
 #[cfg(target_os = "wasi")]
