@@ -323,15 +323,20 @@ mod tests {
 
     #[test]
     fn the_link_survives_bad_channels_bad_slots_a_bye_and_a_new_pixel_file() {
-        link_survives(Duration::ZERO);
+        link_survives(Duration::ZERO, false);
     }
 
     #[test]
     fn the_link_survives_a_scheduler_pause_longer_than_the_production_watchdog() {
-        link_survives(Duration::from_millis(2100));
+        link_survives(Duration::from_millis(2100), false);
     }
 
-    fn link_survives(pause: Duration) {
+    #[test]
+    fn the_link_survives_a_pause_before_the_guest_polls_first() {
+        link_survives(Duration::from_millis(2100), true);
+    }
+
+    fn link_survives(pause: Duration, guest_first: bool) {
         let (mut app, port) = host_app();
         // no GuestComposePlugin: the plugin made the resource itself
         assert!(app.world().get_resource::<GuestFrames>().is_some());
@@ -368,9 +373,15 @@ mod tests {
         // Both peers have drained the handshake and neither has a heartbeat pending.
         // A descheduled CI worker can leave both loops idle here.
         sleep(pause);
+        if guest_first {
+            guest.poll();
+        }
         app.update();
         let events = guest.poll();
-        if !pause.is_zero() { eprintln!("after pause: {events:?}; host {:?}", stats(&app)); }
+        assert!(
+            guest.is_connected(),
+            "guest lost after scheduling pause: {events:?}"
+        );
 
         // A good channel and a good frame
         let mut w1 = writer("hl-one");
@@ -456,7 +467,9 @@ mod tests {
         let mut old = write(&mut a, 10);
         guest.send_frame(&old).unwrap();
         pump(&mut app, &mut [&mut guest], |a| stats(a).frames_shown == 1);
-        for _ in 1..100 { old = write(&mut a, 20); }
+        for _ in 1..100 {
+            old = write(&mut a, 20);
+        }
         let mut b = writer("order-b");
         let ready = write(&mut b, 30);
         guest.announce_frames(b.channel()).unwrap();
@@ -468,7 +481,12 @@ mod tests {
         pump(&mut app, &mut [&mut guest], |a| stats(a).frames_shown == 2);
         assert_eq!(shown(&app), Some((1, true, 30)));
         // An invalid replacement must also remove the previous image.
-        guest.announce_frames(&FrameChannel { path: "relative.frames".into(), ..b.channel().clone() }).unwrap();
+        guest
+            .announce_frames(&FrameChannel {
+                path: "relative.frames".into(),
+                ..b.channel().clone()
+            })
+            .unwrap();
         settle(&mut app, &mut [&mut guest]);
         assert_eq!(shown(&app), None);
     }
@@ -487,11 +505,42 @@ mod tests {
         // Ordinary truncation is refused while mapped on Windows; Unix must survive it.
         #[cfg(unix)]
         {
-            std::fs::OpenOptions::new().write(true).open(w.path()).unwrap().set_len(0).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(w.path())
+                .unwrap()
+                .set_len(0)
+                .unwrap();
             guest.send_frame(&FrameReady { frame: 2, ..ready }).unwrap();
             settle(&mut app, &mut [&mut guest]);
             assert_eq!(shown(&app), None);
         }
+    }
+
+    #[test]
+    fn presentation_never_regresses_within_the_same_file() {
+        let (mut app, port) = host_app();
+        let mut guest = guest_link(port);
+        connect(&mut app, &mut guest);
+        let mut w = writer("same-file-order");
+        guest.announce_frames(w.channel()).unwrap();
+        settle(&mut app, &mut [&mut guest]);
+        let mut frames = Vec::new();
+        for i in 1..=5 {
+            frames.push(write(&mut w, i));
+        }
+        guest.send_frame(&frames[4]).unwrap();
+        pump(&mut app, &mut [&mut guest], |a| stats(a).frames_shown == 1);
+        assert_eq!(shown(&app), Some((5, true, 5)));
+        guest.send_frame(&frames[3]).unwrap();
+        guest.send_frame(&frames[4]).unwrap();
+        settle(&mut app, &mut [&mut guest]);
+        assert_eq!(
+            stats(&app).frames_shown,
+            1,
+            "older and duplicate slots must not be presented"
+        );
+        assert_eq!(shown(&app), Some((5, true, 5)));
     }
 
     #[test]
