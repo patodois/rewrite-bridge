@@ -80,6 +80,11 @@ required-features = ["link"]
 name = "link_fds"
 required-features = ["link"]
 
+# A Warframe rewrite's asset ids on the wire, against the fake_host and fake_guest programs (no game files).
+[[test]]
+name = "warframe_ids"
+required-features = ["link"]
+
 # The shared protocol vectors of tests/vectors/link, also run by link-java, link-c and link-cs.
 [[test]]
 name = "link_vectors"

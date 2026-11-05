@@ -9,8 +9,14 @@
 //! surface below that point once a `Collision` snapshot covers it (until then it floats at eye
 //! height). Use that with a real game, whose player is rarely near the origin.
 //!
+//! The cube is announced as `--provider` (default `Fake Guest`) with `--asset` (default `demo/cube`) and
+//! `--name` (default `Cube`), so a host can be tried with the ids of a real game's provider, for example
+//! `--provider Warframe --asset /Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx`. The link carries the
+//! id as a string and does not check it; the cube is drawn whatever the id says.
+//!
 //! cargo run --release --features link --example fake_guest -- [--port 47800] [--seconds 10]
 //!     [--frames [--no-depth] [--latency 40]] [--in-front]     (latency in milliseconds)
+//!     [--provider NAME] [--asset ID] [--name NAME]
 
 #[path = "common/raster.rs"]
 mod raster;
@@ -105,6 +111,9 @@ fn main() -> std::io::Result<()> {
     let with_depth = !std::env::args().any(|a| a == "--no-depth");
     let latency = Duration::from_millis(arg("--latency").unwrap_or(40));
     let in_front = std::env::args().any(|a| a == "--in-front");
+    let provider: String = arg("--provider").unwrap_or_else(|| "Fake Guest".into());
+    let asset: String = arg("--asset").unwrap_or_else(|| "demo/cube".into());
+    let name: String = arg("--name").unwrap_or_else(|| "Cube".into());
     // With --in-front: chosen from the first camera, then set on the ground once collision is known
     let mut center = (!in_front).then_some(CUBE_CENTER);
     let mut grounded = !in_front;
@@ -142,9 +151,9 @@ fn main() -> std::io::Result<()> {
                     ));
                     let _ = link.spawn(&Spawn {
                         entity: CUBE,
-                        provider: "Fake Guest".into(),
-                        asset: "demo/cube".into(),
-                        name: Some("Cube".into()),
+                        provider: provider.clone(),
+                        asset: asset.clone(),
+                        name: Some(name.clone()),
                     });
                     if frames {
                         let tag = format!("guest-{:08x}", p.session);
