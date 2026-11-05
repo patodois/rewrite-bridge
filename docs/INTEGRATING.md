@@ -5,14 +5,15 @@ rewrite-bridge passthrough: two programs on one machine, each running its own ga
 covers the three things you can build, the library for your language, a minimal loop for each, how to test
 with no second game, and what is not proven.
 
-- **Contract.** [`CONTRACT.md`](CONTRACT.md) is the protocol: v1, revision 6. This guide does not restate it
+- **Contract.** [`CONTRACT.md`](CONTRACT.md) is the protocol: v1, revision 7. This guide does not restate it
   and links to the section that decides each point. If the contract and this page disagree, the contract wins.
-- **Checked against** rewrite-bridge `main` at `1bc3b02` and the `main` branches of link-c, link-cs and link-java
-  (all revision 6), on macOS 26 (arm64) with Rust 1.99.1, Apple clang 21, .NET SDK 8.0.426 and JDK 25 (Java code
-  compiled with `--release 8`). Every command and snippet below was run there, except where a section says it was not.
-  The guide's own commands were not run on Linux or Windows; what those systems' CI runs is listed under "Not supported or not
-  proven". What rewrite-bridge 0.3.1 adds (`Link::last_error`, and the link on `wasm32-wasip2`) was run on the branch that
-  becomes 0.3.1: on macOS, under wasmtime 50.0.1, and for the stalled-peer tests on GitHub's `ubuntu-latest`.
+- **Validation scope.** This guide targets rewrite-bridge 0.4.0 and contract revision 7, with the matching
+  link-c, link-cs and link-java APIs. Native examples were developed on macOS 26 (arm64) with Rust 1.99.1,
+  Apple clang 21, .NET SDK 8.0.426 and JDK 25 (`--release 8`). Historical observations below identify their
+  environment; they do not imply every command was rerun for every release. The guide's commands were not
+  run on Linux or Windows; those systems' CI coverage is listed under "Not supported or not proven".
+  `Link::last_error` and the link on `wasm32-wasip2`, introduced in 0.3.1, were exercised on macOS under
+  wasmtime 50.0.1, with stalled-peer tests also exercised on GitHub's `ubuntu-latest`.
 
 ## Shortest path
 
@@ -56,10 +57,21 @@ tested against each other.
 - **Bevy 0.20:** `rewrite-bridge-bevy` loads provider output; with its `compose` feature `HostLinkPlugin` and
   `GuestComposePlugin` make a Bevy camera a host that depth-composites a guest's frames. Run against
   `fake_guest --frames` here (see [Bevy host](#bevy-host)). Details: [its README](../rewrite-bridge-bevy/README.md).
-- **One copy per build.** Before 1.0 a new minor number is a different crate, and a build with two copies fails to
-  compile (see [the README](../README.md#one-copy-for-the-whole-build)). The providers are on 0.3 from `wt-unpack`
-  0.4.0, `wf-unpack` 0.4.0, `hytale-unpack` 0.3.0, `mc-unpack` 0.4.0 and `nocturne-unpack` 0.3.0, as are
-  `bridge-guest` and `bridge-testbed`. Older provider versions are on 0.2.x and do not mix with 0.3.
+- **One copy per build.** Before 1.0 a new minor number is a different crate: provider types from 0.3
+  cannot be passed to an API expecting 0.4 (see [the README](../README.md#one-copy-for-the-whole-build)).
+  At the publication of rewrite-bridge 0.4.0, the published provider releases `wt-unpack` 0.4.0,
+  `wf-unpack` 0.4.0, `hytale-unpack` 0.3.0, `mc-unpack` 0.4.0 and `nocturne-unpack` 0.3.0 still require
+  rewrite-bridge 0.3. Published `bridge-guest` and `bridge-testbed` also still use 0.3 until their own
+  compatible releases are published. Publishing rewrite-bridge 0.4.0 alone does not upgrade them.
+  For provider integration, use a dependency graph that stays on 0.3 until those compatible releases are
+  available, or select provider releases that explicitly require 0.4 once they exist. Do not force the old
+  provider graph onto 0.4 with a version override. Standalone 0.3 peers can still negotiate wire protocol v1;
+  this Rust type compatibility requirement concerns crates linked into one program.
+  Run `cargo tree -d` in the consumer to find duplicate crate versions, then
+  `cargo tree -i rewrite-bridge@0.4.0` to see who requires the new crate. For an old copy, use
+  `cargo tree -i rewrite-bridge@<exact-version-from-cargo-tree>` with the version printed by the first
+  command. Check `rewrite-bridge-bevy` as well if it is used. Older provider releases on 0.2.x need a
+  matching older graph too.
 
 ### C or C++ mod: Skyrim (SKSE), Fallout 4 (F4SE), GTA V (ScriptHookV), Unreal
 
@@ -544,8 +556,8 @@ link-c/build/demo host --seconds 6             # a host that sends cameras and c
 It writes its pixel file in the system temp folder; set `TMPDIR` to keep it elsewhere. Building the Rust peers
 below can take a while at `Updating crates.io index`, or fail where crates.io cannot be reached: use this one then.
 
-The Rust peers ship with the crate and have more options. Build them once (or `cargo install rewrite-bridge --version 0.3.0
---features link --examples`, which put them in `~/.cargo/bin`; checked offline here):
+The Rust peers ship with the crate and have more options. Build them once (or `cargo install rewrite-bridge --version 0.4.0
+--features link --examples`, which puts them in `~/.cargo/bin` once that release is available):
 
 ```sh
 git clone https://github.com/patodois/rewrite-bridge && cd rewrite-bridge
@@ -673,8 +685,8 @@ Text below is what the code printed when run. Wording is each library's own and 
 | What you see | Cause | Fix |
 |---|---|---|
 | Host: `Error: Os { code: 48, kind: AddrInUse, message: "Address already in use" }` (Rust `Link::host`; code 98 on Linux). C: `rbl_link_host` returns a non-zero status, print `rbl_strerror` (text not captured here) | Another process holds the control port (often a previous run, or a second host) | Stop it, or pick another `control_port`; with an endpoint file use port 0, the file carries the real one |
-| Guest: no event, never connects (`connected=false`) | No host is listening, or the endpoint file is missing or unusable. A guest retries every 500 ms for ever. A Rust guest (0.3.1) says why in `Link::last_error()`: `cannot connect to 127.0.0.1:<port>: connection refused` when nothing listens. The C, C# and Java guests, as run for this guide, print nothing | Start the host first; in Rust print `last_error()` after a timeout, in the others print your own "waiting for host"; check the file as in the next row |
-| Guest silent with an endpoint file | The guest cannot use the file. A Rust guest (0.3.1) puts the reason in `last_error()`, and these were printed: `endpoint file: group or others have permissions on it` (fix: `chmod 600`), `endpoint file: not a JSON object`, `endpoint file: No such file or directory (os error 2)` (the host is not running yet, or the path differs). The other libraries say nothing; diagnose with `Endpoint::read(path)` (Rust, public), which printed for a file with a bad `control_port`: `InvalidData: endpoint file: control_port is not an integer from 1 to 65535` | Fix the named problem; the guest re-reads the file before every attempt |
+| Guest: no event, never connects (`connected=false`) | No host is listening, or the endpoint file is missing or unusable. A guest retries every 500 ms for ever. A Rust guest (0.3.1) says why in `Link::last_error()`: `cannot connect to 127.0.0.1:<port>: connection refused` when nothing listens. C# exposes connection and endpoint failures in `Link.LastError`; the caller chooses when to log them. C and Java callers must provide their own connection diagnostics | Start the host first; in Rust inspect `last_error()` and in C# inspect `LastError` after a timeout; in C and Java print your own "waiting for host"; check the file as in the next row |
+| Guest silent with an endpoint file | The guest cannot use the file. A Rust guest (0.3.1) puts the reason in `last_error()`, and these were printed: `endpoint file: group or others have permissions on it` (fix: `chmod 600`), `endpoint file: not a JSON object`, `endpoint file: No such file or directory (os error 2)` (the host is not running yet, or the path differs). C# also exposes the endpoint refusal through `Link.LastError`, including an unavailable Unix permission-verification API; the file remains refused when permissions cannot be verified. In C and Java, call the endpoint reader directly to diagnose it. Rust also offers public `Endpoint::read(path)` | Fix the named problem; the guest re-reads the file before every attempt |
 | On `wasm32-wasip2`, `last_error()` says `not accepting: peers that stopped reading still hold earlier connections` (a host) or `not connecting: …` (a guest) | Four earlier connections whose peers held the socket open and stopped reading are still set aside, counted for the whole component (see the README of rewrite-bridge, "In a component") | Make the peers read or exit; the text goes away when one lets go. Run in the test `four_stalled_peers_fill_the_limit_and_a_fifth_connection_waits_for_one_to_let_go` |
 | Guest: `peer said bye: unauthorized` (the host's own event says just `unauthorized`) | Wrong or missing token. The host makes a new token each run, so a copy of an old file is useless | Read the file the running host wrote; never copy or cache the token |
 | Guest: `peer said bye: busy` | The host already has a guest | Stop the first guest |
@@ -718,15 +730,17 @@ From both:
 - **Protocol version** is negotiated in `hello`: `protocol` is the highest the side supports, `min_protocol` the
   lowest. The session version is the smaller `protocol`, valid only if it is at least the larger `min_protocol`;
   otherwise the host sends `bye` and closes (contract section 6). The only version that exists is 1.
-- **Contract revision** is not on the wire. Revisions 2 to 6 changed validation and added optional things without
+- **Contract revision** is not on the wire. Revisions 2 to 7 changed validation and added optional things without
   changing the protocol version (contract section 12 says why each stays v1). To check what you have: the first
-  paragraph of `docs/CONTRACT.md`; the library README (link-c, link-cs, link-java say "revision 6" on `main`
-  and at their `v0.2.0` tags); and the shared vectors, `tests/vectors/link/SHA256SUMS`, which each library
-  checks against a digest and runs in its test suite.
+  paragraph of `docs/CONTRACT.md`; the library README (these releases describe revision 7); and the
+  shared vectors, `tests/vectors/link/SHA256SUMS`, which each library checks against a digest and runs
+  in its test suite. Revision 7 clarifies frame presentation and bounded positional pixel reads without
+  changing the wire protocol or file layout.
 - **Mixed revisions** (contract section 12; not run here). A revision 6 guest with a token works with a
   revision 5 host, which ignores the field. A revision 5 guest cannot open a session with a host that has a token.
-  The Rust crate has the token from 0.3.0 (0.2.3 has no `endpoint_file`). `bridge-guest` is on 0.3 and connects to a
-  host that requires one with `--endpoint-file` or `--token-file`.
+  The Rust crate has the token from 0.3.0 (0.2.3 has no `endpoint_file`). The published `bridge-guest` still uses 0.3 until its own compatible release; it can connect to a
+  token-requiring v1 host with `--endpoint-file` or `--token-file`. This does not make its Rust dependency
+  graph compatible with 0.4; check the graph as described under "One copy per build".
 
 ## Find the user's game files
 
@@ -893,7 +907,7 @@ PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT." first, as `mc-
 
 ## References
 
-- [`CONTRACT.md`](CONTRACT.md): the protocol, v1 revision 6.
+- [`CONTRACT.md`](CONTRACT.md): the protocol, v1 revision 7.
 - [`WRITING_A_PROVIDER.md`](WRITING_A_PROVIDER.md): readers for a game's files.
 - [`tests/interop/README.md`](../tests/interop/README.md) and [`tests/vectors/link`](../tests/vectors/link/README.md): the scripted session and the shared vectors.
 - Libraries: [link-c](https://github.com/patodois/link-c), [link-cs](https://github.com/patodois/link-cs), [link-java](https://github.com/patodois/link-java).

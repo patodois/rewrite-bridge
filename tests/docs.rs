@@ -175,3 +175,18 @@ fn current_dependency_line_and_pixel_presentation_are_documented() {
         .unwrap();
     assert!(tail.contains("unordered") && tail.contains("read_latest"));
 }
+
+#[test]
+fn release_guide_distinguishes_published_provider_versions_from_wire_compatibility() {
+    let guide = read("docs/INTEGRATING.md");
+    assert!(guide.contains("protocol: v1, revision 7"));
+    assert!(guide.contains("published provider releases"));
+    assert!(guide.contains("still require\n  rewrite-bridge 0.3"));
+    assert!(guide.contains("Publishing rewrite-bridge 0.4.0 alone does not upgrade them"));
+    assert!(
+        guide.contains("cargo tree -d") && guide.contains("cargo tree -i rewrite-bridge@0.4.0")
+    );
+    assert!(guide.contains("cargo install rewrite-bridge --version 0.4.0"));
+    assert!(guide.contains("Link.LastError"));
+    assert!(!guide.contains("1bc3b02") && !guide.contains("run on the branch"));
+}
