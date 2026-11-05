@@ -10,12 +10,12 @@ lines. It knows nothing about any game; it spawns what the bridge's types descri
 ```toml
 [dependencies]
 bevy = "0.20"
-rewrite-bridge = "0.2"
-rewrite-bridge-bevy = "0.2"
+rewrite-bridge = "0.3"
+rewrite-bridge-bevy = "0.3"
 ```
 
 Both come from crates.io, so every provider you add shares the one copy of rewrite-bridge that this plugin
-uses, as long as it asks for the same `0.2` line (see
+uses, as long as it asks for the same `0.3` line (see
 [one copy for the whole build](https://github.com/patodois/rewrite-bridge#one-copy-for-the-whole-build)).
 
 ```rust
@@ -120,7 +120,7 @@ presents now. It is the GPU form of the core crate's CPU reference, `rewrite_bri
 (contract section 9.7), with the same rules and tested against it.
 
 ```toml
-rewrite-bridge-bevy = { version = "0.2.2", features = ["compose"] }   # the feature is new in 0.2.2
+rewrite-bridge-bevy = { version = "0.3", features = ["compose"] }   # the feature is new in 0.2.2
 ```
 
 ```rust

@@ -7,7 +7,8 @@
 //! - the wire codec: [`encode_datagram`] / [`decode_datagram`] for the binary UDP datagrams and
 //!   [`Control::to_line`] / [`Control::parse`] for the JSON-lines control channel;
 //! - [`Link`], which owns the sockets, does the handshake, heartbeat and watchdog, and is driven by
-//!   a non-blocking [`Link::poll`] from a game loop or a Bevy system;
+//!   a [`Link::poll`] that does not wait on the network, from a game loop or a Bevy system (but see the
+//!   guest's connect on a target with no threads, below);
 //! - [`FrameWriter`] / [`FrameReader`] for RGBA frames, and optionally their linear depth, in a
 //!   memory-mapped file; [`compose`] has the reference CPU reprojection and depth compositing for
 //!   such frames.
@@ -15,6 +16,10 @@
 //! A host can require a token from its guest (contract section 6.2): set [`LinkConfig::token`], or
 //! [`LinkConfig::endpoint_file`] to have the host generate one and hand it, with the port, to the guest
 //! through an owner-only [`Endpoint`] file.
+//!
+//! The link also runs in a component on `wasm32-wasip2`, which has no threads and no memory-mapped files:
+//! a guest connects inside [`Link::poll`], which can wait up to 100 ms for it (a host that never accepts), and
+//! the pixel file is an `Unsupported` error there.
 //!
 //! The link only exchanges what each process chooses to publish. It never touches another process.
 
@@ -26,10 +31,13 @@ use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
 use std::io::{self, ErrorKind, Read, Write};
 use std::mem::ManuallyDrop;
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+use std::net::UdpSocket;
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use memmap2::{Mmap, MmapMut};
@@ -89,9 +97,32 @@ pub const UNAUTHORIZED: &str = "unauthorized";
 pub const COLLISION_PER_POLL: usize = 32;
 /// The UDP receive buffer a receiver asks for, in bytes (section 2); the OS may grant less.
 pub const RECV_BUFFER_BYTES: usize = 4 << 20;
+/// Datagrams one [`Link::poll`] reads at most; the rest wait in the socket for the next poll. A flood from a
+/// process that is not the peer is read, and dropped, at this rate, so it bounds how long a poll can be held up.
+/// Past what a poll reads, the socket fills and the system drops the peer's datagrams along with the flood's,
+/// whatever the limit is; the limit only says how much of a tick the flood may take.
+///
+/// Natively 4096. On `wasm32-wasip2` 1024, because reading a datagram there costs more: every one is copied out
+/// of the runtime and allocated. Measured under wasmtime 50.0.1 on macOS, with four native threads keeping the
+/// socket full during the poll and a poll every 50 ms, at 4096: an average poll of 22 ms for datagrams of 24
+/// bytes, 27 ms for 8192, and 95 ms for 65507 (worst 161 ms), which overran every tick; at 1024 an average of 6 ms,
+/// 9 ms and 35 ms (worst 10, 17 and 45 ms), all inside the tick. Normal traffic needs far fewer: a collision snapshot is 32 datagrams a poll, and a heartbeat, a camera and a few pose datagrams are all
+/// else.
+#[cfg(not(target_os = "wasi"))]
+const MAX_DATAGRAMS_PER_POLL: usize = 4096;
+/// See the other `MAX_DATAGRAMS_PER_POLL`.
+#[cfg(target_os = "wasi")]
+const MAX_DATAGRAMS_PER_POLL: usize = 1024;
 /// How long one connection attempt of a guest may take. It runs on a helper thread, so a slow
 /// refusal (Windows retries a refused localhost SYN for about two seconds) never blocks a poll.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a guest on a target with no threads (`wasm32-wasip2`) waits inside [`Link::poll`] for its
+/// connection. A poll is one tick of the caller's loop (50 ms at 20 ticks a second), a loopback connect to a
+/// listener with room in its accept queue takes well under a millisecond (0.2 to 0.7 ms in 20 attempts under
+/// wasmtime), and a host that never accepts
+/// (a full accept queue drops the SYN, and the system retries it for seconds) must not hold more than two
+/// ticks of that loop, repeated after every [`LinkConfig::reconnect`].
+const INLINE_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// [`Pose::flags`] bit: do not interpolate from the entity's previous pose.
 pub const POSE_TELEPORT: u32 = 1;
@@ -1192,9 +1223,68 @@ pub struct Stats {
 }
 
 struct Ctl {
-    stream: TcpStream,
+    stream: Stream,
     rbuf: Vec<u8>,
     wbuf: Vec<u8>,
+}
+
+/// The socket of a control connection, closed so that closing it never waits.
+///
+/// On `wasm32-wasip2` the runtime takes a write of up to 64 KiB at once and delivers it to the kernel in the
+/// background, and closing the socket waits until it has. While the peer neither reads nor closes and the
+/// kernel's buffers are full, that is until the peer does: measured with wasmtime 50.0.1, 5 s on macOS and
+/// for ever on Linux. A `poll` that closed such a connection, or a `Drop`, would hold its caller that long. A
+/// socket that would wait is parked in [`PARKED`] instead and closed by a later [`Link::poll`] once its bytes
+/// have gone. Everywhere else the field is closed on drop, as a `TcpStream` always is.
+struct Stream(Option<TcpStream>);
+
+impl std::ops::Deref for Stream {
+    type Target = TcpStream;
+    fn deref(&self) -> &TcpStream {
+        self.0.as_ref().expect("a stream is only taken in drop")
+    }
+}
+
+impl std::ops::DerefMut for Stream {
+    fn deref_mut(&mut self) -> &mut TcpStream {
+        self.0.as_mut().expect("a stream is only taken in drop")
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        if let Some(s) = self.0.take() {
+            if cfg!(target_os = "wasi") && !closes_at_once(&s) {
+                PARKED
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(s);
+            }
+        }
+    }
+}
+
+/// Sockets that could not be closed without waiting, see [`Stream`].
+static PARKED: Mutex<Vec<TcpStream>> = Mutex::new(Vec::new());
+
+/// Most parked sockets before a `Link` takes no new connection. A host serves one guest at a time, so each
+/// parked socket is a session whose peer stopped reading and then stayed; a peer that keeps doing that would
+/// otherwise pile up a socket and its kernel buffers (megabytes) per session. A few is already a peer that
+/// is not going to read.
+const PARKED_LIMIT: usize = 4;
+
+/// Can `s` be closed at once? On `wasm32-wasip2` a write of no bytes asks the runtime whether it still holds
+/// bytes for the kernel: it answers `WouldBlock` then, and changes nothing otherwise.
+fn closes_at_once(s: &TcpStream) -> bool {
+    let mut s = s;
+    !matches!(s.write(&[]), Err(e) if e.kind() == ErrorKind::WouldBlock)
+}
+
+/// Closes the parked sockets that have nothing left to wait for, and returns how many remain.
+fn reap_parked() -> usize {
+    let mut parked = PARKED.lock().unwrap_or_else(PoisonError::into_inner);
+    parked.retain(|s| !closes_at_once(s));
+    parked.len()
 }
 
 impl Ctl {
@@ -1202,7 +1292,7 @@ impl Ctl {
         stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
         Ok(Self {
-            stream,
+            stream: Stream(Some(stream)),
             rbuf: Vec::new(),
             wbuf: Vec::new(),
         })
@@ -1327,8 +1417,11 @@ impl Closing {
 enum Conn {
     /// No connection. A guest retries at `next_try`; a host waits for one.
     Idle { next_try: Instant },
-    /// Guest: a helper thread is connecting.
-    Connecting { rx: Receiver<io::Result<TcpStream>> },
+    /// Guest: a helper thread is connecting to `port`.
+    Connecting {
+        rx: Receiver<io::Result<TcpStream>>,
+        port: u16,
+    },
     /// Connected, waiting for the peer's `hello`.
     Handshake { ctl: Ctl, since: Instant },
     Live {
@@ -1348,12 +1441,13 @@ struct Assembly {
 }
 
 /// One side of a passthrough link. Create it with [`Link::host`] or [`Link::guest`], then call
-/// [`Link::poll`] once per frame or tick; it never blocks.
+/// [`Link::poll`] once per frame or tick; it does not wait on the network, except that a guest on a target with
+/// no threads (`wasm32-wasip2`) waits up to 100 ms for its connection.
 pub struct Link {
     role: Role,
     cfg: LinkConfig,
     listener: Option<TcpListener>,
-    udp: UdpSocket,
+    udp: Udp,
     conn: Conn,
     focus: Role,
     seq: u32,
@@ -1378,6 +1472,8 @@ pub struct Link {
     token: Option<String>,
     /// Host: the endpoint file this link wrote, removed on drop.
     endpoint_written: Option<PathBuf>,
+    /// Guest: why the last connection attempt failed, see [`Link::last_error`].
+    last_error: Option<String>,
 }
 
 fn localhost(port: u16) -> SocketAddr {
@@ -1388,8 +1484,42 @@ fn millis(d: Duration) -> u32 {
     d.as_millis().min(u128::from(u32::MAX)) as u32
 }
 
+/// The link's UDP socket, bound to 127.0.0.1 and non-blocking.
+///
+/// Everywhere but `wasm32-wasip2` it is a `std` socket. There the C library's `recvfrom` does not free the
+/// payload of the datagram it returns, so every datagram received through `std` leaves its own length (and the
+/// allocator's overhead) in the component's memory for good: measured with rustc 1.99.1 and wasmtime 50.0.1,
+/// 8208 bytes for one of 8192 and 32 for one of 24, with `recv`, `recv_from` and any buffer size alike, until
+/// the memory is exhausted. The same loop through the WASI interface directly stays flat, so this goes through
+/// it.
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+struct Udp(UdpSocket);
+
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+impl Udp {
+    fn bind(addr: SocketAddr) -> io::Result<Self> {
+        let udp = UdpSocket::bind(addr)?;
+        request_recv_buffer(&udp, RECV_BUFFER_BYTES);
+        udp.set_nonblocking(true)?;
+        Ok(Self(udp))
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.0.local_addr()
+    }
+
+    fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.0.recv_from(buf)
+    }
+
+    fn send_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<usize> {
+        self.0.send_to(data, addr)
+    }
+}
+
 /// Asks the OS for a UDP receive buffer of `bytes` (contract section 2: collision snapshots
 /// arrive in bursts). Best effort: the OS may grant less, or refuse, and the link works either way.
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
 fn request_recv_buffer(udp: &UdpSocket, bytes: usize) {
     let bytes = i32::try_from(bytes).unwrap_or(i32::MAX);
     #[cfg(unix)]
@@ -1429,11 +1559,144 @@ fn request_recv_buffer(udp: &UdpSocket, bytes: usize) {
     let _ = (udp, bytes);
 }
 
-fn random_session() -> u32 {
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
+use wasip2::sockets::{
+    instance_network::instance_network,
+    network::{ErrorCode, IpAddressFamily, IpSocketAddress, Ipv4SocketAddress},
+    udp::{IncomingDatagramStream, OutgoingDatagram, OutgoingDatagramStream, UdpSocket as WasiUdp},
+    udp_create_socket::create_udp_socket,
+};
+
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
+struct Udp {
+    // Fields drop in this order, and the streams must go before the socket they came from.
+    incoming: IncomingDatagramStream,
+    outgoing: OutgoingDatagramStream,
+    _socket: WasiUdp,
+    local: SocketAddr,
+}
+
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
+impl Udp {
+    fn bind(addr: SocketAddr) -> io::Result<Self> {
+        let SocketAddr::V4(v4) = addr else {
+            return Err(ErrorKind::Unsupported.into());
+        };
+        let net = instance_network();
+        let socket = create_udp_socket(IpAddressFamily::Ipv4).map_err(wasi_error)?;
+        socket.start_bind(&net, wasi_addr(v4)).map_err(wasi_error)?;
+        loop {
+            match socket.finish_bind() {
+                Ok(()) => break,
+                Err(ErrorCode::WouldBlock) => socket.subscribe().block(),
+                Err(e) => return Err(wasi_error(e)),
+            }
+        }
+        // A receive buffer of RECV_BUFFER_BYTES (section 2); best effort, the host may grant less.
+        let _ = socket.set_receive_buffer_size(RECV_BUFFER_BYTES as u64);
+        let local = match socket.local_address().map_err(wasi_error)? {
+            IpSocketAddress::Ipv4(a) => SocketAddr::from((
+                Ipv4Addr::new(a.address.0, a.address.1, a.address.2, a.address.3),
+                a.port,
+            )),
+            IpSocketAddress::Ipv6(_) => return Err(ErrorKind::Unsupported.into()),
+        };
+        let (incoming, outgoing) = socket.stream(None).map_err(wasi_error)?;
+        Ok(Self {
+            incoming,
+            outgoing,
+            _socket: socket,
+            local,
+        })
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local)
+    }
+
+    /// One datagram, or `WouldBlock`. Like the OS, it cuts a datagram that does not fit `buf` and says so
+    /// only by the length it returns.
+    fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let mut received = self.incoming.receive(1).map_err(wasi_error)?;
+        let Some(d) = received.pop() else {
+            return Err(ErrorKind::WouldBlock.into());
+        };
+        let n = d.data.len().min(buf.len());
+        buf[..n].copy_from_slice(&d.data[..n]);
+        let from = match d.remote_address {
+            IpSocketAddress::Ipv4(a) => SocketAddr::from((
+                Ipv4Addr::new(a.address.0, a.address.1, a.address.2, a.address.3),
+                a.port,
+            )),
+            // never sent to an IPv4 socket; a source that matches no peer
+            IpSocketAddress::Ipv6(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        };
+        Ok((n, from))
+    }
+
+    fn send_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<usize> {
+        let SocketAddr::V4(v4) = addr else {
+            return Err(ErrorKind::Unsupported.into());
+        };
+        if self.outgoing.check_send().map_err(wasi_error)? == 0 {
+            return Err(ErrorKind::WouldBlock.into());
+        }
+        let datagram = OutgoingDatagram {
+            data: data.to_vec(),
+            remote_address: Some(wasi_addr(v4)),
+        };
+        match self.outgoing.send(&[datagram]).map_err(wasi_error)? {
+            0 => Err(ErrorKind::WouldBlock.into()),
+            _ => Ok(data.len()),
+        }
+    }
+}
+
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
+fn wasi_addr(a: std::net::SocketAddrV4) -> IpSocketAddress {
+    IpSocketAddress::Ipv4(Ipv4SocketAddress {
+        port: a.port(),
+        address: {
+            let [a, b, c, d] = a.ip().octets();
+            (a, b, c, d)
+        },
+    })
+}
+
+/// The kinds of error the link tells apart (would block, refused, reset); anything else keeps its WASI name.
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
+fn wasi_error(e: ErrorCode) -> io::Error {
+    let kind = match e {
+        ErrorCode::WouldBlock => ErrorKind::WouldBlock,
+        ErrorCode::ConnectionRefused => ErrorKind::ConnectionRefused,
+        ErrorCode::ConnectionReset => ErrorKind::ConnectionReset,
+        ErrorCode::AddressInUse => ErrorKind::AddrInUse,
+        ErrorCode::AccessDenied => ErrorKind::PermissionDenied,
+        _ => ErrorKind::Other,
+    };
+    io::Error::new(kind, e.name())
+}
+
+/// A fresh random session number (contract section 6, step 3), from the operating system's generator, like a
+/// token. If the generator fails (natively, a host out of file descriptors cannot open `/dev/urandom`), the two
+/// kinds of target differ on purpose:
+///
+/// - On WASI there is no number and the handshake fails with a `bye`. The only other source there, the seed
+///   `RandomState` uses, is `wasi:random/insecure-seed`, which its interface says may be entirely deterministic,
+///   and the number is what binds the datagrams to the session (section 6.2).
+/// - Everywhere else a hash of the clock and of `RandomState`'s keys (which the operating system chose for the
+///   process) stands in, as it did before 0.3.1, so that a host that is out of descriptors still takes a guest.
+fn random_session() -> Option<u32> {
+    let mut b = [0u8; 4];
+    if os_random(&mut b).is_ok() {
+        return Some(u32::from_le_bytes(b).max(1));
+    }
+    if cfg!(target_os = "wasi") {
+        return None;
+    }
     let mut h = RandomState::new().build_hasher();
     h.write_u64(now_us());
-    h.write_u32(std::process::id());
-    (h.finish() as u32).max(1)
+    Some((h.finish() as u32).max(1))
 }
 
 impl Link {
@@ -1486,9 +1749,7 @@ impl Link {
             Duration::from_millis(u64::from(*lo)),
             Duration::from_millis(u64::from(*hi)),
         );
-        let udp = UdpSocket::bind(localhost(cfg.udp_port))?;
-        request_recv_buffer(&udp, RECV_BUFFER_BYTES);
-        udp.set_nonblocking(true)?;
+        let udp = Udp::bind(localhost(cfg.udp_port))?;
         let now = Instant::now();
         Ok(Self {
             role,
@@ -1513,6 +1774,7 @@ impl Link {
             last_frame: 0,
             token: None,
             endpoint_written: None,
+            last_error: None,
         })
     }
 
@@ -1541,6 +1803,19 @@ impl Link {
         self.peer().is_some()
     }
 
+    /// Guest: why the last attempt to connect failed, or `None` before the first attempt and after one that
+    /// connected. Either the endpoint file could not be read or was refused, or the connection to the host's
+    /// port failed. The text never holds a token. A host that refuses the guest after the connection is up
+    /// is reported by [`Event::HandshakeFailed`] instead.
+    ///
+    /// Either role, on `wasm32-wasip2` only: why it is taking no new connection, while four connections whose
+    /// peers stopped reading are still set aside. The four are counted for the whole component, not per `Link`:
+    /// unrelated `Link`s in it share them, and one can be held up by another's peers. A host has no other
+    /// reason, and clears it when it is under the limit again. Elsewhere there is no such limit.
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
     /// Which side currently has input focus.
     pub fn focus(&self) -> Role {
         self.focus
@@ -1550,13 +1825,19 @@ impl Link {
         self.stats
     }
 
-    /// Does all pending network work without blocking and returns what happened since the last
+    /// Does all pending network work without waiting for the peer and returns what happened since the last
     /// call. Call it every frame; heartbeats are sent from here, so a side that stops polling
-    /// looks dead to its peer, as intended.
+    /// looks dead to its peer, as intended. The one wait: a guest on a target with no threads
+    /// (`wasm32-wasip2`) connects here and waits up to 100 ms for a host that does not accept.
     pub fn poll(&mut self) -> Vec<Event> {
         let now = Instant::now();
         self.closing.retain_mut(|c| c.pump(now));
-        self.poll_connect(now);
+        let parked = if cfg!(target_os = "wasi") {
+            reap_parked()
+        } else {
+            0
+        };
+        self.poll_connect(now, parked >= PARKED_LIMIT);
         self.poll_control(now);
         self.poll_udp(now);
         self.pump_collision();
@@ -1582,10 +1863,18 @@ impl Link {
         })
     }
 
-    fn poll_connect(&mut self, now: Instant) {
+    fn poll_connect(&mut self, now: Instant, full: bool) {
         if let Some(listener) = &self.listener {
             let mut busy = Vec::new();
+            // Said while it lasts, and gone when the host is under the limit again.
+            self.last_error = full.then(|| {
+                "not accepting: peers that stopped reading still hold earlier connections".into()
+            });
             loop {
+                // With [`PARKED_LIMIT`] sockets parked nobody is taken in; a guest waits in the backlog.
+                if full {
+                    break;
+                }
                 let stream = match listener.accept() {
                     Ok((s, _)) => s,
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -1604,6 +1893,15 @@ impl Link {
             return;
         }
         match &self.conn {
+            Conn::Idle { next_try } if now >= *next_try && full => {
+                self.last_error = Some(
+                    "not connecting: peers that stopped reading still hold earlier connections"
+                        .into(),
+                );
+                self.conn = Conn::Idle {
+                    next_try: now + self.cfg.reconnect,
+                };
+            }
             Conn::Idle { next_try } if now >= *next_try => {
                 let port = match &self.cfg.endpoint_file {
                     // Read before every attempt: a restarted host has a new port and a new token.
@@ -1612,7 +1910,15 @@ impl Link {
                             self.token = Some(e.token);
                             e.control_port
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            // `Endpoint::read` never quotes the file, so this holds no token. Its own
+                            // refusals already begin with "endpoint file: ".
+                            let why = e.to_string();
+                            self.last_error = Some(if why.starts_with("endpoint file: ") {
+                                why
+                            } else {
+                                format!("endpoint file: {why}")
+                            });
                             self.conn = Conn::Idle {
                                 next_try: now + self.cfg.reconnect,
                             };
@@ -1625,6 +1931,20 @@ impl Link {
                     }
                 };
                 let addr = localhost(port);
+                // A target with no threads (`wasm32-wasip2`) connects right here, for at most
+                // `INLINE_CONNECT_TIMEOUT`; the helper thread below does not exist there.
+                if cfg!(target_os = "wasi") {
+                    let connected = TcpStream::connect_timeout(&addr, INLINE_CONNECT_TIMEOUT)
+                        // On `wasm32-wasip2` this returns `Ok` for a port that refuses; only the socket's own
+                        // error tells.
+                        .and_then(|s| match s.take_error() {
+                            Ok(None) => Ok(s),
+                            Ok(Some(e)) | Err(e) => Err(e),
+                        })
+                        .and_then(Ctl::new);
+                    self.conn = self.connect_done(connected, port, now);
+                    return;
+                }
                 let (tx, rx) = mpsc::channel();
                 let spawned = std::thread::Builder::new()
                     .name("rewrite-bridge-connect".into())
@@ -1632,29 +1952,38 @@ impl Link {
                         let _ = tx.send(TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT));
                     });
                 self.conn = match spawned {
-                    Ok(_) => Conn::Connecting { rx },
-                    Err(_) => Conn::Idle {
-                        next_try: now + self.cfg.reconnect,
-                    },
+                    Ok(_) => Conn::Connecting { rx, port },
+                    Err(e) => self.connect_done(Err(e), port, now),
                 };
             }
-            Conn::Connecting { rx } => {
+            Conn::Connecting { rx, port } => {
+                let port = *port;
                 let connected = match rx.try_recv() {
                     Err(TryRecvError::Empty) => return,
                     Ok(r) => r.and_then(Ctl::new),
                     Err(TryRecvError::Disconnected) => Err(ErrorKind::BrokenPipe.into()),
                 };
-                self.conn = match connected {
-                    Ok(mut ctl) => {
-                        ctl.queue(&self.hello(PROTOCOL_VERSION, None));
-                        Conn::Handshake { ctl, since: now }
-                    }
-                    Err(_) => Conn::Idle {
-                        next_try: now + self.cfg.reconnect,
-                    },
-                };
+                self.conn = self.connect_done(connected, port, now);
             }
             _ => {}
+        }
+    }
+
+    /// What follows an attempt to connect to `port`: our `hello` and the handshake, or, after recording why
+    /// it failed (the kind of the error only, which quotes nothing), a pause before the next try.
+    fn connect_done(&mut self, connected: io::Result<Ctl>, port: u16, now: Instant) -> Conn {
+        match connected {
+            Ok(mut ctl) => {
+                self.last_error = None;
+                ctl.queue(&self.hello(PROTOCOL_VERSION, None));
+                Conn::Handshake { ctl, since: now }
+            }
+            Err(e) => {
+                self.last_error = Some(format!("cannot connect to 127.0.0.1:{port}: {}", e.kind()));
+                Conn::Idle {
+                    next_try: now + self.cfg.reconnect,
+                }
+            }
         }
     }
 
@@ -1679,9 +2008,16 @@ impl Link {
 
     fn poll_control(&mut self, now: Instant) {
         let Some(ctl) = self.ctl() else { return };
-        if let Err(reason) = ctl.flush() {
-            return self.end(reason, false);
-        }
+        let write_failed = ctl.flush().err();
+        self.read_control(now, write_failed);
+    }
+
+    /// Reads and handles what the peer sent, then ends the session if a write failed (`write_failed`) or the
+    /// connection did. The reading comes first even after a failed write: a `bye` that is waiting decides how
+    /// the session ended (contract section 6.1), so a peer that said `bye` and closed is a clean end, not a
+    /// broken write.
+    fn read_control(&mut self, now: Instant, write_failed: Option<String>) {
+        let Some(ctl) = self.ctl() else { return };
         let (lines, end) = ctl.read_lines();
         for line in lines {
             self.stats.lines_received += 1;
@@ -1691,6 +2027,9 @@ impl Link {
             if matches!(self.conn, Conn::Idle { .. }) {
                 return;
             }
+        }
+        if let Some(reason) = write_failed {
+            return self.end(reason, false);
         }
         if let Some((reason, bye)) = end {
             self.end(reason, bye);
@@ -1804,7 +2143,10 @@ impl Link {
                         true,
                     )
                 })?;
-                (v, random_session())
+                let session = random_session().ok_or_else(|| {
+                    ("no source of random bytes for the session".to_owned(), true)
+                })?;
+                (v, session)
             }
             Role::Guest => {
                 if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&h.protocol) {
@@ -1889,7 +2231,7 @@ impl Link {
 
     fn poll_udp(&mut self, now: Instant) {
         let mut buf = [0u8; 2 * MAX_DATAGRAM];
-        for _ in 0..4096 {
+        for _ in 0..MAX_DATAGRAMS_PER_POLL {
             let (n, from) = match self.udp.recv_from(&mut buf) {
                 Ok(r) => r,
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -2084,7 +2426,7 @@ impl Link {
         let ctl = self.ctl().expect("connected");
         ctl.queue(c);
         if let Err(reason) = ctl.flush() {
-            self.end(reason, false);
+            self.read_control(Instant::now(), Some(reason));
             return Err(LinkError::NotConnected);
         }
         Ok(())
@@ -2187,7 +2529,8 @@ impl Link {
 
 impl Drop for Link {
     /// Removes the endpoint file the host wrote, says `bye` and closes gracefully, which may block
-    /// for up to [`LINGER`].
+    /// for up to [`LINGER`]. A connection whose peer has stopped reading is not waited for beyond that, even
+    /// on `wasm32-wasip2`: it is set aside and closed later, as the runtime allows, or left to the runtime, which frees it with the component.
     fn drop(&mut self) {
         if let Some(path) = self.endpoint_written.take() {
             let _ = Endpoint::remove(&path);
@@ -2202,6 +2545,9 @@ impl Drop for Link {
             std::thread::sleep(Duration::from_millis(2));
             let now = Instant::now();
             self.closing.retain_mut(|c| c.pump(now));
+        }
+        if cfg!(target_os = "wasi") {
+            reap_parked();
         }
     }
 }
@@ -2224,7 +2570,8 @@ pub fn token_equal(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// A new token: 32 bytes from the operating system's cryptographic random number generator, as 64
-/// lowercase hex digits (contract section 6.2). Fails rather than fall back to a weaker source.
+/// lowercase hex digits (contract section 6.2). Fails rather than fall back to a weaker source. On WASI the
+/// generator is the runtime's `wasi:random/random` (see the note under rule 7 of the contract).
 pub fn generate_token() -> io::Result<String> {
     let mut bytes = [0u8; 32];
     os_random(&mut bytes)?;
@@ -2289,7 +2636,14 @@ fn os_random(buf: &mut [u8]) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(target_os = "wasi")]
+fn os_random(buf: &mut [u8]) -> io::Result<()> {
+    // WASI `random`, which the runtime fills: wasmtime from a generator seeded from the operating system, which
+    // an embedder can replace. (Not `insecure-seed`, which may be deterministic.)
+    getrandom::fill(buf).map_err(|_| io::Error::other("the WASI random number generator failed"))
+}
+
+#[cfg(not(any(unix, windows, target_os = "wasi")))]
 fn os_random(_buf: &mut [u8]) -> io::Result<()> {
     Err(io::Error::new(
         ErrorKind::Unsupported,
@@ -2335,8 +2689,9 @@ impl Endpoint {
     /// Writes the file atomically: a temporary file in the same directory, created exclusively and
     /// owner-only (mode 0600 on Unix, from the moment it exists), then renamed over `path`. A reader
     /// sees no file, the old one or this one, never part of it. The directory must exist; on Windows
-    /// put it under the user's local application data, whose ACL keeps other users out. Errors never
-    /// quote the token.
+    /// put it under the user's local application data, whose ACL keeps other users out. On WASI there
+    /// are no mode bits to ask for, so the file gets the mode of the process's umask (run it with `umask
+    /// 077`); that is a deviation the platform forces from section 6.2. Errors never quote the token.
     pub fn write(&self, path: &Path) -> io::Result<()> {
         check_token(&self.token)?;
         if self.control_port == 0 {
@@ -2352,12 +2707,13 @@ impl Endpoint {
             Some(d) if !d.as_os_str().is_empty() => d,
             _ => Path::new("."),
         };
+        // The nonce keeps two writers apart (so does `create_new`, which fails rather than share a file);
+        // no process id is in the name, since `wasm32-wasip2` has none and `std::process::id` panics there.
         let mut nonce = [0u8; 4];
         os_random(&mut nonce)?;
         let tmp = dir.join(format!(
-            ".{}.{}.{:08x}.tmp",
+            ".{}.{:08x}.tmp",
             name.to_string_lossy(),
-            std::process::id(),
             u32::from_le_bytes(nonce)
         ));
         let mut text =
@@ -2568,6 +2924,18 @@ pub enum FrameMiss {
     Gone,
 }
 
+/// Fails where the pixel file cannot work: it is memory-mapped, and where the platform has no memory-mapped
+/// files (`wasm32-wasip2`) memmap2 is a stub that fails, but only after a writer has made the file.
+fn pixel_file_supported() -> io::Result<()> {
+    if cfg!(not(any(unix, windows))) {
+        return Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "the pixel file needs memory-mapped files, which this platform does not have",
+        ));
+    }
+    Ok(())
+}
+
 /// Writes RGBA frames, and optionally their depth, into a memory-mapped pixel file (contract
 /// section 9.6).
 pub struct FrameWriter {
@@ -2593,6 +2961,7 @@ impl FrameWriter {
 
     /// Like [`create`](Self::create), with the options of [`FrameFileOptions`], e.g. a depth plane.
     pub fn create_with(path: &Path, opts: &FrameFileOptions) -> io::Result<Self> {
+        pixel_file_supported()?;
         let invalid = |m: &str| io::Error::new(ErrorKind::InvalidInput, m.to_owned());
         let FrameFileOptions {
             width,
@@ -2678,6 +3047,7 @@ impl FrameWriter {
 
     /// [`create_temp`](Self::create_temp) with [`FrameFileOptions`].
     pub fn create_temp_with(tag: &str, opts: &FrameFileOptions) -> io::Result<Self> {
+        pixel_file_supported()?;
         static NEXT: AtomicU32 = AtomicU32::new(0);
         // A crashed run may have left a file with this process id's name behind; skip its path.
         for _ in 0..64 {
@@ -2924,6 +3294,7 @@ impl FrameReader {
     /// is opened and the file is opened non-blocking where the OS has that, so a FIFO the peer
     /// names cannot stall the caller.
     pub fn open(path: &Path) -> io::Result<Self> {
+        pixel_file_supported()?;
         let bad = |m: &str| io::Error::new(ErrorKind::InvalidData, m.to_owned());
         let file = open_regular(path)?;
         let file_len = file.metadata()?.len();

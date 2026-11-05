@@ -3559,11 +3559,13 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "rewrite-bridge"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
+ "getrandom 0.3.4",
  "libc",
  "memmap2",
  "serde_json",
+ "wasip2",
 ]
 
 [[package]]
@@ -4950,6 +4952,9 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+dependencies = [
+ "bitflags 2.13.2",
+]
 
 [[package]]
 name = "wl-clipboard-rs"

@@ -60,7 +60,7 @@ Add yours with a pull request or an issue once it is public.
 
 ```toml
 [dependencies]
-rewrite-bridge = "0.2"
+rewrite-bridge = "0.3"
 ```
 
 ### One copy for the whole build
@@ -75,9 +75,9 @@ rewrite-bridge = "0.2"
 > ```
 >
 > From crates.io this takes care of itself. Cargo gives every requirement that agrees with the others
-> (`"0.2"`, `"0.2.1"`, `"^0.2.1"`) the same release and builds it once, so the `rewrite-bridge = "0.2"`
-> in your crate and the `0.2.1` that a provider asks for are one crate. Before 1.0 the minor number is
-> the breaking one: a `"0.3"` anywhere in the build would be a second copy, and the error above. Stay
+> (`"0.3"`, `"0.3.1"`, `"^0.3.1"`) the same release and builds it once, so the `rewrite-bridge = "0.3"`
+> in your crate and the `0.3.1` that a provider asks for are one crate. Before 1.0 the minor number is
+> the breaking one: a `"0.4"` anywhere in the build would be a second copy, and the error above. Stay
 > on one `0.x` line, as the providers and `rewrite-bridge-bevy` do.
 >
 > A second copy can still come from another source. Cargo treats a `git` dependency (such as the
@@ -89,12 +89,12 @@ rewrite-bridge = "0.2"
 > error: specification `rewrite-bridge` is ambiguous
 > help: re-run this command with one of the following specifications
 >   rewrite-bridge@0.1.0
->   rewrite-bridge@0.2.1
+>   rewrite-bridge@0.3.1
 > ```
 >
 > `cargo tree -d` lists the duplicated crates and the crates that pull each copy in. Fix it by moving
 > every dependency to crates.io: replace the `git` and `tag` lines of `rewrite-bridge` and
-> `rewrite-bridge-bevy` with `"0.2"`, and use a provider revision that does the same.
+> `rewrite-bridge-bevy` with `"0.3"`, and use a provider revision that does the same.
 
 ### Rust and build times
 
@@ -332,8 +332,8 @@ models with skins, animations with sockets, and scenes. A Rust game rewrite need
 
 ```toml
 [dependencies]
-rewrite-bridge = "0.2"
-rewrite-bridge-bevy = "0.2"
+rewrite-bridge = "0.3"
+rewrite-bridge-bevy = "0.3"
 ```
 
 Both come from crates.io and are built once whatever else you combine, providers included (see
@@ -396,7 +396,7 @@ use rewrite_bridge::link::{Event, Link, LinkConfig};
 
 let mut link = Link::guest(LinkConfig::new("My Game"))?;
 // Every frame or tick, e.g. in a Bevy system:
-for event in link.poll() {            // never blocks
+for event in link.poll() {            // does not wait on the network
     if let Event::Camera { camera, .. } = event {
         // place your world relative to the host's camera, then link.send_poses(&[...])
     }
@@ -422,8 +422,42 @@ let guest = Link::guest(LinkConfig { endpoint_file: Some(path), ..LinkConfig::ne
 The token keeps out other users and processes that cannot read the file, not programs running as the
 same user; the contract says what it protects and what it does not.
 
+**In a component on `wasm32-wasip2`.** The link also runs in a WebAssembly component, which has no
+threads, no process ids and no `/dev/urandom`, and only the sockets and folders its runtime grants (TCP and
+UDP on `127.0.0.1`, and a folder for the endpoint file). There:
+
+- a guest connects inside `poll`, waiting at most 100 ms for it, instead of on a helper thread with a
+  one-second timeout. A connect to a listener with room took 0.2 to 0.7 ms and a refusal 0.2 ms in the
+  measurements on macOS, but a host that never accepts leaves the connect hanging, so a poll can take 100 ms
+  after every `reconnect`. Where a refusal is slow (a refused connect to localhost can take about two seconds
+  on Windows) the guest reports `timed out` after each 100 ms, not `connection refused`;
+- random bytes come from WASI through the `getrandom` crate, and the UDP socket is the WASI one through the
+  `wasip2` crate (receiving through `std` leaks the payload of every datagram there); both are dependencies
+  of WASI targets only, and the 4 MiB receive buffer of section 2 is asked for (under wasmtime on macOS it was granted; not measured
+  elsewhere);
+- there are no memory-mapped files, so `FrameWriter` and `FrameReader` return an `Unsupported` error;
+- a connection whose peer holds the socket open and stops reading is not closed at once, because closing it
+  would wait for the peer: it is set aside and closed when the peer reads or exits. With four of them set aside
+  a `Link` takes no new connection (`last_error` says so). The four are counted for the whole component, not
+  per `Link`, so unrelated `Link`s in it share them; native has no such limit;
+- `set_nodelay` does nothing there (wasi-libc keeps the flag and wasmtime has no such option), so small control
+  lines can be held back and arrive together a few milliseconds late: a pose sent right after its `spawn` can arrive
+  before it and be dropped as the pose of an unknown entity, which the contract allows;
+- a component cannot ask for a file mode, so the endpoint file cannot be created `0600` as section 6.2 asks.
+  It gets what the host process's umask leaves: 0644 under the usual umask 022, 0600 under 077, 0666 under
+  000 (measured). Under 022 the token is readable by other users and a native guest refuses the file, so
+  that host cannot serve it. A guest on this target cannot check the file's mode at all. Start the process
+  with `umask 077`, which makes the file 0600 and lets both a native guest and a component guest use it. A
+  folder only you can enter keeps other users away from the token, but under umask 022 the file in it is still
+  0644 and a native guest still refuses it. On a Windows host there is no umask: the folder's ACL is what
+  counts.
+
+`Link::last_error` says why a guest's last attempt to connect failed, which is how a plugin can show
+that no host is listening. CI runs `tests/link_wasi.rs`, both roles in one thread, on that target under
+wasmtime.
+
 Without the feature the crate still has no dependencies; with it, it uses `memmap2` and
-`serde_json`. The link only exchanges what each process publishes about itself: it never reads
+`serde_json` (and `libc` on Unix, `getrandom` and `wasip2` on WASI). The link only exchanges what each process publishes about itself: it never reads
 another process's memory or injects code.
 
 The four implementations of the link (this crate, [link-java](https://github.com/patodois/link-java),
