@@ -1810,6 +1810,7 @@ impl Link {
         self.peer().is_some()
     }
 
+    /// Either role: a local hello or bye that exceeded the control-line limit.
     /// Guest: why the last attempt to connect failed, or `None` before the first attempt and after one that
     /// connected. Either the endpoint file could not be read or was refused, or the connection to the host's
     /// port failed. The text never holds a token. A host that refuses the guest after the connection is up
@@ -1981,8 +1982,16 @@ impl Link {
     fn connect_done(&mut self, connected: io::Result<Ctl>, port: u16, now: Instant) -> Conn {
         match connected {
             Ok(mut ctl) => {
+                if !ctl.queue(&self.hello(PROTOCOL_VERSION, None)) {
+                    let reason = "local hello control line too long".to_owned();
+                    self.last_error = Some(reason.clone());
+                    self.events.push(Event::HandshakeFailed { reason });
+                    return Conn::Idle {
+                        next_try: now + self.cfg.reconnect,
+                    };
+                }
+                self.stats.lines_sent += 1;
                 self.last_error = None;
-                ctl.queue(&self.hello(PROTOCOL_VERSION, None));
                 Conn::Handshake { ctl, since: now }
             }
             Err(e) => {
@@ -1997,8 +2006,11 @@ impl Link {
     /// Closes a control connection gracefully, after an optional `bye`.
     fn retire(&mut self, mut ctl: Ctl, bye: Option<String>, now: Instant) {
         if let Some(reason) = bye {
-            ctl.queue(&Control::Bye { reason });
-            self.stats.lines_sent += 1;
+            if ctl.queue(&Control::Bye { reason }) {
+                self.stats.lines_sent += 1;
+            } else {
+                self.last_error = Some("local bye control line too long".into());
+            }
         }
         let mut c = Closing::new(ctl, now);
         if c.pump(now) {
@@ -2184,7 +2196,11 @@ impl Link {
             unreachable!("on_hello is only called during the handshake")
         };
         if let Some(reply) = reply {
-            ctl.queue(&reply);
+            if !ctl.queue(&reply) {
+                self.conn = Conn::Handshake { ctl, since: now };
+                self.last_error = Some("local hello control line too long".into());
+                return Err(("local hello control line too long".into(), true));
+            }
             self.stats.lines_sent += 1;
             let _ = ctl.flush();
         }
@@ -2195,6 +2211,7 @@ impl Link {
             last_heard: now,
         };
         self.last_beat = now;
+        self.last_error = None;
         self.events.push(Event::Connected(peer));
         self.send(&Datagram::Heartbeat)
             .map_err(|e| (e.to_string(), true))?;
@@ -3764,6 +3781,70 @@ fn normalize(a: [f32; 3]) -> [f32; 3] {
 mod tests {
     use super::*;
 
+    #[test]
+    fn oversized_host_hello_is_a_visible_handshake_failure() {
+        let mut host = Link::host(LinkConfig {
+            control_port: 0,
+            ..LinkConfig::new("x".repeat(MAX_LINE))
+        })
+        .unwrap();
+        let mut guest = Link::guest(LinkConfig {
+            control_port: host.control_addr().unwrap().port(),
+            ..LinkConfig::new("guest")
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            guest.poll();
+            if host.poll().iter().any(
+                |e| matches!(e,Event::HandshakeFailed{reason} if reason.contains("local hello")),
+            ) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "oversized host hello did not fail visibly"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!host.is_connected());
+        assert_eq!(host.stats.lines_sent, 1, "only short error bye");
+    }
+
+    #[test]
+    fn oversized_internal_controls_are_visible_and_not_counted() {
+        let listener = TcpListener::bind(localhost(0)).unwrap();
+        let remote = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let mut link = Link::guest(LinkConfig::new("x".repeat(MAX_LINE))).unwrap();
+        let next = link.connect_done(
+            Ok(Ctl::new(socket).unwrap()),
+            listener.local_addr().unwrap().port(),
+            Instant::now(),
+        );
+        assert!(
+            matches!(next, Conn::Idle { .. }),
+            "oversized hello must fail before handshake wait"
+        );
+        assert!(link.last_error().is_some_and(|e| e.contains("hello")));
+        assert!(link
+            .events
+            .iter()
+            .any(|e| matches!(e,Event::HandshakeFailed{reason} if reason.contains("hello"))));
+        assert_eq!(link.stats.lines_sent, 0);
+        drop(remote);
+        let remote = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        link.retire(
+            Ctl::new(socket).unwrap(),
+            Some("x".repeat(MAX_LINE)),
+            Instant::now(),
+        );
+        assert_eq!(link.stats.lines_sent, 0, "discarded bye cannot be counted");
+        assert!(link.last_error().is_some_and(|e| e.contains("bye")));
+        drop(remote);
+    }
+
     #[cfg(unix)]
     #[test]
     fn buffered_bye_wins_over_deterministic_write_failure() {
@@ -3878,6 +3959,8 @@ mod tests {
         }
         drop(peer);
     }
+
+
 
     #[test]
     fn pixel_widths_can_shrink_and_grow_without_stale_pixels() {
