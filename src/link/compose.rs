@@ -366,8 +366,8 @@ pub struct Composited {
 ///
 /// All four slices cover the same `n` pixels (`*_rgba` has `4 * n` bytes); both depths are linear
 /// metres (convert a host depth buffer with [`linearize_buffer`]). Where the guest pixel is not
-/// empty (alpha above 0, finite positive depth) and strictly nearer than the host's (`+inf` or
-/// NaN there means the host drew nothing), it is blended over the host with straight-alpha
+/// empty (alpha above 0, finite positive depth) and strictly nearer than the host's (any non-finite
+/// host depth means the host drew nothing), it is blended over the host with straight-alpha
 /// "over", in the encoded (sRGB) values as the pixel file carries them; otherwise the host pixel
 /// stays. Equal depths go to the host.
 pub fn composite(
@@ -388,7 +388,7 @@ pub fn composite(
         if g[3] == 0 || !gd.is_finite() || gd <= 0.0 {
             continue;
         }
-        let hd = if host_depth[i].is_nan() {
+        let hd = if !host_depth[i].is_finite() {
             f32::INFINITY
         } else {
             host_depth[i]
@@ -469,6 +469,19 @@ impl Default for CameraRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_nonfinite_host_depth_is_empty() {
+        for hd in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let result =
+                composite(&[10, 20, 30, 255], &[hd], &[200, 100, 50, 255], &[2.0]).unwrap();
+            assert_eq!(result.rgba, [200, 100, 50, 255], "host depth {hd}");
+            assert_eq!(result.depth, [2.0]);
+            assert_eq!(result.guest_in_front, 1);
+        }
+        let result = composite(&[10, 20, 30, 255], &[1.0], &[200, 100, 50, 255], &[2.0]).unwrap();
+        assert_eq!(result.rgba, [10, 20, 30, 255]);
+    }
 
     const RANGES: [DepthRange; 3] = [
         DepthRange::NegOneToOne,
