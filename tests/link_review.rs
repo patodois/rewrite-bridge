@@ -690,7 +690,9 @@ fn late_old_frame_does_not_hide_a_new_channels_first_frame() {
     };
     p.guest.send_frame(&old).unwrap();
     assert!(p.until(1000, |p| frames_in(&p.he) == 1));
-    assert!(reader.read_latest(&old, &mut vec![], &mut vec![]).is_err());
+    assert!(reader
+        .read_latest(&old, &mut vec![], Some(&mut vec![]))
+        .is_err());
     p.he.clear();
     p.guest.send_frame(&good).unwrap();
     assert!(
@@ -699,20 +701,26 @@ fn late_old_frame_does_not_hide_a_new_channels_first_frame() {
     );
     assert_eq!(
         reader
-            .read_latest(&good, &mut vec![], &mut vec![])
+            .read_latest(&good, &mut vec![], Some(&mut vec![]))
             .unwrap()
             .frame,
         1
     );
-    assert!(reader.read_latest(&good, &mut vec![], &mut vec![]).is_err());
+    assert!(reader
+        .read_latest(&good, &mut vec![], Some(&mut vec![]))
+        .is_err());
     let next = w.write(&[8; 16], 2, 2, 0, 2).unwrap();
-    assert!(reader.read_latest(&next, &mut vec![], &mut vec![]).is_ok());
+    assert!(reader
+        .read_latest(&next, &mut vec![], Some(&mut vec![]))
+        .is_ok());
     assert!(
         reader.read(&good, &mut vec![]).is_ok(),
         "old slot remains valid"
     );
     assert!(
-        reader.read_latest(&good, &mut vec![], &mut vec![]).is_err(),
+        reader
+            .read_latest(&good, &mut vec![], Some(&mut vec![]))
+            .is_err(),
         "presentation never regresses"
     );
 }

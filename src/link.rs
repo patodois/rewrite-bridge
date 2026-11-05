@@ -3260,7 +3260,10 @@ fn parse_file_header(b: &[u8]) -> Result<([u8; 8], FileHeader), WireError> {
 
 // A deterministic test seam at the exact size/access boundary, absent from production builds.
 #[cfg(test)]
+type PixelCopyHook = Box<dyn FnMut(usize)>;
+#[cfg(test)]
 thread_local! {
+    static PIXEL_BEFORE_COPY: std::cell::RefCell<Option<PixelCopyHook>> = std::cell::RefCell::new(None);
     static PIXEL_AFTER_SIZE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }
 #[inline]
@@ -3279,6 +3282,8 @@ fn pixel_after_size() {
 /// Writers still must obey the revision 6 lifetime and seqlock rules.
 pub struct FrameReader {
     newest: std::sync::Mutex<u64>,
+    stale_reads: AtomicU64,
+    gone: std::sync::atomic::AtomicBool,
     file: File,
     file_len: u64,
     #[cfg(windows)]
@@ -3380,6 +3385,8 @@ impl FrameReader {
         }
         Ok(Self {
             newest: std::sync::Mutex::new(0),
+            stale_reads: AtomicU64::new(0),
+            gone: std::sync::atomic::AtomicBool::new(false),
             file,
             file_len,
             #[cfg(windows)]
@@ -3396,20 +3403,30 @@ impl FrameReader {
     /// Reads a frame for presentation, in increasing order within this reader's file.
     /// Only a successful copy advances the number. Open a new reader on every channel change
     /// and clear previously displayed pixels, including when opening the replacement fails.
-    /// `read` and `read_depth` remain unordered low-level copies.
+    /// `read` and `read_depth` remain unordered low-level copies. Pass `None` to skip depth.
+    /// Output buffers are valid only on success; failure may leave partial or previous bytes.
     pub fn read_latest(
         &self,
         ready: &FrameReady,
         rgba: &mut Vec<u8>,
-        depth: &mut Vec<f32>,
+        depth: Option<&mut Vec<f32>>,
     ) -> Result<FrameData, FrameMiss> {
+        if ready.frame == 0 {
+            return Err(FrameMiss::OutOfRange);
+        }
         let mut newest = self.newest.lock().unwrap_or_else(|e| e.into_inner());
         if ready.frame <= *newest {
+            self.stale_reads.fetch_add(1, Ordering::Relaxed);
             return Err(FrameMiss::Replaced);
         }
-        let data = self.read_depth(ready, rgba, depth)?;
+        let data = self.read_inner(ready, rgba, depth)?;
         *newest = data.frame;
         Ok(data)
+    }
+
+    /// Presentation reads rejected for a duplicate or older nonzero frame number.
+    pub fn stale_reads(&self) -> u64 {
+        self.stale_reads.load(Ordering::Relaxed)
     }
 
     /// Whether the file has a depth plane for [`read_depth`](Self::read_depth) to return.
@@ -3418,7 +3435,8 @@ impl FrameReader {
     }
 
     /// Copies the announced frame into `rgba` as tightly packed rows, if the slot still holds it
-    /// intact. A depth plane, if the file has one, is ignored.
+    /// intact. A depth plane, if the file has one, is ignored. Output buffers are valid only
+    /// on success; on failure they may contain partial or previous bytes.
     pub fn read(&self, ready: &FrameReady, rgba: &mut Vec<u8>) -> Result<FrameData, FrameMiss> {
         self.read_inner(ready, rgba, None)
     }
@@ -3437,6 +3455,20 @@ impl FrameReader {
     }
 
     fn copy_at(&self, offset: usize, dst: &mut [u8]) -> Result<(), FrameMiss> {
+        let result = self.copy_at_inner(offset, dst);
+        if result.is_err() {
+            self.gone.store(true, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn copy_at_inner(&self, offset: usize, dst: &mut [u8]) -> Result<(), FrameMiss> {
+        #[cfg(test)]
+        PIXEL_BEFORE_COPY.with(|h| {
+            if let Some(f) = h.borrow_mut().as_mut() {
+                f(offset);
+            }
+        });
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
@@ -3476,7 +3508,7 @@ impl FrameReader {
         row: usize,
         dst: &mut [u8],
     ) -> Result<(), FrameMiss> {
-        if row == stride {
+        if stride == row {
             return self.copy_at(offset, dst);
         }
         for (y, dst) in dst.chunks_exact_mut(row).enumerate() {
@@ -3500,12 +3532,16 @@ impl FrameReader {
         {
             return Err(FrameMiss::OutOfRange);
         }
+        if self.gone.load(Ordering::Relaxed) {
+            return Err(FrameMiss::Gone);
+        }
         // Early rejection; the bounded copies also handle truncation after this check.
         if self
             .file
             .metadata()
             .map_or(true, |m| m.len() < self.file_len)
         {
+            self.gone.store(true, Ordering::Relaxed);
             return Err(FrameMiss::Gone);
         }
         pixel_after_size();
@@ -3560,15 +3596,14 @@ impl FrameReader {
             }
         }
         fence(Ordering::Acquire);
+        let mut last = [0u8; 16];
+        self.copy_at(base, &mut last)?;
         #[cfg(windows)]
         let l2 = lock_at(self.map.as_ptr(), base).load(Ordering::Relaxed);
         #[cfg(not(windows))]
-        let l2 = {
-            let mut last = [0u8; 8];
-            self.copy_at(base, &mut last)?;
-            u64::from_le_bytes(last)
-        };
-        if l2 != l1 {
+        let l2 = u64::from_le_bytes(last[..8].try_into().unwrap());
+        let final_frame = u64::from_le_bytes(last[8..].try_into().unwrap());
+        if l2 != l1 || final_frame != ready.frame {
             return Err(FrameMiss::Torn);
         }
         Ok(data)
@@ -3606,6 +3641,142 @@ fn normalize(a: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn presentation_can_skip_depth_and_counts_only_nonzero_stale_frames() {
+        let mut w =
+            FrameWriter::create_temp_with("optional", &FrameFileOptions::new(8, 4, 1).with_depth())
+                .unwrap();
+        let ready = w
+            .write_depth(&[7; 128], Some(&[2.0; 32]), 8, 4, 0, 1)
+            .unwrap();
+        let r = FrameReader::open(w.path()).unwrap();
+        let depth_at = FILE_HEADER_LEN + r.depth.unwrap().0 as usize;
+        PIXEL_BEFORE_COPY.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |at| {
+                assert_ne!(at, depth_at, "omitted depth must not be read")
+            }))
+        });
+        assert!(r.read_latest(&ready, &mut vec![], None).is_ok());
+        PIXEL_BEFORE_COPY.with(|h| *h.borrow_mut() = None);
+        assert_eq!(
+            r.read_latest(&FrameReady { frame: 0, ..ready }, &mut vec![], None),
+            Err(FrameMiss::OutOfRange)
+        );
+        assert_eq!(r.stale_reads(), 0);
+        assert_eq!(
+            r.read_latest(&ready, &mut vec![], None),
+            Err(FrameMiss::Replaced)
+        );
+        assert_eq!(r.stale_reads(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_frame_identity_is_checked_even_when_the_lock_is_unchanged() {
+        let mut w = FrameWriter::create_temp("final-frame", 8, 4, 1).unwrap();
+        let ready = w.write(&[7; 128], 8, 4, 0, 1).unwrap();
+        let r = FrameReader::open(w.path()).unwrap();
+        let f = OpenOptions::new().write(true).open(w.path()).unwrap();
+        let mut headers = 0;
+        PIXEL_BEFORE_COPY.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |at| {
+                if at == FILE_HEADER_LEN {
+                    headers += 1;
+                    if headers == 2 {
+                        use std::os::unix::fs::FileExt;
+                        f.write_all_at(&2u64.to_le_bytes(), (FILE_HEADER_LEN + 8) as u64)
+                            .unwrap();
+                    }
+                }
+            }))
+        });
+        let result = r.read(&ready, &mut vec![]);
+        PIXEL_BEFORE_COPY.with(|h| *h.borrow_mut() = None);
+        assert_eq!(result, Err(FrameMiss::Torn));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn truncation_inside_either_plane_is_never_a_success() {
+        for plane in ["colour", "depth"] {
+            let mut w = FrameWriter::create_temp_with(
+                "plane",
+                &FrameFileOptions::new(16, 8, 1).with_depth(),
+            )
+            .unwrap();
+            let ready = w
+                .write_depth(&[7; 128], Some(&[2.0; 32]), 8, 4, 0, 1)
+                .unwrap();
+            let r = FrameReader::open(w.path()).unwrap();
+            let at = FILE_HEADER_LEN
+                + if plane == "colour" {
+                    SLOT_HEADER_LEN
+                } else {
+                    r.depth.unwrap().0 as usize
+                };
+            let f = OpenOptions::new().write(true).open(w.path()).unwrap();
+            PIXEL_BEFORE_COPY.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |offset| {
+                    if offset == at {
+                        f.set_len((at + 64) as u64).unwrap();
+                    }
+                }))
+            });
+            let got = if plane == "colour" {
+                r.read(&ready, &mut vec![])
+            } else {
+                r.read_depth(&ready, &mut vec![], &mut vec![])
+            };
+            PIXEL_BEFORE_COPY.with(|h| *h.borrow_mut() = None);
+            assert_eq!(
+                got,
+                Err(FrameMiss::Gone),
+                "{plane} copy errors must propagate"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn truncating_only_unused_tail_bytes_invalidates_the_reader() {
+        let mut w = FrameWriter::create_temp("tail", 3, 2, 1).unwrap();
+        let ready = w.write(&[7; 24], 3, 2, 0, 1).unwrap();
+        let r = FrameReader::open(w.path()).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(w.path())
+            .unwrap()
+            .set_len(r.file_len - 1)
+            .unwrap();
+        assert_eq!(r.read(&ready, &mut vec![]), Err(FrameMiss::Gone));
+    }
+
+    #[test]
+    fn presentation_order_belongs_to_each_file() {
+        let mut a = FrameWriter::create_temp("order-a", 2, 2, 3).unwrap();
+        let mut b =
+            FrameWriter::create_temp_with("order-b", &FrameFileOptions::new(3, 2, 3).with_depth())
+                .unwrap();
+        let ar = FrameReader::open(a.path()).unwrap();
+        let br = FrameReader::open(b.path()).unwrap();
+        let mut old = a.write(&[1; 16], 2, 2, 0, 1).unwrap();
+        for _ in 1..5 {
+            old = a.write(&[1; 16], 2, 2, 0, 1).unwrap();
+        }
+        let first = b
+            .write_depth(&[2; 24], Some(&[2.0; 6]), 3, 2, 0, 1)
+            .unwrap();
+        assert!(ar.read_latest(&old, &mut vec![], Some(&mut vec![])).is_ok());
+        assert!(br
+            .read_latest(&old, &mut vec![], Some(&mut vec![]))
+            .is_err());
+        assert!(br.read_latest(&first, &mut vec![], None).is_ok());
+        assert!(br
+            .read_latest(&first, &mut vec![], Some(&mut vec![]))
+            .is_err());
+    }
 
     #[cfg(unix)]
     #[test]

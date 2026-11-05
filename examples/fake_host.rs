@@ -175,7 +175,7 @@ fn main() -> std::io::Result<()> {
                 }
                 Event::Frame { frame, .. } => {
                     if let Some(r) = &reader {
-                        if let Ok(d) = r.read_latest(&frame, &mut pixels, &mut depth) {
+                        if let Ok(d) = r.read_latest(&frame, &mut pixels, Some(&mut depth)) {
                             frames += 1;
                             guest = Some(GuestFrame {
                                 rgba: pixels.clone(),
