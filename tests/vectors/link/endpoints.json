@@ -1,7 +1,7 @@
 {
   "format": "rbl-link-vectors/1",
   "kind": "endpoints",
-  "contract": "v1 revision 6",
+  "contract": "v1 revision 7",
   "cases": [
     {"id":"ep.ok.contract_example_form","section":"6.2","expect":"ok","text":"{\"control_port\":47800,\"token\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}","control_port":47800,"token":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","note":"what a host writes"},
     {"id":"ep.ok.trailing_newline","section":"6.2","expect":"ok","text":"{\"control_port\":47800,\"token\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}\n","control_port":47800,"token":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},

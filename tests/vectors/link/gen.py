@@ -18,7 +18,7 @@ import struct
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CONTRACT = "v1 revision 6"
+CONTRACT = "v1 revision 7"
 INF = float("inf")
 # The token of the revision 6 vectors (section 6.2): 64 lowercase hex digits, the form a host generates.
 TOKEN = "0123456789abcdef" * 4
@@ -881,6 +881,18 @@ def pixel_cases(outdir):
     def read(fx, slot, want_depth=True):
         return fx.read_expect(slot, want_depth)
 
+    def presentation(rd):
+        return dict(rd, latest=True)
+
+    cases.append({"id": "pf.present.only_success_advances_order_rev7", "section": "7, 8, 9.6 (revision 7)",
+                  "basis": "MUST", "file": fa, "open": "ok", "info": info_of(A),
+                  "note": "Presentation reads share a reader; raw reads remain unordered. Invalid high numbers do not advance order.",
+                  "reads": [presentation(skip_read(18446744073709551615, 1, "the slot does not hold this old announcement")),
+                            presentation(read(A, 1, False)), presentation(read(A, 0)),
+                            presentation(skip_read(2, 2, "frame 2 is valid but older than the presented frame 3")),
+                            presentation(skip_read(3, 0, "frame 3 was already presented")),
+                            read(A, 2)]})
+
     cases.append({"id": "pf.read.depth_file_frames_1_to_3", "section": "9.6", "basis": "MUST", "file": fa,
                   "open": "ok", "info": info_of(A),
                   "reads": [read(A, 1), read(A, 2), read(A, 0), read(A, 1, False),
@@ -1537,14 +1549,14 @@ def sessions():
     def fr(frame, slot=0, cam=0):
         return encode_body(frame_body(frame=frame, slot=slot, camera_seq=cam, width=4, height=2)).hex()
 
-    case("sess.host.udp.frame_announcements_require_consumer_validation", "7, 8", "host", HS + [
+    case("sess.host.udp.frame_announcements_are_not_presentation_rev7", "9.6 (revision 7)", "host", HS + [
         sendd(dg(fr(5), 5, seq=1)), ev("frame", {"frame": "5"}),
         sendd(dg(fr(5), 5, seq=2)), ev("frame", {"frame": "5"}),
         sendd(dg(fr(4), 5, seq=3)), ev("frame", {"frame": "4"}),
         sendd(dg(fr(6), 5, seq=4)), ev("frame", {"frame": "6"}),
         send('{"type":"frame_channel","path":"/tmp/x-2-guest.frames","width":4,"height":2,"slots":3}\n'),
         ev("frame_channel"), sendd(dg(fr(1), 5, seq=5)), ev("frame", {"frame": "1"})],
-         note="transport announcements are not shown frames; without reading a pixel file this harness cannot confirm presentation staleness")
+         note="Revision 7: transport announcements are not shown frames; without reading a pixel file this harness cannot confirm presentation staleness")
     case("sess.host.udp.frame_fields", "9.6", "host", HS + [
         sendd(dg(encode_body(frame_body(frame=9, slot=0, camera_seq=77, width=320, height=240)).hex(), 5)),
         ev("frame", {"frame": "9", "slot": 0, "camera_seq": 77, "width": 320, "height": 240})])

@@ -547,7 +547,13 @@ fn check_read(reader: &FrameReader, rd: &Value) -> Result<(), String> {
     let want_depth = rd["want_depth"] == true;
     let mut rgba = Vec::new();
     let mut depth = Vec::new();
-    let got = if want_depth {
+    let got = if rd["latest"] == true {
+        reader.read_latest(
+            &ready,
+            &mut rgba,
+            if want_depth { Some(&mut depth) } else { None },
+        )
+    } else if want_depth {
         reader.read_depth(&ready, &mut rgba, &mut depth)
     } else {
         reader.read(&ready, &mut rgba)

@@ -1,7 +1,7 @@
 {
   "format": "rbl-link-vectors/1",
   "kind": "control",
-  "contract": "v1 revision 6",
+  "contract": "v1 revision 7",
   "cases": [
     {"id":"ctl.hello.guest_contract_example","section":"6","expect":"message","line":"{\"type\":\"hello\",\"role\":\"guest\",\"game\":\"Warframe rewrite\",\"protocol\":1,\"min_protocol\":1,\"udp_port\":53001,\"heartbeat_ms\":250,\"timeout_ms\":2000}","message":{"type":"hello","role":"guest","game":"Warframe rewrite","protocol":1,"min_protocol":1,"udp_port":53001,"heartbeat_ms":250,"timeout_ms":2000},"encode":true},
     {"id":"ctl.hello.host_contract_example","section":"6","expect":"message","line":"{\"type\":\"hello\",\"role\":\"host\",\"game\":\"War Thunder rewrite\",\"protocol\":1,\"min_protocol\":1,\"udp_port\":53000,\"heartbeat_ms\":250,\"timeout_ms\":2000,\"session\":2882400001}","message":{"type":"hello","role":"host","game":"War Thunder rewrite","protocol":1,"min_protocol":1,"udp_port":53000,"heartbeat_ms":250,"timeout_ms":2000,"session":2882400001},"encode":true},
