@@ -3526,7 +3526,7 @@ impl FrameReader {
             return Err(FrameMiss::Torn);
         }
         let h = &header[8..];
-        let mut r = In { b: &h, at: 0 };
+        let mut r = In { b: h, at: 0 };
         let data = FrameData {
             frame: r.u64().unwrap_or(0),
             time_us: r.u64().unwrap_or(0),
