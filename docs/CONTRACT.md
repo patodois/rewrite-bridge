@@ -984,7 +984,7 @@ had rendered with the current camera.
 reprojection, with its own scene depth `t_h` converted to linear metres, and the nearer one wins:
 
 - a guest pixel takes part if its alpha is above 0 and `t_g` is finite and positive;
-- it covers the host's pixel if `t_g < t_h` (a non-finite `t_h` means the host drew nothing there);
+- it covers the host's pixel if `t_g < t_h` (a non-finite or non-positive `t_h` means the host drew nothing there);
   equal depths go to the host;
 - where it covers, the result is the straight-alpha "over": `rgb = g * a + h * (1 - a)`, with the
   colours as the file carries them (sRGB-encoded; an engine may convert to linear light first);
@@ -1264,4 +1264,5 @@ keeps the old meaning.
   replacement or a gone reader. Section 9.6 permits bounded positional reads on Unix, specifies
   complete reads, lock/frame observations and their guarantees and limitations, and supersedes
   the mapping-only reader and truncation mitigation wording of revision 6. Raw re-read APIs may
-  remain unordered. Protocol version 1, every wire field and every file offset remain unchanged.
+  remain unordered. Section 9.7 clarifies that non-finite or non-positive host depth means nothing was drawn.
+  Protocol version 1, every wire field and every file offset remain unchanged.

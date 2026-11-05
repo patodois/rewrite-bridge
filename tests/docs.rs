@@ -190,3 +190,13 @@ fn release_guide_distinguishes_published_provider_versions_from_wire_compatibili
     assert!(guide.contains("Link.LastError"));
     assert!(!guide.contains("1bc3b02") && !guide.contains("run on the branch"));
 }
+
+#[test]
+fn contract_defines_invalid_host_depth_as_empty() {
+    let contract = read("docs/CONTRACT.md");
+    assert!(
+        contract.contains("a non-finite or non-positive `t_h` means the host drew nothing there")
+    );
+    let changelog = contract.split("- v1, revision 7:").nth(1).unwrap();
+    assert!(changelog.contains("non-finite or non-positive host depth means nothing was drawn"));
+}
