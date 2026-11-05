@@ -1243,9 +1243,15 @@ fn a_poll_reads_at_most_1024_foreign_datagrams_and_the_next_polls_read_the_rest(
         host.poll();
     }
     let all = host.stats().foreign;
-    assert!(all >= first && all <= queued as u64, "read {all} of {queued}");
+    assert!(
+        all >= first && all <= queued as u64,
+        "read {all} of {queued}"
+    );
     if all > 1024 {
-        assert_eq!(first, 1024, "more than 1024 were waiting, and the first poll read {first}");
+        assert_eq!(
+            first, 1024,
+            "more than 1024 were waiting, and the first poll read {first}"
+        );
     }
 }
 
