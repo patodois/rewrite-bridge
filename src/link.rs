@@ -97,6 +97,15 @@ pub const UNAUTHORIZED: &str = "unauthorized";
 pub const COLLISION_PER_POLL: usize = 32;
 /// The UDP receive buffer a receiver asks for, in bytes (section 2); the OS may grant less.
 pub const RECV_BUFFER_BYTES: usize = 4 << 20;
+/// Datagrams one [`Link::poll`] reads at most, on every target; the rest wait in the socket for the next poll.
+/// A flood from a process that is not the peer is read, and dropped, at this rate, so it bounds how long a poll
+/// can be held up. On `wasm32-wasip2` a datagram costs 2 to 14 microseconds to read (24 to 8192 bytes, under
+/// wasmtime on macOS), so 4096 of them are at most about 14 ms of a tick of 50 ms; the 4 MiB the socket asks for
+/// holds only about 500 datagrams of 8192 bytes, which is 7 ms. A lower limit would save little and lower the
+/// flood a session can ride out: past what a poll reads, the socket fills and the system drops the peer's
+/// datagrams along with the flood's, whatever the limit is. A tick needs far fewer (a collision snapshot is 32
+/// datagrams a poll; a heartbeat, a camera and a few pose datagrams are all else).
+const MAX_DATAGRAMS_PER_POLL: usize = 4096;
 /// How long one connection attempt of a guest may take. It runs on a helper thread, so a slow
 /// refusal (Windows retries a refused localhost SYN for about two seconds) never blocks a poll.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1658,7 +1667,7 @@ fn wasi_error(e: ErrorCode) -> io::Error {
         ErrorCode::AccessDenied => ErrorKind::PermissionDenied,
         _ => ErrorKind::Other,
     };
-    io::Error::new(kind, format!("{e:?}"))
+    io::Error::new(kind, e.name())
 }
 
 /// A fresh random session number (contract section 6, step 3), from the operating system's generator, like a
@@ -2215,7 +2224,7 @@ impl Link {
 
     fn poll_udp(&mut self, now: Instant) {
         let mut buf = [0u8; 2 * MAX_DATAGRAM];
-        for _ in 0..4096 {
+        for _ in 0..MAX_DATAGRAMS_PER_POLL {
             let (n, from) = match self.udp.recv_from(&mut buf) {
                 Ok(r) => r,
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -2554,7 +2563,8 @@ pub fn token_equal(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// A new token: 32 bytes from the operating system's cryptographic random number generator, as 64
-/// lowercase hex digits (contract section 6.2). Fails rather than fall back to a weaker source.
+/// lowercase hex digits (contract section 6.2). Fails rather than fall back to a weaker source. On WASI the
+/// generator is the runtime's `wasi:random/random` (see the note under rule 7 of the contract).
 pub fn generate_token() -> io::Result<String> {
     let mut bytes = [0u8; 32];
     os_random(&mut bytes)?;
@@ -2621,7 +2631,8 @@ fn os_random(buf: &mut [u8]) -> io::Result<()> {
 
 #[cfg(target_os = "wasi")]
 fn os_random(buf: &mut [u8]) -> io::Result<()> {
-    // WASI `random`, which the runtime fills from the operating system's generator.
+    // WASI `random`, which the runtime fills: wasmtime from a generator seeded from the operating system, which
+    // an embedder can replace. (Not `insecure-seed`, which may be deterministic.)
     getrandom::fill(buf).map_err(|_| io::Error::other("the WASI random number generator failed"))
 }
 
