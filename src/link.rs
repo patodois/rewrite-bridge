@@ -3763,6 +3763,96 @@ fn normalize(a: [f32; 3]) -> [f32; 3] {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn buffered_bye_wins_over_deterministic_write_failure() {
+        use std::net::Shutdown;
+        for (live, send, bye) in [
+            (true, false, Some("peer is done")),
+            (true, true, Some("peer is done")),
+            (false, false, Some("unauthorized")),
+            (true, false, None),
+            (true, true, None),
+        ] {
+            let listener = TcpListener::bind(localhost(0)).unwrap();
+            let mut remote = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (socket, _) = listener.accept().unwrap();
+            let mut ctl = Ctl::new(socket).unwrap();
+            if let Some(reason) = bye {
+                remote
+                    .write_all(
+                        Control::Bye {
+                            reason: reason.into(),
+                        }
+                        .to_line()
+                        .as_bytes(),
+                    )
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    match ctl.stream.peek(&mut [0]) {
+                        Ok(n) if n > 0 => break,
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                        other => panic!("cannot observe pending bye: {other:?}"),
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "bye did not reach loopback socket"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            // This produces a real write failure without depending on a remote reset's timing.
+            // The read half and any complete bye waiting there remain available.
+            ctl.stream.shutdown(Shutdown::Write).unwrap();
+            assert!(ctl.queue(&Control::Despawn { entity: 7 }));
+            let mut link = Link::guest(LinkConfig::new("test")).unwrap();
+            link.conn = if live {
+                Conn::Live {
+                    ctl,
+                    peer: PeerInfo {
+                        game: "peer".into(),
+                        role: Role::Host,
+                        protocol: 1,
+                        session: 1,
+                        udp_addr: localhost(1),
+                        heartbeat: Duration::from_secs(1),
+                        timeout: Duration::from_secs(30),
+                    },
+                    last_heard: Instant::now(),
+                }
+            } else {
+                Conn::Handshake {
+                    ctl,
+                    since: Instant::now(),
+                }
+            };
+            if send {
+                assert!(matches!(link.despawn(7), Err(LinkError::NotConnected)));
+            } else {
+                link.poll_control(Instant::now());
+            }
+            let reason = link
+                .events
+                .iter()
+                .find_map(|e| match e {
+                    Event::Lost { reason } if live => Some(reason),
+                    Event::HandshakeFailed { reason } if !live => Some(reason),
+                    _ => None,
+                })
+                .expect("terminal event missing");
+            if let Some(bye) = bye {
+                assert_eq!(reason, &format!("peer said bye: {bye}"));
+            } else {
+                assert!(
+                    reason.contains("control write failed"),
+                    "missing write failure: {reason}"
+                );
+            }
+            assert!(!link.is_connected());
+        }
+    }
+
     #[test]
     fn control_queue_limit_preserves_pending_bytes() {
         let listener = TcpListener::bind(localhost(0)).unwrap();
