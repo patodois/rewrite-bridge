@@ -56,12 +56,10 @@ tested against each other.
 - **Bevy 0.20:** `rewrite-bridge-bevy` loads provider output; with its `compose` feature `HostLinkPlugin` and
   `GuestComposePlugin` make a Bevy camera a host that depth-composites a guest's frames. Run against
   `fake_guest --frames` here (see [Bevy host](#bevy-host)). Details: [its README](../rewrite-bridge-bevy/README.md).
-- **One copy per build.** Every provider crate (`wt-unpack`, `wf-unpack`, `hytale-unpack`, `nocturne-unpack`,
-  `mc-unpack`) and `bridge-guest` and `bridge-testbed` depend on `rewrite-bridge` 0.2.x, and before 1.0 a new
-  minor number is a different crate. A build that uses both a 0.2 provider and 0.3 types has two copies and
-  fails to compile (see [the README](../README.md#one-copy-for-the-whole-build)). Today that means: with a 0.2
-  provider you have the link without the token; with the token you cannot yet use those providers in the same
-  build.
+- **One copy per build.** Before 1.0 a new minor number is a different crate, and a build with two copies fails to
+  compile (see [the README](../README.md#one-copy-for-the-whole-build)). The providers are on 0.3 from `wt-unpack`
+  0.4.0, `wf-unpack` 0.4.0, `hytale-unpack` 0.3.0, `mc-unpack` 0.4.0 and `nocturne-unpack` 0.3.0, as are
+  `bridge-guest` and `bridge-testbed`. Older provider versions are on 0.2.x and do not mix with 0.3.
 
 ### C or C++ mod: Skyrim (SKSE), Fallout 4 (F4SE), GTA V (ScriptHookV), Unreal
 
@@ -550,9 +548,9 @@ cargo build --release --features link --example fake_host --example fake_guest -
 # binaries: target/release/examples/{fake_host,fake_guest,interop_peer}
 ```
 
-**Prebuilt, once a release has them (takes effect then; until then build them as above).** A release made from a `v*` tag
-carries one archive per system (macOS arm64 and x86_64, Linux and Windows x86_64) with the three peers, and a `SHA256SUMS`
-beside them on the [releases page](https://github.com/patodois/rewrite-bridge/releases): download yours, check it, and run `./fake_host` or `./fake_guest` in it. No Rust toolchain.
+**Prebuilt, no Rust toolchain.** The release [`peers-v0.3.1`](https://github.com/patodois/rewrite-bridge/releases/tag/peers-v0.3.1) has one archive per system (macOS arm64 and x86_64, Linux and Windows x86_64) with the three peers, and a
+`SHA256SUMS` and its signature: download yours, check it, and run `./fake_host` or `./fake_guest` from it. Later crate
+releases carry their own archives. The macOS arm64 archive was run here; the other three are built and packed by CI and were not run.
 
 On the toolchain used here the build printed a warning that `rust-objcopy` could not load `libLLVM.dylib`;
 the binaries were built and ran.
@@ -719,8 +717,8 @@ From both:
   checks against a digest and runs in its test suite.
 - **Mixed revisions** (contract section 12; not run here). A revision 6 guest with a token works with a
   revision 5 host, which ignores the field. A revision 5 guest cannot open a session with a host that has a token.
-  The Rust crate has the token from 0.3.0 (0.2.3 has no `endpoint_file`), and `bridge-guest` is on 0.2.2, so it
-  cannot connect to a host that requires one.
+  The Rust crate has the token from 0.3.0 (0.2.3 has no `endpoint_file`). `bridge-guest` is on 0.3 and connects to a
+  host that requires one with `--endpoint-file` or `--token-file`.
 
 ## Find the user's game files
 
