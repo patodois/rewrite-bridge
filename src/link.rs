@@ -1302,8 +1302,13 @@ impl Ctl {
         })
     }
 
-    fn queue(&mut self, c: &Control) {
-        self.wbuf.extend_from_slice(c.to_line().as_bytes());
+    fn queue(&mut self, c: &Control) -> bool {
+        let line = c.to_line();
+        if line.len() > MAX_LINE {
+            return false;
+        }
+        self.wbuf.extend_from_slice(line.as_bytes());
+        true
     }
 
     /// Writes as much as the socket takes without blocking.
@@ -2418,9 +2423,12 @@ impl Link {
         if !self.is_connected() {
             return Err(LinkError::NotConnected);
         }
+        let ctl = self.ctl().expect("connected");
+        if !ctl.queue(c) {
+            return Err(WireError::BadControl("control line too long".into()).into());
+        }
         self.stats.lines_sent += 1;
         let ctl = self.ctl().expect("connected");
-        ctl.queue(c);
         if let Err(reason) = ctl.flush() {
             self.read_control(Instant::now(), Some(reason));
             return Err(LinkError::NotConnected);
@@ -3754,6 +3762,31 @@ fn normalize(a: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_queue_limit_preserves_pending_bytes() {
+        let listener = TcpListener::bind(localhost(0)).unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let mut ctl = Ctl::new(socket).unwrap();
+        let make = |asset| {
+            Control::Spawn(Spawn {
+                entity: 1,
+                provider: "p".into(),
+                asset,
+                name: None,
+            })
+        };
+        let overhead = make(String::new()).to_line().len();
+        assert!(ctl.queue(&make("a".repeat(MAX_LINE - overhead))));
+        assert_eq!(ctl.wbuf.len(), MAX_LINE);
+        let pending = ctl.wbuf.clone();
+        for asset in ["a".repeat(MAX_LINE), "é".repeat(MAX_LINE / 2)] {
+            assert!(!ctl.queue(&make(asset)));
+            assert_eq!(ctl.wbuf, pending);
+        }
+        drop(peer);
+    }
 
     #[cfg(unix)]
     #[test]
