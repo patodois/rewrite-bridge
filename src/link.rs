@@ -3284,6 +3284,8 @@ pub struct FrameReader {
     newest: std::sync::Mutex<u64>,
     stale_reads: AtomicU64,
     gone: std::sync::atomic::AtomicBool,
+    #[cfg(unix)]
+    plane_scratch: std::sync::Mutex<Vec<u8>>,
     file: File,
     file_len: u64,
     #[cfg(windows)]
@@ -3387,6 +3389,8 @@ impl FrameReader {
             newest: std::sync::Mutex::new(0),
             stale_reads: AtomicU64::new(0),
             gone: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(unix)]
+            plane_scratch: std::sync::Mutex::new(Vec::new()),
             file,
             file_len,
             #[cfg(windows)]
@@ -3501,6 +3505,80 @@ impl FrameReader {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn vector_rows(
+        &self,
+        offset: usize,
+        stride: usize,
+        row: usize,
+        dst: &mut [u8],
+    ) -> Result<(), FrameMiss> {
+        use std::os::fd::AsRawFd;
+        let height = dst.len() / row;
+        let gap = stride - row;
+        let mut padding = self.plane_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        padding.resize(gap, 0);
+        for start in (0..height).step_by(8) {
+            let rows = 8.min(height - start);
+            let mut vectors = [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            }; 16];
+            for y in 0..rows {
+                // SAFETY: disjoint destination rows are within dst; padding is owned scratch.
+                vectors[2 * y] = libc::iovec {
+                    iov_base: unsafe { dst.as_mut_ptr().add((start + y) * row) }.cast(),
+                    iov_len: row,
+                };
+                vectors[2 * y + 1] = libc::iovec {
+                    iov_base: padding.as_mut_ptr().cast(),
+                    iov_len: gap,
+                };
+            }
+            let count = 2 * rows - 1;
+            let mut at = offset + start * stride;
+            #[cfg(test)]
+            PIXEL_BEFORE_COPY.with(|h| {
+                if let Some(f) = h.borrow_mut().as_mut() {
+                    f(at);
+                }
+            });
+            let mut first = 0;
+            while first < count {
+                // SAFETY: validated file offsets and owned buffers; each syscall fills vectors
+                // in order. Overlapping padding destinations are intentionally discarded.
+                let n = unsafe {
+                    libc::preadv(
+                        self.file.as_raw_fd(),
+                        vectors[first..].as_ptr(),
+                        (count - first) as libc::c_int,
+                        at as libc::off_t,
+                    )
+                };
+                if n < 0 && io::Error::last_os_error().kind() == ErrorKind::Interrupted {
+                    continue;
+                }
+                if n <= 0 {
+                    self.gone.store(true, Ordering::Relaxed);
+                    return Err(FrameMiss::Gone);
+                }
+                let mut used = n as usize;
+                at += used;
+                while first < count && used >= vectors[first].iov_len {
+                    used -= vectors[first].iov_len;
+                    first += 1;
+                }
+                if first < count && used > 0 {
+                    vectors[first].iov_len -= used;
+                    // SAFETY: used is smaller than the current owned buffer segment.
+                    vectors[first].iov_base =
+                        unsafe { vectors[first].iov_base.cast::<u8>().add(used) }.cast();
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn copy_rows(
         &self,
         offset: usize,
@@ -3508,8 +3586,43 @@ impl FrameReader {
         row: usize,
         dst: &mut [u8],
     ) -> Result<(), FrameMiss> {
-        if stride == row {
+        if row == stride {
             return self.copy_at(offset, dst);
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let height = dst.len() / row;
+            let span = (height - 1) * stride + row;
+            // Wide padding costs more than the saved calls in measured cropped-frame cases.
+            if stride <= 16 * 1024 && height > 1 && span <= dst.len() * 4 {
+                return self.vector_rows(offset, stride, row, dst);
+            }
+        }
+        #[cfg(unix)]
+        {
+            let height = dst.len() / row;
+            let span = (height - 1)
+                .checked_mul(stride)
+                .and_then(|n| n.checked_add(row))
+                .ok_or(FrameMiss::OutOfRange)?;
+            // Coalesce normal cropped frames. Do not turn an extremely sparse read into
+            // hundreds of MiB of unnecessary I/O: limit amplification to four times output.
+            let block_bytes = (32 * 1024).max(row);
+            let block_rows = ((block_bytes - row) / stride + 1).min(height);
+            if stride <= 16 * 1024 && span <= dst.len() * 4 && block_rows > 1 {
+                let mut scratch = self.plane_scratch.lock().unwrap_or_else(|e| e.into_inner());
+                scratch.resize((block_rows - 1) * stride + row, 0);
+                for start in (0..height).step_by(block_rows) {
+                    let rows = block_rows.min(height - start);
+                    let bytes = (rows - 1) * stride + row;
+                    self.copy_at(offset + start * stride, &mut scratch[..bytes])?;
+                    for y in 0..rows {
+                        dst[(start + y) * row..(start + y + 1) * row]
+                            .copy_from_slice(&scratch[y * stride..y * stride + row]);
+                    }
+                }
+                return Ok(());
+            }
         }
         for (y, dst) in dst.chunks_exact_mut(row).enumerate() {
             self.copy_at(offset + y * stride, dst)?;
@@ -3670,6 +3783,33 @@ mod tests {
             Err(FrameMiss::Replaced)
         );
         assert_eq!(r.stale_reads(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cropped_plane_is_one_bounded_copy() {
+        let mut w =
+            FrameWriter::create_temp_with("cropped", &FrameFileOptions::new(16, 8, 1).with_depth())
+                .unwrap();
+        let ready = w
+            .write_depth(&[7; 128], Some(&[2.0; 32]), 8, 4, 0, 1)
+            .unwrap();
+        let r = FrameReader::open(w.path()).unwrap();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = calls.clone();
+        PIXEL_BEFORE_COPY
+            .with(|h| *h.borrow_mut() = Some(Box::new(move |_| observed.set(observed.get() + 1))));
+        let (mut rgba, mut depth) = (vec![], vec![]);
+        let result = r.read_latest(&ready, &mut rgba, Some(&mut depth));
+        PIXEL_BEFORE_COPY.with(|h| *h.borrow_mut() = None);
+        assert!(result.is_ok());
+        assert_eq!(rgba, [7; 128]);
+        assert_eq!(depth, [2.0; 32]);
+        assert_eq!(
+            calls.get(),
+            4,
+            "header, colour span, depth span, final identity"
+        );
     }
 
     #[cfg(unix)]

@@ -2,16 +2,23 @@
 use rewrite_bridge::link::*;
 use std::time::Instant;
 fn main() {
-    for (width, height) in [
-        (1280, 720),
-        (1920, 1080),
-        (3840, 2160),
-        (8192, 8192),
-        (16384, 1),
-        (16384, 4096),
+    for (file_width, file_height, width, height) in [
+        (1280, 720, 1280, 720),
+        (1920, 1080, 1920, 1080),
+        (3840, 2160, 3840, 2160),
+        (8192, 8192, 8192, 8192),
+        (16384, 1, 16384, 1),
+        (16384, 4096, 16384, 4096),
+        (1920, 1080, 1280, 720),
+        (3840, 2160, 1920, 1080),
+        (16384, 4096, 8192, 4096),
+        (16384, 4096, 1, 4096),
     ] {
+        if std::env::var_os("RBL_BENCH_CROPPED_ONLY").is_some() && width == file_width {
+            continue;
+        }
         for with_depth in [false, true] {
-            let mut opts = FrameFileOptions::new(width, height, 1);
+            let mut opts = FrameFileOptions::new(file_width, file_height, 1);
             if with_depth {
                 opts = opts.with_depth();
             }
@@ -39,7 +46,8 @@ fn main() {
             }
             times.sort_by(|a, b| a.total_cmp(b));
             println!(
-                "rust,{width},{height},{with_depth},{n},{:.6},{:.6}",
+                "rust,{file_width},{file_height},{width},{height},{with_depth},{n},{:.6},{:.6},{:.6}",
+                times[times.len() / 10],
                 times[times.len() / 2],
                 times[(times.len() * 95 / 100).min(times.len() - 1)]
             );
