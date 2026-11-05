@@ -23,10 +23,12 @@
 //!
 //! The link only exchanges what each process chooses to publish. It never touches another process.
 
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::fs::{File, OpenOptions};
+use std::hash::{BuildHasher, Hasher};
 use std::io::{self, ErrorKind, Read, Write};
 use std::mem::ManuallyDrop;
 #[cfg(not(all(target_os = "wasi", target_env = "p2")))]
@@ -1660,14 +1662,25 @@ fn wasi_error(e: ErrorCode) -> io::Error {
 }
 
 /// A fresh random session number (contract section 6, step 3), from the operating system's generator, like a
-/// token. If the generator fails there is no number: the handshake fails with a `bye` rather than go on with a
-/// weaker one. The number is what binds the datagrams to the session (section 6.2), `generate_token` makes the
-/// same choice, and a generator that fails is a machine the link should not be trusted on. (The hash of
-/// `RandomState`, which was the fallback, may be deterministic on WASI: `wasi:random/insecure-seed` says so.)
+/// token. If the generator fails (natively, a host out of file descriptors cannot open `/dev/urandom`), the two
+/// kinds of target differ on purpose:
+///
+/// - On WASI there is no number and the handshake fails with a `bye`. The only other source there, the seed
+///   `RandomState` uses, is `wasi:random/insecure-seed`, which its interface says may be entirely deterministic,
+///   and the number is what binds the datagrams to the session (section 6.2).
+/// - Everywhere else a hash of the clock and of `RandomState`'s keys (which the operating system chose for the
+///   process) stands in, as it did before 0.3.1, so that a host that is out of descriptors still takes a guest.
 fn random_session() -> Option<u32> {
     let mut b = [0u8; 4];
-    os_random(&mut b).ok()?;
-    Some(u32::from_le_bytes(b).max(1))
+    if os_random(&mut b).is_ok() {
+        return Some(u32::from_le_bytes(b).max(1));
+    }
+    if cfg!(target_os = "wasi") {
+        return None;
+    }
+    let mut h = RandomState::new().build_hasher();
+    h.write_u64(now_us());
+    Some((h.finish() as u32).max(1))
 }
 
 impl Link {
