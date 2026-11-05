@@ -122,8 +122,8 @@ jobs:
       - name: Run the link test under wasmtime
         timeout-minutes: 12
         env:
-          # `timeout` kills a test binary that has not finished in 5 minutes (about 10 seconds is normal) and
-          # the step fails with status 124.
+          # `timeout` kills a test binary that has not finished in 5 minutes (about 10 seconds is normal); the
+          # binary then exits with status 124, cargo reports it and exits with 101, and the step fails.
           CARGO_TARGET_WASM32_WASIP2_RUNNER: "timeout 300 wasmtime run -S inherit-network --dir /tmp::/tmp"
         run: cargo test --target wasm32-wasip2 --features link --test link_wasi
 
