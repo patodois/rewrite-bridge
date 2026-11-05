@@ -8,9 +8,9 @@ readme = "README.md"
 repository = "https://github.com/patodois/rewrite-bridge"
 keywords = ["gamedev", "assets", "interop", "3d", "rewrite"]
 categories = ["game-development", "rendering::data-formats"]
-# The CI workflow is not part of the crate. The Bevy plugin (rewrite-bridge-bevy/) is its own package and is left out
-# of this one automatically.
-exclude = [".github/"]
+# The CI and release workflows and the script that packs the release archives are not part of the crate. The Bevy
+# plugin (rewrite-bridge-bevy/) is its own package and is left out of this one automatically.
+exclude = [".github/", "packaging/"]
 
 [workspace]
 # The core crate stays the root package, so `cargo test` here (and a git dependency on this repo)

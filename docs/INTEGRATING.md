@@ -550,6 +550,10 @@ cargo build --release --features link --example fake_host --example fake_guest -
 # binaries: target/release/examples/{fake_host,fake_guest,interop_peer}
 ```
 
+**Prebuilt, once a release has them (takes effect then; until then build them as above).** A release made from a `v*` tag
+carries one archive per system (macOS arm64 and x86_64, Linux and Windows x86_64) with the three peers, and a `SHA256SUMS`
+beside them on the [releases page](https://github.com/patodois/rewrite-bridge/releases): download yours, check it, and run `./fake_host` or `./fake_guest` in it. No Rust toolchain.
+
 On the toolchain used here the build printed a warning that `rust-objcopy` could not load `libLLVM.dylib`;
 the binaries were built and ran.
 
