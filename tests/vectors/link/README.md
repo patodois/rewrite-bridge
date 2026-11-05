@@ -1,6 +1,6 @@
 # Link protocol test vectors
 
-Test vectors for the passthrough link protocol of `docs/CONTRACT.md` (protocol v1, revision 6). Every
+Test vectors for the passthrough link protocol of `docs/CONTRACT.md` (protocol v1, revision 7). Every
 implementation of the link (Rust in this repository, `link-java`, `link-c`, `link-cs`) reads these files in its
 own test suite and must agree with all of them. They are derived from the contract alone: `gen.py` writes them
 with an encoder of its own (standard library only), so no implementation's bug can have leaked into them. Where
@@ -28,6 +28,7 @@ unique `id` (`ctl.*`, `dg.*`, `pf.*`/`pw.*`, `sess.*`, `ep.*`) and a `section` o
 field table but does not say a reader must refuse anything else; revision 5 states all of those in so many words,
 so none is left) or `derived` (follows from the text by reading it closely). A runner reports a failing `table` or
 `derived` vector like any other, and the report says its basis.
+`implementation` identifies an optional API policy supplied by these four libraries, rather than a protocol MUST.
 `note` and `why` are for humans. Everything is ASCII; the JSON is one case per line.
 
 Numbers in JSON: `u32` and smaller are numbers; `u64` (`time_us`, `frame`, `lock`) are decimal strings, so that no
@@ -98,6 +99,12 @@ delivered (an odd lock, another frame in the slot, a slot that does not exist, a
 size in the datagram that differs from the slot header's, a size of 0 or above the file's in the slot header). A
 `then` list continues the case: `{"op": "truncate", "length": N}` truncates the file the reader holds open, and
 `{"op": "read", ...}` is another read.
+
+A read with `"latest": true` uses the presentation API and advances order only after a valid
+copy. An absent or false `latest` selects the optional raw inspection API. A `channels` list
+contains reader cases in announcement order; discard the preceding reader and open a fresh
+one for each entry. This checks order across files. Applications must separately clear their
+own cached images on replacement or loss.
 
 Writer cases (`pw.*`) have `writer` (`width`, `height`, `slots`, `with_depth`, and `writes`: the frames to write
 in order, each with `camera_seq`, `time_us`, `width`, `height`, `rgba` and `depth`). The writer is created at a

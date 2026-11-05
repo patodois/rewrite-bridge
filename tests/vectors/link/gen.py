@@ -886,12 +886,37 @@ def pixel_cases(outdir):
 
     cases.append({"id": "pf.present.only_success_advances_order_rev7", "section": "7, 8, 9.6 (revision 7)",
                   "basis": "MUST", "file": fa, "open": "ok", "info": info_of(A),
-                  "note": "Presentation reads share a reader; raw reads remain unordered. Invalid high numbers do not advance order.",
+                  "note": "Presentation reads share a reader. Invalid high numbers do not advance order.",
                   "reads": [presentation(skip_read(18446744073709551615, 1, "the slot does not hold this old announcement")),
                             presentation(read(A, 1, False)), presentation(read(A, 0)),
                             presentation(skip_read(2, 2, "frame 2 is valid but older than the presented frame 3")),
-                            presentation(skip_read(3, 0, "frame 3 was already presented")),
-                            read(A, 2)]})
+                            presentation(skip_read(3, 0, "frame 3 was already presented"))]})
+
+    cases.append({"id": "pf.raw.reread_is_unordered", "section": "9.6 (revision 7)",
+                  "basis": "implementation", "file": fa, "open": "ok", "info": info_of(A),
+                  "note": "Checks the optional unordered raw API supplied by these implementations; the protocol permits but does not require that API.",
+                  "reads": [read(A,0), read(A,2), read(A,0)]})
+    widths = Fixture(width=16, height=16, slots=9)
+    for slot, width in enumerate([15,14,15,8,7,16,1,14,15]):
+        widths.put(slot, slot+1, w=width, h=9)
+    width_file = fixture_file("depth_width_sequence.bin", widths)
+    for want_depth in [False, True]:
+        cases.append({"id": "pf.present.changing_widths." + ("depth" if want_depth else "colour"),
+                      "section": "9.6 (revision 7)", "basis": "MUST", "file": width_file,
+                      "open": "ok", "info": info_of(widths),
+                      "reads": [presentation(read(widths,slot,want_depth)) for slot in range(9)]})
+    first = Fixture(width=2,height=2)
+    first.put(2,5)
+    second = Fixture(width=3,height=2)
+    second.put(1,1)
+    cases.append({"id": "pf.present.channel_replacement_starts_new_order", "section": "7, 8, 9.6 (revision 7)",
+                  "basis": "MUST", "channels": [
+                      {"file": fixture_file("channel_first.bin",first), "open":"ok", "info": info_of(first),
+                       "reads":[presentation(read(first,2))]},
+                      {"file": fixture_file("channel_second.bin",second), "open":"ok", "info": info_of(second),
+                       "reads":[presentation(skip_read(5,2,"late previous-file announcement",w=2,h=2)),
+                                presentation(read(second,1,False)),
+                                presentation(skip_read(1,1,"duplicate from current file",w=3,h=2))]}]})
 
     cases.append({"id": "pf.read.depth_file_frames_1_to_3", "section": "9.6", "basis": "MUST", "file": fa,
                   "open": "ok", "info": info_of(A),

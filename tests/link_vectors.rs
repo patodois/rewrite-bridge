@@ -620,6 +620,12 @@ fn check_read(reader: &FrameReader, rd: &Value) -> Result<(), String> {
 }
 
 fn check_pixel_reader(c: &Value) -> Result<(), String> {
+    if let Some(channels) = c["channels"].as_array() {
+        for channel in channels {
+            check_pixel_reader(channel)?;
+        }
+        return Ok(());
+    }
     let t = Temp::new("pf");
     let path = t.path("pixel.frames");
     let open_path: PathBuf = match c["path_kind"].as_str() {
