@@ -89,3 +89,7 @@ required-features = ["link"]
 [[test]]
 name = "link_vectors"
 required-features = ["link"]
+
+[[example]]
+name = "pixel_bench"
+required-features = ["link"]

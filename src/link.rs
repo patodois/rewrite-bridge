@@ -40,7 +40,9 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use memmap2::{Mmap, MmapMut};
+#[cfg(windows)]
+use memmap2::Mmap;
+use memmap2::MmapMut;
 use serde_json::{json, Map, Value};
 
 pub mod compose;
@@ -1179,6 +1181,8 @@ pub enum Event {
     },
     /// A complete collision snapshot, all chunks reassembled.
     Collision(Collision),
+    /// An unvalidated announcement. Presentation order is decided after copying the current
+    /// file, e.g. by `FrameReader::read_latest`, never from receipt alone.
     Frame {
         header: Header,
         frame: FrameReady,
@@ -2909,10 +2913,10 @@ pub enum FrameMiss {
     OutOfRange,
     /// The writer was in the slot, or overwrote it while it was copied.
     Torn,
-    /// The slot already holds another frame.
+    /// The slot already holds another frame, or presentation has already accepted this number.
     Replaced,
-    /// The file is now shorter than the mapping made of it (the peer truncated it). Nothing was
-    /// read; drop the reader and wait for a new `frame_channel`.
+    /// The file shrank or a positional read failed. Discard any partial copy, drop the reader
+    /// and wait for a new `frame_channel`.
     Gone,
 }
 
@@ -3254,17 +3258,30 @@ fn parse_file_header(b: &[u8]) -> Result<([u8; 8], FileHeader), WireError> {
     ))
 }
 
-/// Reads frames from a peer's pixel file, mapped read-only.
-///
-/// The peer owns the file. A peer that truncates it while it is mapped would crash a reader with
-/// SIGBUS on a plain access, so every [`read`](Self::read) first compares the file's current
-/// length with the mapped one and answers [`FrameMiss::Gone`] if it shrank. That narrows the race
-/// but cannot close it: a truncation between that check and the copy still faults. The contract
-/// forbids a sender to truncate or resize a pixel file it announced, so this guards against a
-/// broken or hostile peer only.
+// A deterministic test seam at the exact size/access boundary, absent from production builds.
+#[cfg(test)]
+thread_local! {
+    static PIXEL_AFTER_SIZE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+#[inline]
+fn pixel_after_size() {
+    #[cfg(test)]
+    PIXEL_AFTER_SIZE.with(|hook| {
+        if let Some(f) = hook.borrow_mut().take() {
+            f();
+        }
+    });
+}
+
+/// Reads a peer's pixel file. Unix uses bounded positional I/O so truncation, including
+/// between the length check and a copy, returns `Gone` instead of faulting the process.
+/// Windows keeps a read-only map: an active file mapping prevents ordinary file truncation.
+/// Writers still must obey the revision 6 lifetime and seqlock rules.
 pub struct FrameReader {
     newest: std::sync::Mutex<u64>,
     file: File,
+    file_len: u64,
+    #[cfg(windows)]
     map: Mmap,
     slots: u32,
     width: u32,
@@ -3276,7 +3293,7 @@ pub struct FrameReader {
 }
 
 impl FrameReader {
-    /// Maps the file a `frame_channel` message named and checks its header, including the depth
+    /// Opens the file a `frame_channel` message named and checks its header, including the depth
     /// fields: a file whose depth plane does not fit its slot is refused. A `depth_format` this
     /// revision does not know is read as colour only, so a later depth format stays readable.
     ///
@@ -3294,14 +3311,10 @@ impl FrameReader {
         if file_len < FILE_HEADER_LEN as u64 {
             return Err(bad("pixel file too short"));
         }
-        // SAFETY: the file is shared with its writer; this map is only read through raw
-        // pointers and the seqlock below, never as a Rust slice that could change under it. A
-        // peer that truncates the file is handled in `read_inner` (see the type's docs).
-        let map = unsafe { Mmap::map(&file)? };
-        if map.len() < FILE_HEADER_LEN {
-            return Err(bad("pixel file too short"));
-        }
-        let (magic, hdr) = parse_file_header(&map[..FILE_HEADER_LEN]).map_err(|_| bad("header"))?;
+        pixel_after_size();
+        let mut head = [0; FILE_HEADER_LEN];
+        (&file).read_exact(&mut head)?;
+        let (magic, hdr) = parse_file_header(&head).map_err(|_| bad("header"))?;
         let FileHeader {
             version,
             slots,
@@ -3354,12 +3367,22 @@ impl FrameReader {
         let need = slot_sz
             .checked_mul(u64::from(slots))
             .and_then(|n| n.checked_add(FILE_HEADER_LEN as u64));
-        if need.is_none_or(|n| (map.len() as u64) < n) {
+        if need.is_none_or(|n| file_len < n) {
             return Err(bad("pixel file shorter than its header says"));
+        }
+        #[cfg(windows)]
+        // SAFETY: an active Windows file mapping prevents ordinary truncation. Reads use
+        // raw pointers, bounded by the validated file length, and verify the slot seqlock.
+        let map = unsafe { Mmap::map(&file)? };
+        #[cfg(windows)]
+        if need.is_none_or(|n| (map.len() as u64) < n) {
+            return Err(bad("pixel file shrank before mapping"));
         }
         Ok(Self {
             newest: std::sync::Mutex::new(0),
             file,
+            file_len,
+            #[cfg(windows)]
             map,
             slots,
             width,
@@ -3413,6 +3436,55 @@ impl FrameReader {
         self.read_inner(ready, rgba, Some(depth))
     }
 
+    fn copy_at(&self, offset: usize, dst: &mut [u8]) -> Result<(), FrameMiss> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file
+                .read_exact_at(dst, offset as u64)
+                .map_err(|_| FrameMiss::Gone)
+        }
+        #[cfg(windows)]
+        {
+            if offset
+                .checked_add(dst.len())
+                .is_none_or(|end| end > self.map.len())
+            {
+                return Err(FrameMiss::Gone);
+            }
+            // SAFETY: validated range, Windows prevents truncation of a mapped file.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.map.as_ptr().add(offset),
+                    dst.as_mut_ptr(),
+                    dst.len(),
+                );
+            }
+            Ok(())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (offset, dst);
+            Err(FrameMiss::Gone)
+        }
+    }
+
+    fn copy_rows(
+        &self,
+        offset: usize,
+        stride: usize,
+        row: usize,
+        dst: &mut [u8],
+    ) -> Result<(), FrameMiss> {
+        if row == stride {
+            return self.copy_at(offset, dst);
+        }
+        for (y, dst) in dst.chunks_exact_mut(row).enumerate() {
+            self.copy_at(offset + y * stride, dst)?;
+        }
+        Ok(())
+    }
+
     fn read_inner(
         &self,
         ready: &FrameReady,
@@ -3428,30 +3500,32 @@ impl FrameReader {
         {
             return Err(FrameMiss::OutOfRange);
         }
-        // The peer must not shrink its file; if it did, touching the map would fault.
+        // Early rejection; the bounded copies also handle truncation after this check.
         if self
             .file
             .metadata()
-            .map_or(true, |m| m.len() < self.map.len() as u64)
+            .map_or(true, |m| m.len() < self.file_len)
         {
             return Err(FrameMiss::Gone);
         }
+        pixel_after_size();
         let base = self
             .slot_size
             .checked_mul(u64::from(ready.slot))
             .and_then(|n| n.checked_add(FILE_HEADER_LEN as u64))
             .and_then(|n| usize::try_from(n).ok())
             .ok_or(FrameMiss::OutOfRange)?;
-        let ptr = self.map.as_ptr();
-        let lock = lock_at(ptr, base);
-        let l1 = lock.load(Ordering::Acquire);
+        let mut header = [0u8; SLOT_HEADER_LEN];
+        #[cfg(windows)]
+        let l1 = lock_at(self.map.as_ptr(), base).load(Ordering::Acquire);
+        self.copy_at(base, &mut header)?;
+        #[cfg(not(windows))]
+        let l1 = u64::from_le_bytes(header[..8].try_into().unwrap());
+        fence(Ordering::Acquire);
         if l1 & 1 == 1 {
             return Err(FrameMiss::Torn);
         }
-        let mut h = [0u8; SLOT_HEADER_LEN - 8];
-        // SAFETY: in bounds (checked in `open`); the writer may change these bytes, which the
-        // seqlock check below detects.
-        unsafe { std::ptr::copy_nonoverlapping(ptr.add(base + 8), h.as_mut_ptr(), h.len()) };
+        let h = &header[8..];
         let mut r = In { b: &h, at: 0 };
         let data = FrameData {
             frame: r.u64().unwrap_or(0),
@@ -3470,37 +3544,31 @@ impl FrameReader {
         let row = data.width as usize * 4;
         rgba.clear();
         rgba.resize(row * data.height as usize, 0);
-        for y in 0..data.height as usize {
-            let at = base + SLOT_HEADER_LEN + y * self.stride as usize;
-            // SAFETY: as above.
-            unsafe {
-                std::ptr::copy_nonoverlapping(ptr.add(at), rgba.as_mut_ptr().add(y * row), row)
-            };
-        }
+        self.copy_rows(base + SLOT_HEADER_LEN, self.stride as usize, row, rgba)?;
         if let Some(depth) = depth {
             depth.clear();
             if let Some((offset, dstride)) = self.depth {
                 depth.resize(data.width as usize * data.height as usize, 0.0);
-                for y in 0..data.height as usize {
-                    let at = base + offset as usize + y * dstride as usize;
-                    // SAFETY: as above; `open` checked that the whole plane is inside the slot,
-                    // and `row` is at most `dstride`. The destination is the vector's own f32s,
-                    // filled bytewise.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            ptr.add(at),
-                            (depth.as_mut_ptr() as *mut u8).add(y * row),
-                            row,
-                        )
-                    };
-                }
+                // SAFETY: initialized local f32 storage; every f32 bit pattern is valid.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts_mut(depth.as_mut_ptr().cast::<u8>(), depth.len() * 4)
+                };
+                self.copy_rows(base + offset as usize, dstride as usize, row, bytes)?;
                 for v in depth.iter_mut() {
                     *v = f32::from_bits(u32::from_le(v.to_bits()));
                 }
             }
         }
         fence(Ordering::Acquire);
-        if lock.load(Ordering::Relaxed) != l1 {
+        #[cfg(windows)]
+        let l2 = lock_at(self.map.as_ptr(), base).load(Ordering::Relaxed);
+        #[cfg(not(windows))]
+        let l2 = {
+            let mut last = [0u8; 8];
+            self.copy_at(base, &mut last)?;
+            u64::from_le_bytes(last)
+        };
+        if l2 != l1 {
             return Err(FrameMiss::Torn);
         }
         Ok(data)
@@ -3538,6 +3606,50 @@ fn normalize(a: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn truncation_after_size_is_a_miss() {
+        if let Ok(mode) = std::env::var("RBL_TRUNCATE_CHILD") {
+            let mut w = FrameWriter::create_temp("truncate", 64, 64, 1).unwrap();
+            let ready = w.write(&vec![7; 64 * 64 * 4], 64, 64, 0, 1).unwrap();
+            let truncator = OpenOptions::new().write(true).open(w.path()).unwrap();
+            if mode == "open" {
+                PIXEL_AFTER_SIZE.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move || truncator.set_len(0).unwrap()))
+                });
+                assert!(FrameReader::open(w.path()).is_err());
+            } else {
+                let r = FrameReader::open(w.path()).unwrap();
+                PIXEL_AFTER_SIZE.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move || truncator.set_len(0).unwrap()))
+                });
+                assert_eq!(r.read(&ready, &mut vec![]), Err(FrameMiss::Gone));
+            }
+            return;
+        }
+        for mode in ["open", "read"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "link::tests::truncation_after_size_is_a_miss",
+                    "--nocapture",
+                ])
+                .env("RBL_TRUNCATE_CHILD", mode)
+                .output()
+                .unwrap();
+            eprintln!(
+                "{mode}: status {}\n{}{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.status.success(),
+                "truncated {mode} crashed or failed"
+            );
+        }
+    }
 
     fn header(seq: u32) -> Header {
         Header {

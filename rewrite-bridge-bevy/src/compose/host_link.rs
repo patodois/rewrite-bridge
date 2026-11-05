@@ -182,6 +182,8 @@ fn poll_link(mut host: NonSendMut<HostLink>, mut frames: ResMut<GuestFrames>) {
                     Err(FrameMiss::Gone) => {
                         warn!("passthrough link: the pixel file was truncated, dropping it");
                         host.reader = None;
+                        host.newest = 0;
+                        frames.clear_frame();
                         host.stats.frames_missed += 1;
                     }
                     Err(_) => host.stats.frames_missed += 1,
@@ -469,6 +471,27 @@ mod tests {
         guest.announce_frames(&FrameChannel { path: "relative.frames".into(), ..b.channel().clone() }).unwrap();
         settle(&mut app, &mut [&mut guest]);
         assert_eq!(shown(&app), None);
+    }
+
+    #[test]
+    fn a_truncated_file_invalidates_the_displayed_image() {
+        let (mut app, port) = host_app();
+        let mut guest = guest_link(port);
+        connect(&mut app, &mut guest);
+        let mut w = writer("truncate-image");
+        guest.announce_frames(w.channel()).unwrap();
+        settle(&mut app, &mut [&mut guest]);
+        let ready = write(&mut w, 7);
+        guest.send_frame(&ready).unwrap();
+        pump(&mut app, &mut [&mut guest], |a| stats(a).frames_shown == 1);
+        // Ordinary truncation is refused while mapped on Windows; Unix must survive it.
+        #[cfg(unix)]
+        {
+            std::fs::OpenOptions::new().write(true).open(w.path()).unwrap().set_len(0).unwrap();
+            guest.send_frame(&FrameReady { frame: 2, ..ready }).unwrap();
+            settle(&mut app, &mut [&mut guest]);
+            assert_eq!(shown(&app), None);
+        }
     }
 
     #[test]
