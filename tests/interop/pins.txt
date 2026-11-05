@@ -1,6 +1,6 @@
 # Revisions of the other implementations that .github/workflows/link-interop.yml checks out.
 # Each must contain tests/vectors/link identical to this repository's and the interop peer.
 # Move a pin in the pull request that needs the newer revision.
-link-java  931fb417a4217dd7880d0237667449c80767e879
-link-c     3ddf7f4f5d9d96d7c66c2ac24d3cb401fdd892e6
-link-cs    e2082057f87ae770fb4512d35005f27e3e8f11f7
+link-java  fabc937ebe54905e1d5f16a97ba3495f6998e757
+link-c     562a95e67e10d0380ea7500c71ee8b466595a18b
+link-cs    912a885b54f872e7000cf912b6c700129e74f652
