@@ -60,7 +60,7 @@ Add yours with a pull request or an issue once it is public.
 
 ```toml
 [dependencies]
-rewrite-bridge = "0.3"
+rewrite-bridge = "0.4"
 ```
 
 ### One copy for the whole build
@@ -75,8 +75,8 @@ rewrite-bridge = "0.3"
 > ```
 >
 > From crates.io this takes care of itself. Cargo gives every requirement that agrees with the others
-> (`"0.3"`, `"0.3.1"`, `"^0.3.1"`) the same release and builds it once, so the `rewrite-bridge = "0.3"`
-> in your crate and the `0.3.1` that a provider asks for are one crate. Before 1.0 the minor number is
+> (`"0.4"`, `"0.4.0"`, `"^0.4.0"`) the same release and builds it once, so the `rewrite-bridge = "0.4"`
+> in your crate and the `0.4.0` that a provider asks for are one crate. Before 1.0 the minor number is
 > the breaking one: a `"0.4"` anywhere in the build would be a second copy, and the error above. Stay
 > on one `0.x` line, as the providers and `rewrite-bridge-bevy` do.
 >
@@ -89,12 +89,12 @@ rewrite-bridge = "0.3"
 > error: specification `rewrite-bridge` is ambiguous
 > help: re-run this command with one of the following specifications
 >   rewrite-bridge@0.1.0
->   rewrite-bridge@0.3.1
+>   rewrite-bridge@0.4.0
 > ```
 >
 > `cargo tree -d` lists the duplicated crates and the crates that pull each copy in. Fix it by moving
 > every dependency to crates.io: replace the `git` and `tag` lines of `rewrite-bridge` and
-> `rewrite-bridge-bevy` with `"0.3"`, and use a provider revision that does the same.
+> `rewrite-bridge-bevy` with `"0.4"`, and use a provider revision that does the same.
 
 ### Rust and build times
 
@@ -332,8 +332,8 @@ models with skins, animations with sockets, and scenes. A Rust game rewrite need
 
 ```toml
 [dependencies]
-rewrite-bridge = "0.3"
-rewrite-bridge-bevy = "0.3"
+rewrite-bridge = "0.4"
+rewrite-bridge-bevy = "0.4"
 ```
 
 Both come from crates.io and are built once whatever else you combine, providers included (see
@@ -381,14 +381,27 @@ side freezes or dies.
 
 - Control: JSON lines over TCP on `127.0.0.1` (default port 47800).
 - State: little-endian binary UDP datagrams on `127.0.0.1`, at most 8192 bytes each.
-- Frames: a memory-mapped file in the temp directory, guarded by a seqlock. A frame is RGBA and
+- Frames: a shared pixel file in the temp directory (positional I/O on Unix, a read-only map on Windows), guarded by a seqlock. A frame is RGBA and
   can carry linear depth in metres, so the host can reproject it to its newest camera and let the
   nearer of its own pixel and the guest's win (`link::compose`, a CPU reference for testing and
   small images; engines do the same on the GPU, and `rewrite-bridge-bevy` does for a Bevy camera with
   its [`compose` feature](rewrite-bridge-bevy/README.md#depth-compositing-of-a-guests-frames-feature-compose)).
 - Coordinates: the same glTF conventions as `Model`; each side converts its own.
 
-[`docs/CONTRACT.md`](docs/CONTRACT.md) is the versioned protocol (v1, revision 6), with every byte offset and C
+### Migrating pixel consumers to 0.4.0
+
+`Event::Frame` is an unvalidated announcement. `Link` no longer discards frame numbers
+before the pixel slot has been checked. For presentation, replace unordered `read` /
+`read_depth` calls with `reader.read_latest(&ready, &mut rgba, Some(&mut depth))`, or pass
+`None` to omit depth. Only a successful current-file copy advances presentation order;
+`reader.stale_reads()` counts rejected duplicates and older numbers. Raw reads remain available
+for inspection and re-reading. Buffers are valid only on success. On `FrameChannel`, close the
+old reader and clear its displayed image before opening the replacement, even if opening fails.
+Also clear the image and drop the reader on `FrameMiss::Gone` or session loss. Discard asynchronous
+results from replaced readers. The minor-version increase is intentional because old consumers
+otherwise compile while losing their presentation-order filter. See [PIXEL-IO.md](PIXEL-IO.md).
+
+[`docs/CONTRACT.md`](docs/CONTRACT.md) is the versioned protocol (v1, revision 7), with every byte offset and C
 structs, so plugins in other languages can implement it without this crate. In Rust:
 
 ```rust
@@ -564,12 +577,3 @@ cargo run --release --features link --example fake_guest -- --frames --seconds 1
 ## License
 
 Licensed under either of MIT or Apache-2.0, at your option.
-
-### Ordem de apresentação de pixels
-
-Os eventos Frame são anúncios ainda não validados. Ao trocar frame_channel ou perder a sessão,
-limpe a imagem anterior e descarte o leitor anterior, inclusive se o novo arquivo não abrir.
-Use a leitura de apresentação read_latest (Rust/C), ReadLatest (C#) ou readLatest (Java):
-só uma cópia válida avança o maior número do arquivo atual. As leituras brutas continuam
-permitindo releituras e não implementam ordem de apresentação. Consumidores assíncronos devem
-associar trabalhos e resultados à instância do leitor e rejeitar resultados de leitores substituídos.

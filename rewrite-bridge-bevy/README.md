@@ -120,7 +120,7 @@ presents now. It is the GPU form of the core crate's CPU reference, `rewrite_bri
 (contract section 9.7), with the same rules and tested against it.
 
 ```toml
-rewrite-bridge-bevy = { version = "0.3", features = ["compose"] }   # the feature is new in 0.2.2
+rewrite-bridge-bevy = { version = "0.4", features = ["compose"] }   # the feature is new in 0.2.2
 ```
 
 ```rust

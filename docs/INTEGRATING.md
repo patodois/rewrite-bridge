@@ -101,7 +101,7 @@ tested against each other.
   - `Collision`: triangles near the player, host to guest, UDP in chunks of at most 226 triangles, a snapshot
     replaces the previous one.
   - `Pose`: per entity, UDP, either direction, only for entities the sender has `spawn`ed.
-  - `Frame`: an RGBA image with optional linear depth in a memory-mapped file, announced by a `frame_channel`
+  - `Frame`: an RGBA image with optional linear depth in a shared pixel file (positional Unix reads, a protected Windows map), announced by a `frame_channel`
     line and a UDP notice, normally guest to host.
   - Control lines (TCP, JSON): `hello`, `spawn`, `despawn`, `input` (who has the keyboard, mouse and gamepad),
     `frame_channel`, `bye`.
