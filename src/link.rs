@@ -3289,6 +3289,7 @@ type PixelCopyHook = Box<dyn FnMut(usize)>;
 #[cfg(test)]
 thread_local! {
     static PIXEL_BEFORE_COPY: std::cell::RefCell<Option<PixelCopyHook>> = std::cell::RefCell::new(None);
+    static PIXEL_VECTOR_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PIXEL_AFTER_SIZE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }
 #[inline]
@@ -3573,11 +3574,25 @@ impl FrameReader {
             while first < count {
                 // SAFETY: validated file offsets and owned buffers; each syscall fills vectors
                 // in order. Overlapping padding destinations are intentionally discarded.
+                let segments = &vectors[first..count];
+                #[cfg(test)]
+                let cap = PIXEL_VECTOR_CAP.with(|v| v.get());
+                #[cfg(test)]
+                let limited = libc::iovec {
+                    iov_base: segments[0].iov_base,
+                    iov_len: segments[0].iov_len.min(cap),
+                };
+                #[cfg(test)]
+                let segments = if cap > 0 {
+                    std::slice::from_ref(&limited)
+                } else {
+                    segments
+                };
                 let n = unsafe {
                     libc::preadv(
                         self.file.as_raw_fd(),
-                        vectors[first..].as_ptr(),
-                        (count - first) as libc::c_int,
+                        segments.as_ptr(),
+                        segments.len() as libc::c_int,
                         at as libc::off_t,
                     )
                 };
@@ -3960,7 +3975,24 @@ mod tests {
         drop(peer);
     }
 
-
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn short_vector_reads_resume_inside_colour_padding_and_depth() {
+        let mut w =
+            FrameWriter::create_temp_with("short", &FrameFileOptions::new(16, 16, 1).with_depth())
+                .unwrap();
+        let pixels: Vec<u8> = (0..8 * 9 * 4).map(|j| (j * 37) as u8).collect();
+        let expected: Vec<f32> = (0..8 * 9).map(|j| j as f32 + 0.5).collect();
+        let ready = w.write_depth(&pixels, Some(&expected), 8, 9, 0, 1).unwrap();
+        let r = FrameReader::open(w.path()).unwrap();
+        let (mut rgba, mut depth) = (vec![], vec![]);
+        PIXEL_VECTOR_CAP.with(|v| v.set(7));
+        let result = r.read_latest(&ready, &mut rgba, Some(&mut depth));
+        PIXEL_VECTOR_CAP.with(|v| v.set(0));
+        result.unwrap();
+        assert_eq!(rgba, pixels);
+        assert_eq!(depth, expected);
+    }
 
     #[test]
     fn pixel_widths_can_shrink_and_grow_without_stale_pixels() {
