@@ -175,7 +175,8 @@ fn main() -> std::io::Result<()> {
                 }
                 Event::Frame { frame, .. } => {
                     if let Some(r) = &reader {
-                        if let Ok(d) = r.read_latest(&frame, &mut pixels, Some(&mut depth)) {
+                        let copied = r.read_latest(&frame, &mut pixels, Some(&mut depth));
+                        if let Ok(d) = copied {
                             frames += 1;
                             guest = Some(GuestFrame {
                                 rgba: pixels.clone(),
@@ -186,6 +187,10 @@ fn main() -> std::io::Result<()> {
                                 width: d.width,
                                 height: d.height,
                             });
+                        } else if copied == Err(FrameMiss::Gone) {
+                            reader = None;
+                            guest = None;
+                            log("pixel file gone; cleared cached frame".into());
                         }
                     }
                 }
