@@ -367,7 +367,7 @@ pub struct Composited {
 /// All four slices cover the same `n` pixels (`*_rgba` has `4 * n` bytes); both depths are linear
 /// metres (convert a host depth buffer with [`linearize_buffer`]). Where the guest pixel is not
 /// empty (alpha above 0, finite positive depth) and strictly nearer than the host's (any non-finite
-/// host depth means the host drew nothing), it is blended over the host with straight-alpha
+/// or nonpositive host depth means the host drew nothing), it is blended over the host with straight-alpha
 /// "over", in the encoded (sRGB) values as the pixel file carries them; otherwise the host pixel
 /// stays. Equal depths go to the host.
 pub fn composite(
@@ -388,7 +388,7 @@ pub fn composite(
         if g[3] == 0 || !gd.is_finite() || gd <= 0.0 {
             continue;
         }
-        let hd = if !host_depth[i].is_finite() {
+        let hd = if !host_depth[i].is_finite() || host_depth[i] <= 0.0 {
             f32::INFINITY
         } else {
             host_depth[i]
@@ -469,6 +469,16 @@ impl Default for CameraRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonpositive_host_depth_is_empty() {
+        for host in [0.0, -0.0, -1.0] {
+            let result =
+                composite(&[10, 20, 30, 255], &[host], &[200, 100, 50, 255], &[2.0]).unwrap();
+            assert_eq!(result.rgba, [200, 100, 50, 255]);
+            assert_eq!(result.depth, [2.0]);
+        }
+    }
 
     #[test]
     fn every_nonfinite_host_depth_is_empty() {
