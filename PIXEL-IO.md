@@ -63,6 +63,8 @@ Mono, Unity and IL2CPP have not been run in this task.
 
 ## Benchmark method
 
+The benchmark repeats raw reads of one valid slot, so it measures copies rather than the
+ordered API rejecting duplicates. It does not include presentation-order locking or counters.
 Synthetic local files, warm cache, two warm-up reads, 30 samples for normal/cropped frames
 and 5 for maximum-sized outputs. Times include header validation, requested planes and final
 identity checks; exclude writer, GPU, IPC and rendering. Rust/C reuse destination buffers;
