@@ -1215,6 +1215,29 @@ fn a_collision_of_9000_bytes_that_starts_as_a_full_valid_chunk_is_malformed() {
     assert_eq!(host.stats().malformed, 1);
 }
 
+/// One poll reads at most 1024 datagrams on this target (4096 natively), however many are waiting: the cost of
+/// reading them, sustained, is what the limit is for. The rest are read by the polls that follow.
+#[cfg(target_os = "wasi")]
+#[test]
+fn a_poll_reads_at_most_1024_foreign_datagrams_and_the_next_polls_read_the_rest() {
+    let _serial = serial();
+    let mut host = Link::host(cfg("Host", 0)).unwrap();
+    let to = host.udp_addr().unwrap();
+    let foreign = UdpSocket::bind(localhost(0)).unwrap();
+    let mut queued = 0;
+    while queued < 3000 && foreign.send_to(&[7u8; 24], to).is_ok() {
+        queued += 1;
+    }
+    assert!(queued >= 2500, "only {queued} datagrams could be queued");
+    host.poll();
+    let first = host.stats().foreign;
+    assert_eq!(first, 1024, "the first poll read {first} datagrams");
+    for _ in 0..10 {
+        host.poll();
+    }
+    assert_eq!(host.stats().foreign, queued as u64);
+}
+
 fn chunk(query: u32, index: u16, count: u16, tag: f32) -> Datagram {
     Datagram::Collision(CollisionChunk {
         query,

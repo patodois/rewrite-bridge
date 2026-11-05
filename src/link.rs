@@ -97,15 +97,22 @@ pub const UNAUTHORIZED: &str = "unauthorized";
 pub const COLLISION_PER_POLL: usize = 32;
 /// The UDP receive buffer a receiver asks for, in bytes (section 2); the OS may grant less.
 pub const RECV_BUFFER_BYTES: usize = 4 << 20;
-/// Datagrams one [`Link::poll`] reads at most, on every target; the rest wait in the socket for the next poll.
-/// A flood from a process that is not the peer is read, and dropped, at this rate, so it bounds how long a poll
-/// can be held up. On `wasm32-wasip2` a datagram costs 2 to 14 microseconds to read (24 to 8192 bytes, under
-/// wasmtime on macOS), so 4096 of them are at most about 14 ms of a tick of 50 ms; the 4 MiB the socket asks for
-/// holds only about 500 datagrams of 8192 bytes, which is 7 ms. A lower limit would save little and lower the
-/// flood a session can ride out: past what a poll reads, the socket fills and the system drops the peer's
-/// datagrams along with the flood's, whatever the limit is. A tick needs far fewer (a collision snapshot is 32
-/// datagrams a poll; a heartbeat, a camera and a few pose datagrams are all else).
+/// Datagrams one [`Link::poll`] reads at most; the rest wait in the socket for the next poll. A flood from a
+/// process that is not the peer is read, and dropped, at this rate, so it bounds how long a poll can be held up.
+/// Past what a poll reads, the socket fills and the system drops the peer's datagrams along with the flood's,
+/// whatever the limit is; the limit only says how much of a tick the flood may take.
+///
+/// Natively 4096. On `wasm32-wasip2` 1024, because reading a datagram there costs more: every one is copied out
+/// of the runtime and allocated. Measured under wasmtime 50.0.1 on macOS, with four native threads keeping the
+/// socket full during the poll and a poll every 50 ms, at 4096: an average poll of 22 ms for datagrams of 24
+/// bytes, 27 ms for 8192, and 95 ms for 65507 (worst 161 ms), which overran every tick; at 1024 an average of 6 ms,
+/// 9 ms and 35 ms (worst 10, 17 and 45 ms), all inside the tick. Normal traffic needs far fewer: a collision snapshot is 32 datagrams a poll, and a heartbeat, a camera and a few pose datagrams are all
+/// else.
+#[cfg(not(target_os = "wasi"))]
 const MAX_DATAGRAMS_PER_POLL: usize = 4096;
+/// See the other `MAX_DATAGRAMS_PER_POLL`.
+#[cfg(target_os = "wasi")]
+const MAX_DATAGRAMS_PER_POLL: usize = 1024;
 /// How long one connection attempt of a guest may take. It runs on a helper thread, so a slow
 /// refusal (Windows retries a refused localhost SYN for about two seconds) never blocks a poll.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
