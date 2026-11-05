@@ -1810,8 +1810,8 @@ impl Link {
         self.peer().is_some()
     }
 
-    /// Either role: a local hello or bye that exceeded the control-line limit. This diagnostic persists
-    /// across polls until a successful handshake clears it.
+    /// Either role: a local hello or bye that exceeded the control-line limit. A host retains this
+    /// diagnostic across polls until a successful handshake clears it.
     /// Guest: why the last attempt to connect failed, or `None` before the first attempt and after one that
     /// connected. Either the endpoint file could not be read or was refused, or the connection to the host's
     /// port failed. The text never holds a token. A host that refuses the guest after the connection is up
