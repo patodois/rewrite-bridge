@@ -3311,7 +3311,7 @@ fn pixel_after_size() {
 /// Reads a peer's pixel file. Unix uses bounded positional I/O so truncation, including
 /// between the length check and a copy, returns `Gone` instead of faulting the process.
 /// Windows keeps a read-only map: an active file mapping prevents ordinary file truncation.
-/// Writers still must obey the revision 6 lifetime and seqlock rules.
+/// Writers still must obey the contract's lifetime and seqlock rules.
 pub struct FrameReader {
     newest: std::sync::Mutex<u64>,
     stale_reads: AtomicU64,
