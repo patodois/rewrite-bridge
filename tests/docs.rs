@@ -8,7 +8,9 @@ fn root() -> PathBuf {
 }
 
 fn read(path: &str) -> String {
-    std::fs::read_to_string(root().join(path)).unwrap_or_else(|e| panic!("{path}: {e}"))
+    std::fs::read_to_string(root().join(path))
+        .unwrap_or_else(|e| panic!("{path}: {e}"))
+        .replace("\r\n", "\n")
 }
 
 /// docs/WRITING_A_PROVIDER.md section 5 is the whole of examples/cube_provider.rs, so the example
