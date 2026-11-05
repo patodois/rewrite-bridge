@@ -227,8 +227,10 @@ impl Scene {
                 }
                 if image.width == 0
                     || image.height == 0
-                    || image.rgba.len() as u64
-                        != u64::from(image.width) * u64::from(image.height) * 4
+                    || Some(image.rgba.len() as u64)
+                        != u64::from(image.width)
+                            .checked_mul(u64::from(image.height))
+                            .and_then(|n| n.checked_mul(4))
                 {
                     return bad(format!(
                         "environment picture is {}x{} but holds {} bytes",

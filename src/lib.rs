@@ -365,7 +365,11 @@ impl Model {
                     img.width, img.height
                 ));
             }
-            if img.rgba.len() as u64 != u64::from(img.width) * u64::from(img.height) * 4 {
+            if Some(img.rgba.len() as u64)
+                != u64::from(img.width)
+                    .checked_mul(u64::from(img.height))
+                    .and_then(|n| n.checked_mul(4))
+            {
                 return bad(format!(
                     "image {i} is {}x{} but holds {} bytes",
                     img.width,
