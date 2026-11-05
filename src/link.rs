@@ -1810,7 +1810,8 @@ impl Link {
         self.peer().is_some()
     }
 
-    /// Either role: a local hello or bye that exceeded the control-line limit.
+    /// Either role: a local hello or bye that exceeded the control-line limit. This diagnostic persists
+    /// across polls until a successful handshake clears it.
     /// Guest: why the last attempt to connect failed, or `None` before the first attempt and after one that
     /// connected. Either the endpoint file could not be read or was refused, or the connection to the host's
     /// port failed. The text never holds a token. A host that refuses the guest after the connection is up
@@ -1818,8 +1819,9 @@ impl Link {
     ///
     /// Either role, on `wasm32-wasip2` only: why it is taking no new connection, while four connections whose
     /// peers stopped reading are still set aside. The four are counted for the whole component, not per `Link`:
-    /// unrelated `Link`s in it share them, and one can be held up by another's peers. A host has no other
-    /// reason, and clears it when it is under the limit again. Elsewhere there is no such limit.
+    /// unrelated `Link`s in it share them, and one can be held up by another's peers. A host clears a
+    /// capacity-only notice when it is under the limit again; an earlier local control error is retained
+    /// instead of being replaced by that notice. Elsewhere there is no such limit.
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
@@ -1874,10 +1876,14 @@ impl Link {
     fn poll_connect(&mut self, now: Instant, full: bool) {
         if let Some(listener) = &self.listener {
             let mut busy = Vec::new();
-            // Said while it lasts, and gone when the host is under the limit again.
-            self.last_error = full.then(|| {
-                "not accepting: peers that stopped reading still hold earlier connections".into()
-            });
+            const CAPACITY_ERROR: &str =
+                "not accepting: peers that stopped reading still hold earlier connections";
+            // Capacity notices are temporary; local control errors survive until a successful handshake.
+            if full && self.last_error.is_none() {
+                self.last_error = Some(CAPACITY_ERROR.into());
+            } else if !full && self.last_error.as_deref() == Some(CAPACITY_ERROR) {
+                self.last_error = None;
+            }
             loop {
                 // With [`PARKED_LIMIT`] sockets parked nobody is taken in; a guest waits in the backlog.
                 if full {
@@ -3830,6 +3836,84 @@ mod tests {
         }
         assert!(!host.is_connected());
         assert_eq!(host.stats.lines_sent, 1, "only short error bye");
+        for _ in 0..2 {
+            host.poll();
+            assert!(
+                host.last_error().is_some_and(|e| e.contains("local hello")),
+                "host diagnostic must survive later polls"
+            );
+        }
+        host.cfg.game = "host".into();
+        let mut replacement = Link::guest(LinkConfig {
+            control_port: host.control_addr().unwrap().port(),
+            ..LinkConfig::new("replacement")
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !host.is_connected() || !replacement.is_connected() {
+            host.poll();
+            replacement.poll();
+            assert!(Instant::now() < deadline, "replacement did not connect");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            host.last_error(),
+            None,
+            "successful handshake clears local error"
+        );
+    }
+
+    #[test]
+    fn host_bye_error_survives_later_polls() {
+        let mut host = Link::host(LinkConfig {
+            control_port: 0,
+            ..LinkConfig::new("host")
+        })
+        .unwrap();
+        let mut guest = Link::guest(LinkConfig {
+            control_port: host.control_addr().unwrap().port(),
+            ..LinkConfig::new("guest")
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !host.is_connected() || !guest.is_connected() {
+            host.poll();
+            guest.poll();
+            assert!(Instant::now() < deadline, "guest did not connect");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        host.disconnect(&"x".repeat(MAX_LINE));
+        for _ in 0..2 {
+            host.poll();
+            assert!(
+                host.last_error().is_some_and(|e| e.contains("local bye")),
+                "host bye diagnostic must survive later polls"
+            );
+        }
+    }
+
+    #[test]
+    fn host_capacity_notice_does_not_replace_a_local_control_error() {
+        let mut host = Link::host(LinkConfig {
+            control_port: 0,
+            ..LinkConfig::new("host")
+        })
+        .unwrap();
+        host.last_error = Some("local bye control line too long".into());
+        host.poll_connect(Instant::now(), true);
+        host.poll_connect(Instant::now(), false);
+        assert_eq!(host.last_error(), Some("local bye control line too long"));
+        host.last_error = None;
+        host.poll_connect(Instant::now(), true);
+        assert!(host
+            .last_error()
+            .is_some_and(|e| e.contains("not accepting")));
+        host.poll_connect(Instant::now(), false);
+        assert_eq!(
+            host.last_error(),
+            None,
+            "capacity-only notice ends when capacity returns"
+        );
     }
 
     #[test]
