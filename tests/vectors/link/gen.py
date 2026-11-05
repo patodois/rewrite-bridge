@@ -1537,13 +1537,14 @@ def sessions():
     def fr(frame, slot=0, cam=0):
         return encode_body(frame_body(frame=frame, slot=slot, camera_seq=cam, width=4, height=2)).hex()
 
-    case("sess.host.udp.frame_staleness_and_channel_reset", "7, 8", "host", HS + [
+    case("sess.host.udp.frame_announcements_require_consumer_validation", "7, 8", "host", HS + [
         sendd(dg(fr(5), 5, seq=1)), ev("frame", {"frame": "5"}),
-        sendd(dg(fr(5), 5, seq=2)), sendd(dg(fr(4), 5, seq=3)), noev("frame", 300),
+        sendd(dg(fr(5), 5, seq=2)), ev("frame", {"frame": "5"}),
+        sendd(dg(fr(4), 5, seq=3)), ev("frame", {"frame": "4"}),
         sendd(dg(fr(6), 5, seq=4)), ev("frame", {"frame": "6"}),
         send('{"type":"frame_channel","path":"/tmp/x-2-guest.frames","width":4,"height":2,"slots":3}\n'),
         ev("frame_channel"), sendd(dg(fr(1), 5, seq=5)), ev("frame", {"frame": "1"})],
-         note="a frame must be newer than the newest shown from the current pixel file; a new frame_channel resets that")
+         note="transport announcements are not shown frames; without reading a pixel file this harness cannot confirm presentation staleness")
     case("sess.host.udp.frame_fields", "9.6", "host", HS + [
         sendd(dg(encode_body(frame_body(frame=9, slot=0, camera_seq=77, width=320, height=240)).hex(), 5)),
         ev("frame", {"frame": "9", "slot": 0, "camera_seq": 77, "width": 320, "height": 240})])

@@ -672,3 +672,47 @@ fn l7_json_corpus_matches_serde_json() {
         }
     }
 }
+
+#[test]
+fn late_old_frame_does_not_hide_a_new_channels_first_frame() {
+    let mut p = Pair::new();
+    let mut w = FrameWriter::create_temp("reordered", 2, 2, 3).unwrap();
+    let good = w.write(&[9; 16], 2, 2, 0, 1).unwrap();
+    p.guest.announce_frames(w.channel()).unwrap();
+    assert!(p.until(1000, |p| p
+        .he
+        .iter()
+        .any(|e| matches!(e, Event::FrameChannel(_)))));
+    let reader = FrameReader::open(w.path()).unwrap();
+    let old = FrameReady {
+        frame: u64::MAX,
+        ..good
+    };
+    p.guest.send_frame(&old).unwrap();
+    assert!(p.until(1000, |p| frames_in(&p.he) == 1));
+    assert!(reader.read_latest(&old, &mut vec![], &mut vec![]).is_err());
+    p.he.clear();
+    p.guest.send_frame(&good).unwrap();
+    assert!(
+        p.until(1000, |p| frames_in(&p.he) == 1),
+        "valid frame 1 suppressed by an unreadable old UDP"
+    );
+    assert_eq!(
+        reader
+            .read_latest(&good, &mut vec![], &mut vec![])
+            .unwrap()
+            .frame,
+        1
+    );
+    assert!(reader.read_latest(&good, &mut vec![], &mut vec![]).is_err());
+    let next = w.write(&[8; 16], 2, 2, 0, 2).unwrap();
+    assert!(reader.read_latest(&next, &mut vec![], &mut vec![]).is_ok());
+    assert!(
+        reader.read(&good, &mut vec![]).is_ok(),
+        "old slot remains valid"
+    );
+    assert!(
+        reader.read_latest(&good, &mut vec![], &mut vec![]).is_err(),
+        "presentation never regresses"
+    );
+}

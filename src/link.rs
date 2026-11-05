@@ -1467,7 +1467,6 @@ pub struct Link {
     spawn_ignored_logged: bool,
     last_collision: Option<u32>,
     assembly: Option<Assembly>,
-    last_frame: u64,
     /// Host: the token a guest must show. Guest: the token sent with the current connection attempt.
     token: Option<String>,
     /// Host: the endpoint file this link wrote, removed on drop.
@@ -1771,7 +1770,6 @@ impl Link {
             spawn_ignored_logged: false,
             last_collision: None,
             assembly: None,
-            last_frame: 0,
             token: None,
             endpoint_written: None,
             last_error: None,
@@ -2084,8 +2082,6 @@ impl Link {
                 self.events.push(Event::Focus { focus, requested });
             }
             Control::FrameChannel(c) => {
-                // A new pixel file numbers its frames from 1 again (contract section 8).
-                self.last_frame = 0;
                 self.events.push(Event::FrameChannel(c));
             }
             Control::Bye { .. } | Control::Unknown(_) => {}
@@ -2204,7 +2200,6 @@ impl Link {
         self.collision_queue.clear();
         self.last_collision = None;
         self.assembly = None;
-        self.last_frame = 0;
     }
 
     /// Ends the current connection, reporting it as lost (or as a failed handshake).
@@ -2309,11 +2304,8 @@ impl Link {
             }
             Datagram::Collision(c) => self.on_collision(c),
             Datagram::Frame(frame) => {
-                if frame.frame <= self.last_frame {
-                    self.stats.stale += 1;
-                    return;
-                }
-                self.last_frame = frame.frame;
+                // Only the consumer can validate the current file's slot. An unreadable old
+                // announcement must not advance staleness (contract sections 7 and 8).
                 self.events.push(Event::Frame { header, frame });
             }
         }
@@ -3271,6 +3263,7 @@ fn parse_file_header(b: &[u8]) -> Result<([u8; 8], FileHeader), WireError> {
 /// forbids a sender to truncate or resize a pixel file it announced, so this guards against a
 /// broken or hostile peer only.
 pub struct FrameReader {
+    newest: std::sync::Mutex<u64>,
     file: File,
     map: Mmap,
     slots: u32,
@@ -3365,6 +3358,7 @@ impl FrameReader {
             return Err(bad("pixel file shorter than its header says"));
         }
         Ok(Self {
+            newest: std::sync::Mutex::new(0),
             file,
             map,
             slots,
@@ -3374,6 +3368,25 @@ impl FrameReader {
             slot_size: slot_sz,
             depth,
         })
+    }
+
+    /// Reads a frame for presentation, in increasing order within this reader's file.
+    /// Only a successful copy advances the number. Open a new reader on every channel change
+    /// and clear previously displayed pixels, including when opening the replacement fails.
+    /// `read` and `read_depth` remain unordered low-level copies.
+    pub fn read_latest(
+        &self,
+        ready: &FrameReady,
+        rgba: &mut Vec<u8>,
+        depth: &mut Vec<f32>,
+    ) -> Result<FrameData, FrameMiss> {
+        let mut newest = self.newest.lock().unwrap_or_else(|e| e.into_inner());
+        if ready.frame <= *newest {
+            return Err(FrameMiss::Replaced);
+        }
+        let data = self.read_depth(ready, rgba, depth)?;
+        *newest = data.frame;
+        Ok(data)
     }
 
     /// Whether the file has a depth plane for [`read_depth`](Self::read_depth) to return.

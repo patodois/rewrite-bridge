@@ -130,6 +130,7 @@ fn poll_link(mut host: NonSendMut<HostLink>, mut frames: ResMut<GuestFrames>) {
             Event::FrameChannel(FrameChannel { path, .. }) => {
                 // A new file numbers its frames from 1 again, so the staleness check starts over.
                 host.newest = 0;
+                frames.clear_frame();
                 host.reader = match FrameReader::open(std::path::Path::new(&path)) {
                     Ok(reader) => Some(reader),
                     Err(e) => {
@@ -440,6 +441,34 @@ mod tests {
         guest.send_frame(&ready).unwrap();
         pump(&mut app, &mut [&mut guest], |a| stats(a).frames_shown == 4);
         assert_eq!(shown(&app), Some((1, true, 40)));
+    }
+
+    #[test]
+    fn channel_switch_clears_pixels_and_a_late_old_udp_cannot_poison_the_new_file() {
+        let (mut app, port) = host_app();
+        let mut guest = guest_link(port);
+        connect(&mut app, &mut guest);
+        let mut a = writer("order-a");
+        guest.announce_frames(a.channel()).unwrap();
+        settle(&mut app, &mut [&mut guest]);
+        let mut old = write(&mut a, 10);
+        guest.send_frame(&old).unwrap();
+        pump(&mut app, &mut [&mut guest], |a| stats(a).frames_shown == 1);
+        for _ in 1..100 { old = write(&mut a, 20); }
+        let mut b = writer("order-b");
+        let ready = write(&mut b, 30);
+        guest.announce_frames(b.channel()).unwrap();
+        settle(&mut app, &mut [&mut guest]);
+        assert_eq!(shown(&app), None, "pixels belong to the replaced channel");
+        guest.send_frame(&old).unwrap();
+        settle(&mut app, &mut [&mut guest]);
+        guest.send_frame(&ready).unwrap();
+        pump(&mut app, &mut [&mut guest], |a| stats(a).frames_shown == 2);
+        assert_eq!(shown(&app), Some((1, true, 30)));
+        // An invalid replacement must also remove the previous image.
+        guest.announce_frames(&FrameChannel { path: "relative.frames".into(), ..b.channel().clone() }).unwrap();
+        settle(&mut app, &mut [&mut guest]);
+        assert_eq!(shown(&app), None);
     }
 
     #[test]

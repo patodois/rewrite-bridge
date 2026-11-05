@@ -162,6 +162,7 @@ fn main() -> std::io::Result<()> {
                     give_back_at = Some(t + 2.0);
                 }
                 Event::FrameChannel(c) => {
+                    guest = None;
                     reader = FrameReader::open(c.path.as_ref()).ok();
                     log(format!(
                         "guest pixel file {} ({}x{}, {} slots, depth plane: {})",
@@ -174,7 +175,7 @@ fn main() -> std::io::Result<()> {
                 }
                 Event::Frame { frame, .. } => {
                     if let Some(r) = &reader {
-                        if let Ok(d) = r.read_depth(&frame, &mut pixels, &mut depth) {
+                        if let Ok(d) = r.read_latest(&frame, &mut pixels, &mut depth) {
                             frames += 1;
                             guest = Some(GuestFrame {
                                 rgba: pixels.clone(),
