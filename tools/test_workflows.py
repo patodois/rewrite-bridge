@@ -1,6 +1,7 @@
 """Check action immutability and keep release write access in one publish step."""
 import re
 import unittest
+from workflow_checks import has_test_command
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,9 +13,9 @@ class WorkflowTests(unittest.TestCase):
 
     def test_python_regressions_run_in_ci(self):
         ci=(ROOT / ".github/workflows/ci.yml").read_text()
-        self.assertIn("python3 -m unittest discover -s tools -p 'test_*.py'",ci)
+        self.assertTrue(has_test_command(ci,"tools","test_*.py"), "CI must execute the regression suite unconditionally")
         if (ROOT / "tests/interop/test_results.py").exists():
-            self.assertIn("python3 -m unittest discover -s tests/interop -p test_results.py",ci)
+            self.assertTrue(has_test_command(ci,"tests/interop","test_results.py"), "CI must execute the interop judge unconditionally")
 
     def test_actions_have_full_commit_pins_and_version_comments(self):
         for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
