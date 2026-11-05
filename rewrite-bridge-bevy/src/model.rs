@@ -415,19 +415,22 @@ pub fn mip_chain(width: u32, height: u32, rgba: &[u8], srgb: bool) -> Vec<Vec<u8
         let prev: &[u8] = levels.last().map_or(rgba, |l| l.as_slice());
         let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
         let mut next = Vec::with_capacity(nw * nh * 4);
+        // Source dimensions are u32; their boundary products fit u64 even on a
+        // 32-bit consumer, where multiplying usize indices could overflow.
+        let (sw, sh, dw, dh) = (w as u64, h as u64, nw as u64, nh as u64);
         for y in 0..nh {
-            let (top, bottom) = (y * h, (y + 1) * h);
+            let (top, bottom) = (y as u64 * sh, (y + 1) as u64 * sh);
             for x in 0..nw {
-                let (left, right) = (x * w, (x + 1) * w);
+                let (left, right) = (x as u64 * sw, (x + 1) as u64 * sw);
                 for k in 0..4 {
                     let mut sum = 0.0;
                     // Integer boundaries are in units of 1/nw and 1/nh. A source
                     // texel contributes exactly the area overlapping this output texel.
-                    for sy in top / nh..bottom.div_ceil(nh) {
-                        let wy = bottom.min((sy + 1) * nh) - top.max(sy * nh);
-                        for sx in left / nw..right.div_ceil(nw) {
-                            let wx = right.min((sx + 1) * nw) - left.max(sx * nw);
-                            let v = prev[(sy * w + sx) * 4 + k];
+                    for sy in top / dh..bottom.div_ceil(dh) {
+                        let wy = bottom.min((sy + 1) * dh) - top.max(sy * dh);
+                        for sx in left / dw..right.div_ceil(dw) {
+                            let wx = right.min((sx + 1) * dw) - left.max(sx * dw);
+                            let v = prev[(sy as usize * w + sx as usize) * 4 + k];
                             let value = if k == 3 {
                                 f32::from(v) / 255.0
                             } else {
@@ -1043,6 +1046,14 @@ mod tests {
                 .iter()
                 .all(|level| level.iter().all(|&v| v == 255)));
         }
+    }
+
+    #[test]
+    fn thin_mip_boundary_products_can_exceed_u32() {
+        let pixels = vec![255; 131_073 * 4];
+        let mips = mip_chain(131_073, 1, &pixels, false);
+        assert_eq!(mips.last().unwrap(), &[255; 4]);
+        assert!(mips.iter().flatten().all(|&v| v == 255));
     }
 
     #[test]
