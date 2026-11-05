@@ -27,6 +27,7 @@ and exits 0 if every check it made passed, 1 otherwise, 2 for a bad command line
 keys (a count is an integer; `stats` is `null` when the library has no counters):
 
 | Key | Meaning |
+| `presentation_rejections` | Host: 9 validated presentation rejections, one duplicate per round and four older slots; raw reads prove those slots remain readable. Guest: 0. |
 |---|---|
 | `role`, `label` | as given |
 | `ok` | `true` if no check failed |
@@ -138,3 +139,11 @@ new temporary directory, printed). The endpoint files go to a private temporary 
 the log directory. A pair passes when both peers exit 0 and `check_results.py` accepts their result lines: the cross
 checks (equal sessions, the expected counts of each side, `lost_reason` containing `bye`, every `stats` counter
 that exists zero) are in that script.
+
+## Publishing the pins
+
+Only published commits may appear in `pins.txt`. This branch deliberately keeps the existing
+published pins until the 0.3.0 ports with the revision 7 vectors and presentation-aware peers
+are published. Publish link-c, link-cs and link-java first; then update all three pins together
+and release rewrite-bridge and rewrite-bridge-bevy 0.4.0. Local interop uses explicit peer paths.
+Do not replace a pin with an unpublished local hash.

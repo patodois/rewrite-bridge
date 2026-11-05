@@ -116,6 +116,7 @@ struct Outcome {
     collision_triangles: usize,
     frames_ok: u32,
     frames_bad: u32,
+    presentation_rejections: u32,
     focus: Vec<String>,
     lost_reason: Option<String>,
     /// Reasons of the `HandshakeFailed` events, in order.
@@ -385,7 +386,7 @@ fn run_host(port: u16, label: &str, endpoint: Option<PathBuf>, refuse: bool) -> 
         p.check_pose(GUEST_ENTITY, k);
         let ready = p.frames.pop_front().expect("frame");
         let (mut buf, mut dep) = (Vec::new(), Vec::new());
-        match reader.read_depth(&ready, &mut buf, &mut dep) {
+        match reader.read_latest(&ready, &mut buf, Some(&mut dep)) {
             Err(miss) => {
                 p.r.frames_bad += 1;
                 p.r.fail(format!("frame {k} ({ready:?}) not readable: {miss:?}"));
@@ -412,6 +413,29 @@ fn run_host(port: u16, label: &str, endpoint: Option<PathBuf>, refuse: bool) -> 
                         dep == depth(k)
                     ));
                 }
+            }
+        }
+        if reader.read(&ready, &mut buf).is_err()
+            || reader.read_latest(&ready, &mut buf, None).is_ok()
+        {
+            p.r.fail("a readable duplicate was presented twice");
+        } else {
+            p.r.presentation_rejections += 1;
+        }
+        if k > 1 {
+            let previous = FrameReady {
+                frame: u64::from(k - 1),
+                slot: (k - 1) % SLOTS,
+                camera_seq: 0,
+                width: FRAME_W,
+                height: FRAME_H,
+            };
+            if reader.read(&previous, &mut buf).is_err()
+                || reader.read_latest(&previous, &mut buf, None).is_ok()
+            {
+                p.r.fail("a readable older slot regressed presentation");
+            } else {
+                p.r.presentation_rejections += 1;
             }
         }
     }
@@ -594,7 +618,7 @@ fn main() {
         "role": role, "label": label, "ok": p.r.failures.is_empty(), "failures": p.r.failures,
         "peer_game": p.r.peer_game, "protocol": p.r.protocol, "session": p.r.session,
         "spawns": p.r.spawns, "despawns": p.r.despawns, "cameras": p.r.cameras, "poses": p.r.poses,
-        "collision_triangles": p.r.collision_triangles, "frames_ok": p.r.frames_ok, "frames_bad": p.r.frames_bad,
+        "collision_triangles": p.r.collision_triangles, "frames_ok": p.r.frames_ok, "frames_bad": p.r.frames_bad, "presentation_rejections": p.r.presentation_rejections,
         "focus": p.r.focus, "lost_reason": p.r.lost_reason,
         "mode": mode, "connected": p.connected, "handshake_failed": p.r.handshake_failed,
         "stats": {"malformed": s.malformed, "foreign": s.foreign, "stale": s.stale,

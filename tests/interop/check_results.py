@@ -26,7 +26,10 @@ def last_result(path):
     if found is None:
         return None, "%s has no %s line" % (path, MARK.strip())
     try:
-        return json.loads(found), None
+        result = json.loads(found)
+        if not isinstance(result, dict) or not result:
+            return None, "%s: result must be a nonempty JSON object" % path
+        return result, None
     except ValueError as e:
         return None, "%s: result line is not JSON: %s" % (path, e)
 
@@ -93,6 +96,7 @@ def main():
         expect(problems, "host", host, "peer_game", "interop guest (%s)" % a.guest_label)
         expect(problems, "host", host, "frames_ok", ROUNDS)
         expect(problems, "host", host, "frames_bad", 0)
+        expect(problems, "host", host, "presentation_rejections", 2 * ROUNDS - 1)
         expect(problems, "host", host, "poses", ROUNDS)
         expect(problems, "host", host, "spawns", [7])
         expect(problems, "host", host, "despawns", [7])
