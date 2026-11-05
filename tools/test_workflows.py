@@ -6,6 +6,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 class WorkflowTests(unittest.TestCase):
+    def test_native_macos_deployment_floor_is_declared(self):
+        self.assertIn("macOS 11.0 or newer", (ROOT / "README.md").read_text())
+        self.assertIn('MACOSX_DEPLOYMENT_TARGET: "11.0"', (ROOT / ".github/workflows/release.yml").read_text())
+
     def test_python_regressions_run_in_ci(self):
         ci=(ROOT / ".github/workflows/ci.yml").read_text()
         self.assertIn("python3 -m unittest discover -s tools -p 'test_*.py'",ci)

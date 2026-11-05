@@ -3532,7 +3532,10 @@ impl FrameReader {
         }
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_os = "macos", target_os = "linux")
+    ))]
     fn vector_rows(
         &self,
         offset: usize,
@@ -3630,7 +3633,10 @@ impl FrameReader {
         if row == stride {
             return self.copy_at(offset, dst);
         }
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(all(
+            target_pointer_width = "64",
+            any(target_os = "macos", target_os = "linux")
+        ))]
         {
             let height = dst.len() / row;
             let span = (height - 1) * stride + row;
@@ -3975,7 +3981,10 @@ mod tests {
         drop(peer);
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_os = "macos", target_os = "linux")
+    ))]
     #[test]
     fn short_vector_reads_resume_inside_colour_padding_and_depth() {
         let mut w =

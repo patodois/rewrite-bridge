@@ -18,6 +18,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
   # The programs of the archive, as `cargo build --example` names them (packaging/package.sh has the same list)
   CARGO_ARGS: --features link --example fake_host --example fake_guest --example interop_peer
 

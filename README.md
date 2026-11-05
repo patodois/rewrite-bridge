@@ -1,5 +1,10 @@
 # rewrite-bridge
 
+Native macOS builds require macOS 11.0 or newer. Set `MACOSX_DEPLOYMENT_TARGET=11.0`
+when compiling native libraries or executables; positional vector I/O uses the system
+`preadv` introduced in macOS 11.0. Older macOS versions are unsupported.
+
+
 [![crates.io](https://img.shields.io/crates/v/rewrite-bridge.svg)](https://crates.io/crates/rewrite-bridge)
 [![docs.rs](https://img.shields.io/docsrs/rewrite-bridge)](https://docs.rs/rewrite-bridge)
 [![rewrite-bridge-bevy on crates.io](https://img.shields.io/crates/v/rewrite-bridge-bevy.svg?label=rewrite-bridge-bevy)](https://crates.io/crates/rewrite-bridge-bevy)
