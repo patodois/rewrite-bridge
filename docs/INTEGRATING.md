@@ -119,7 +119,8 @@ tested against each other.
 Each program takes `SECONDS` and an optional endpoint file. It runs its loop for that long, prints
 `connected to <peer game>`, and ends with one `RESULT` line and exit status 0 only if the session did its job
 (the guest saw cameras, the host saw poses). In a real mod the loop is your game's frame or tick and there is
-no timer. Every library's `poll` never blocks and must be called every frame: it also sends the heartbeats, so
+no timer. Every library's `poll` never blocks (one exception: the Rust one on `wasm32-wasip2`, where a guest's connect may wait
+100 ms for a host that does not accept) and must be called every frame: it also sends the heartbeats, so
 a game that stops calling it looks frozen to the peer. Defaults: `127.0.0.1`, control port 47800.
 
 ### Rust: guest
@@ -139,7 +140,7 @@ fn main() -> std::io::Result<()> {
     let mut link = Link::guest(cfg)?;
     let (mut cameras, mut connected) = (0, false);
     while Instant::now() < end {
-        for event in link.poll() { // never blocks; call it every frame
+        for event in link.poll() { // never blocks (on wasm32-wasip2 a guest's connect may wait 100 ms); every frame
             match event {
                 Event::Connected(host) => {
                     connected = true;
@@ -182,7 +183,7 @@ fn main() -> std::io::Result<()> {
     let mut link = Link::host(cfg)?;
     let (mut poses, mut spawns) = (0, 0);
     while Instant::now() < end {
-        for event in link.poll() { // never blocks; sends the heartbeats
+        for event in link.poll() { // never blocks (on wasm32-wasip2 a guest's connect may wait 100 ms); sends the heartbeats
             match event {
                 Event::Connected(guest) => println!("connected to {}", guest.game),
                 Event::Spawn(_) => spawns += 1,

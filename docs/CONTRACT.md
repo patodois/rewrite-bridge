@@ -184,6 +184,14 @@ above, without sending a `bye` of its own.
 A game loop must not block for step 3: keep the closing socket in a list and drain it,
 non-blocking, on each tick until it is done.
 
+*Implementation note, no rule changes.* Under wasmtime closing a socket waits until the runtime has delivered the
+bytes it still holds for it to the kernel, which does not happen while the peer neither reads nor closes (5 s on
+macOS, for ever on Linux). An implementation there cannot meet the 200 ms of step 3 for such a peer without
+blocking its loop. The one in `rewrite-bridge` sets that socket aside and closes it when the runtime lets go, so
+for a peer that holds its socket open and stops reading, step 4 comes late. It also takes no new connection while
+four such sockets are set aside: a host then does not answer a second connection with `busy` (section 2), the
+connection waits unanswered in the system's backlog.
+
 Future versions keep the datagram header's first 8 bytes (magic, version, kind, flags) and the
 `hello` fields above, so two implementations can always negotiate.
 
@@ -221,6 +229,12 @@ exactly as before revision 6; a guest that has no token sends none.
    each time it starts. Receivers do not check the format: any string of 1 to 256 bytes is a token, so a
    host may also be given one by a launcher.
 
+   *Implementation note, no rule changes.* A WebAssembly component has no operating system to ask: on WASI the
+   generator is the runtime's `wasi:random/random`. In wasmtime 50 that is a thread generator seeded from the
+   operating system, and an embedder can replace it (even with a fixed sequence), so the rule holds on WASI as
+   far as the runtime keeps it. The other WASI source, `insecure-seed`, may be deterministic and is never used for
+   a token or a session number.
+
 **The endpoint file.** A host hands the port and the token to the guest through a file that only the
 user who runs both can read. (The idea follows the endpoint file that Horizon writes for its control
 socket; the format here is this contract's own.) The file holds one JSON object:
@@ -255,8 +269,10 @@ refuses a file that breaks any of this.
   such an implementation can only create the file exclusively, and it should tell its operator the
   consequences. Under the default umask 022 the token is readable by other users, and a guest that checks
   the mode (the rule below) refuses the file, so that host cannot serve it. A component that reads the file
-  cannot check the mode either, so for it the check below is lost. The mitigation is `umask 077` for the
-  process, or a folder that only the user can enter (0700). On a Windows host no umask applies: the folder's
+  cannot check the mode either, so for it the check below is lost. `umask 077` for the process makes the file
+  0600, and then both a native guest and a component guest work. A folder that only the user can enter (0700)
+  keeps other users away from the token, but the file in it is still 0644 under umask 022, so a native guest
+  still refuses it with `PermissionDenied` (measured). On a Windows host no umask applies: the folder's
   per-user ACL is what keeps other users out, as above. This is a deviation the platform forces, not a
   relaxation of the rule for a platform that can set the mode.
 - **Reading (guest).** The guest reads the file and takes `control_port` and `token` from it. It refuses

@@ -433,18 +433,24 @@ UDP on `127.0.0.1`, and a folder for the endpoint file). There:
   on Windows) the guest reports `timed out` after each 100 ms, not `connection refused`;
 - random bytes come from WASI through the `getrandom` crate, and the UDP socket is the WASI one through the
   `wasip2` crate (receiving through `std` leaks the payload of every datagram there); both are dependencies
-  of WASI targets only, and the 4 MiB receive buffer of section 2 is asked for and granted;
+  of WASI targets only, and the 4 MiB receive buffer of section 2 is asked for (under wasmtime on macOS it was granted; not measured
+  elsewhere);
 - there are no memory-mapped files, so `FrameWriter` and `FrameReader` return an `Unsupported` error;
 - a connection whose peer holds the socket open and stops reading is not closed at once, because closing it
   would wait for the peer: it is set aside and closed when the peer reads or exits. With four of them set aside
   a `Link` takes no new connection (`last_error` says so). The four are counted for the whole component, not
   per `Link`, so unrelated `Link`s in it share them; native has no such limit;
+- `set_nodelay` does nothing there (wasi-libc keeps the flag and wasmtime has no such option), so small control
+  lines can be held back and arrive together a few milliseconds late: a pose sent right after its `spawn` can arrive
+  before it and be dropped as the pose of an unknown entity, which the contract allows;
 - a component cannot ask for a file mode, so the endpoint file cannot be created `0600` as section 6.2 asks.
   It gets what the host process's umask leaves: 0644 under the usual umask 022, 0600 under 077, 0666 under
   000 (measured). Under 022 the token is readable by other users and a native guest refuses the file, so
   that host cannot serve it. A guest on this target cannot check the file's mode at all. Start the process
-  with `umask 077`, or keep the file in a folder only you can enter. On a Windows host there is no umask: the
-  folder's ACL is what counts.
+  with `umask 077`, which makes the file 0600 and lets both a native guest and a component guest use it. A
+  folder only you can enter keeps other users away from the token, but under umask 022 the file in it is still
+  0644 and a native guest still refuses it. On a Windows host there is no umask: the folder's ACL is what
+  counts.
 
 `Link::last_error` says why a guest's last attempt to connect failed, which is how a plugin can show
 that no host is listening. CI runs `tests/link_wasi.rs`, both roles in one thread, on that target under
