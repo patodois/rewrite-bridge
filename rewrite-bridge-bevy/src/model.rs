@@ -648,9 +648,10 @@ pub fn spawn_model_owned(
             .skin
             .and_then(|s| skins.get(s))
             .and_then(Option::as_ref);
-        // A mesh that names a node, a material or a skin the model does not have cannot be drawn. Skip it
+        // Only rigid meshes use node; skinned meshes live at the root and use their joints.
+        // A mesh that names a required node, material or skin the model does not have cannot be drawn. Skip it
         // with a warning, but keep an (empty) entity so `SpawnedModel::meshes` stays one per model mesh.
-        if node >= nodes.len()
+        if (mesh.skin.is_none() && node >= nodes.len())
             || material >= materials.len()
             || (mesh.skin.is_some() && skin.is_none())
         {
@@ -1136,6 +1137,48 @@ mod tests {
             ..parts[0].clone()
         };
         assert_eq!(place(&at, &plain), at);
+    }
+
+    #[test]
+    fn a_skinned_mesh_ignores_its_unused_node_index() {
+        for owned in [false, true] {
+            let mut source = model();
+            source.meshes[1].node = usize::MAX;
+            assert_eq!(source.validate(), Ok(()));
+            let mut world = World::new();
+            world.init_resource::<Assets<Mesh>>();
+            world.init_resource::<Assets<StandardMaterial>>();
+            world.init_resource::<Assets<Image>>();
+            world.init_resource::<Assets<SkinnedMeshInverseBindposes>>();
+            let spawned = world
+                .run_system_once(move |mut commands: Commands, mut assets: BridgeAssets| {
+                    if owned {
+                        spawn_model_owned(
+                            &mut commands,
+                            &mut assets,
+                            source.clone(),
+                            &SpawnOptions::default(),
+                        )
+                    } else {
+                        spawn_model(
+                            &mut commands,
+                            &mut assets,
+                            &source,
+                            &SpawnOptions::default(),
+                        )
+                    }
+                })
+                .unwrap();
+            assert!(
+                world.get::<Mesh3d>(spawned.meshes[1]).is_some(),
+                "valid skinned geometry was omitted"
+            );
+            assert!(world.get::<SkinnedMesh>(spawned.meshes[1]).is_some());
+            assert_eq!(
+                world.get::<ChildOf>(spawned.meshes[1]).unwrap().parent(),
+                spawned.root
+            );
+        }
     }
 
     #[test]
