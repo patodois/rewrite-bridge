@@ -89,7 +89,7 @@ readers can be used without the bridge):
 ```toml
 [dependencies]
 # The bridge to other game rewrites
-rewrite-bridge = { version = "0.3", optional = true }
+rewrite-bridge = { version = "0.4", optional = true }
 
 [features]
 default = ["bridge"]
@@ -101,10 +101,10 @@ bridge = ["dep:rewrite-bridge"]
 > from one is accepted by the other. The compiler's complaint is `E0277` with the note
 > *there are multiple different versions of crate `rewrite_bridge` in the dependency graph*.
 >
-> From crates.io Cargo does this for you: `"0.3"`, `"0.3.1"` and `"^0.3.1"` all resolve to the same
-> release, which is built once, so a provider that asks for `"0.3"` and a renderer that asks for `"0.3"`
-> (or `"0.3.1"`) share it. Before 1.0 the minor number is the breaking one, so stay on one `0.x` line:
-> a `"0.4"` in the build would be a second copy. A `git` dependency, a `path` or a `[patch]` is a
+> From crates.io Cargo does this for you: `"0.4"`, `"0.4.0"` and `"^0.4.0"` all resolve to the same
+> release, which is built once, so a provider that asks for `"0.4"` and a renderer that asks for `"0.4"`
+> (or `"0.4.0"`) share it. Before 1.0 the minor number is the breaking one, so stay on one `0.x` line:
+> a `"0.3"` in the build would be a second copy. A `git` dependency, a `path` or a `[patch]` is a
 > different source and therefore a different copy too, which is why providers should depend on the
 > crates.io release and not on a tag or a revision.
 > `cargo tree -i rewrite-bridge` must list one entry, and `cargo tree -d` shows what is duplicated.
@@ -859,7 +859,7 @@ Shots are game content: they stay out of version control.
   published terms and what they do not say. This guide is not legal advice and neither is theirs; read the
   game's terms yourself and leave the decision about reading one's own install to the user.
 - **License.** The four providers and this crate are `MIT OR Apache-2.0`.
-- **Depend on the crates.io release** (`rewrite-bridge = "0.3"`, section 2), and move every crate you build together to the next `0.x` line in one step, since a different minor line is a different copy.
+- **Depend on the crates.io release** (`rewrite-bridge = "0.4"`, section 2), and move every crate you build together to the next `0.x` line in one step, since a different minor line is a different copy.
 - **Tell people.** Once the provider is public, add a row to the "Projects using it" table of the
   [README](../README.md#projects-using-it).
 

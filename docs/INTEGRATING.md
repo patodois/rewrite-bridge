@@ -42,7 +42,7 @@ tested against each other.
 ### Rust rewrite or Bevy game
 
 - **Library:** the `rewrite-bridge` crate with its `link` feature. In `Cargo.toml`:
-  `rewrite-bridge = { version = "0.3", features = ["link"] }`. The token (revision 6) exists from 0.3.0 only. 0.3.1 adds `Link::last_error()` (below), the link on `wasm32-wasip2`
+  `rewrite-bridge = { version = "0.4", features = ["link"] }`. The token (revision 6) exists from 0.3.0 only. 0.3.1 adds `Link::last_error()` (below), the link on `wasm32-wasip2`
   (a component plugin), and the temporary file of the endpoint file no longer carries a process id in its name.
 - **A component plugin (`wasm32-wasip2`, no threads), 0.3.1.** `Link` runs there, host and guest, run under wasmtime 50.0.1:
   a guest connects inside `poll` and waits at most 100 ms for a host that does not accept (the poll that finds a
@@ -515,6 +515,11 @@ All from the contract or from running the code.
   a depth-buffer value). A host converts its own depth buffer with the table in section 9.7.
 - **The old size-less frame read.** link-java, link-c and link-cs keep `read(frame, slot, wantDepth)` for old
   programs; it is not conformant. Read a `Frame` event with the call that takes the whole event.
+- **Presenting frames.** `Frame` events are announcements. Use `FrameReader::read_latest` with
+  `Some(&mut depth)` or `None`; only a valid copy advances presentation order. The raw `read`
+  and `read_depth` APIs are unordered inspection operations. On every `frame_channel`, drop
+  the old reader and clear cached pixels before opening the replacement, even if it fails.
+  Also clear pixels on session loss or `FrameMiss::Gone`.
 - **Frame files.** The sender creates the pixel file exclusively, never resizes or reuses it; a new size is a new
   file and a new `frame_channel`. Limits: 1 to 16 slots, width and height at most 16384, at most 2^26 pixels.
 - **Collision size.** A snapshot has at most 4096 chunks (925696 triangles). Send the triangles nearest to the

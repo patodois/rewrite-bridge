@@ -142,3 +142,36 @@ fn warframe_examples_use_asset_ids_the_provider_lists() {
         "no Warframe example spawn found; the test looks at the wrong place"
     );
 }
+
+#[test]
+fn current_dependency_line_and_pixel_presentation_are_documented() {
+    for path in [
+        "README.md",
+        "docs/INTEGRATING.md",
+        "docs/WRITING_A_PROVIDER.md",
+        "rewrite-bridge-bevy/README.md",
+    ] {
+        if !root().join(path).exists() {
+            continue;
+        }
+        let text = read(path);
+        for line in text
+            .lines()
+            .filter(|l| l.contains("rewrite-bridge") && l.contains("="))
+        {
+            assert!(
+                !line.contains("\"0.3\""),
+                "{path}: obsolete dependency: {line}"
+            );
+        }
+    }
+    assert!(read("README.md").contains("a `\"0.3\"` anywhere"));
+    assert!(read("docs/INTEGRATING.md").contains("read_latest"));
+    let source = read("src/link.rs");
+    let docs = source.split("pub fn read(&self, ready:").next().unwrap();
+    let tail = docs
+        .rsplit("    /// Copies the announced frame")
+        .next()
+        .unwrap();
+    assert!(tail.contains("unordered") && tail.contains("read_latest"));
+}

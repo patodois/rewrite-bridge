@@ -77,7 +77,7 @@ rewrite-bridge = "0.4"
 > From crates.io this takes care of itself. Cargo gives every requirement that agrees with the others
 > (`"0.4"`, `"0.4.0"`, `"^0.4.0"`) the same release and builds it once, so the `rewrite-bridge = "0.4"`
 > in your crate and the `0.4.0` that a provider asks for are one crate. Before 1.0 the minor number is
-> the breaking one: a `"0.4"` anywhere in the build would be a second copy, and the error above. Stay
+> the breaking one: a `"0.3"` anywhere in the build would be a second copy, and the error above. Stay
 > on one `0.x` line, as the providers and `rewrite-bridge-bevy` do.
 >
 > A second copy can still come from another source. Cargo treats a `git` dependency (such as the

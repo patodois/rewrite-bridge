@@ -3447,7 +3447,8 @@ impl FrameReader {
     }
 
     /// Copies the announced frame into `rgba` as tightly packed rows, if the slot still holds it
-    /// intact. A depth plane, if the file has one, is ignored. Output buffers are valid only
+    /// intact. This is an unordered inspection operation; use [`read_latest`](Self::read_latest)
+    /// for presentation. A depth plane, if the file has one, is ignored. Output buffers are valid only
     /// on success; on failure they may contain partial or previous bytes.
     pub fn read(&self, ready: &FrameReady, rgba: &mut Vec<u8>) -> Result<FrameData, FrameMiss> {
         self.read_inner(ready, rgba, None)

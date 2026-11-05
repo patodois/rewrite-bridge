@@ -10,12 +10,12 @@ lines. It knows nothing about any game; it spawns what the bridge's types descri
 ```toml
 [dependencies]
 bevy = "0.20"
-rewrite-bridge = "0.3"
-rewrite-bridge-bevy = "0.3"
+rewrite-bridge = "0.4"
+rewrite-bridge-bevy = "0.4"
 ```
 
 Both come from crates.io, so every provider you add shares the one copy of rewrite-bridge that this plugin
-uses, as long as it asks for the same `0.3` line (see
+uses, as long as it asks for the same `0.4` line (see
 [one copy for the whole build](https://github.com/patodois/rewrite-bridge#one-copy-for-the-whole-build)).
 
 ```rust
