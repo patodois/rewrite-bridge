@@ -234,6 +234,9 @@ mod tests {
         let mut app = App::new();
         app.add_plugins(HostLinkPlugin::new(LinkConfig {
             control_port: 0,
+            // This test exercises pixels and reconnection, not a real-time watchdog.
+            // Keep scheduling pauses within the helper's 10 s deadline from ending the session.
+            timeout: Duration::from_secs(30),
             ..LinkConfig::new("test host")
         }));
         let port = app
@@ -250,6 +253,7 @@ mod tests {
         Link::guest(LinkConfig {
             control_port: port,
             reconnect: Duration::from_millis(50),
+            timeout: Duration::from_secs(30),
             ..LinkConfig::new("test guest")
         })
         .expect("a guest link")
@@ -316,6 +320,15 @@ mod tests {
 
     #[test]
     fn the_link_survives_bad_channels_bad_slots_a_bye_and_a_new_pixel_file() {
+        link_survives(Duration::ZERO);
+    }
+
+    #[test]
+    fn the_link_survives_a_scheduler_pause_longer_than_the_production_watchdog() {
+        link_survives(Duration::from_millis(2100));
+    }
+
+    fn link_survives(pause: Duration) {
         let (mut app, port) = host_app();
         // no GuestComposePlugin: the plugin made the resource itself
         assert!(app.world().get_resource::<GuestFrames>().is_some());
@@ -349,6 +362,12 @@ mod tests {
             assert_eq!(shown(&app), None, "{path}");
         }
         assert_eq!(stats(&app).frames_shown, 0);
+        // Both peers have drained the handshake and neither has a heartbeat pending.
+        // A descheduled CI worker can leave both loops idle here.
+        sleep(pause);
+        app.update();
+        let events = guest.poll();
+        if !pause.is_zero() { eprintln!("after pause: {events:?}; host {:?}", stats(&app)); }
 
         // A good channel and a good frame
         let mut w1 = writer("hl-one");
