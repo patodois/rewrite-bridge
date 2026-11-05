@@ -377,9 +377,9 @@ fn linear_to_srgb(c: f32) -> u8 {
     (s * 255.0).round() as u8
 }
 
-/// Every mip level of an RGBA8 image after the first, each a 2x2 box filter of the one above (a
-/// level with an odd size repeats its last row or column). Colour channels of sRGB images are
-/// averaged in linear light, alpha always linearly.
+/// Every mip level of an RGBA8 image after the first, using an area box filter over the
+/// entire previous level. Odd edges contribute with their covered area rather than being
+/// discarded. Colour channels of sRGB images are averaged in linear light, alpha linearly.
 pub fn mip_chain(width: u32, height: u32, rgba: &[u8], srgb: bool) -> Vec<Vec<u8>> {
     // An empty image has no levels, and one whose pixels are fewer than its size says would index past the end
     // (both are images `validate` rejects, but this is a public function)
@@ -416,23 +416,27 @@ pub fn mip_chain(width: u32, height: u32, rgba: &[u8], srgb: bool) -> Vec<Vec<u8
         let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
         let mut next = Vec::with_capacity(nw * nh * 4);
         for y in 0..nh {
-            let (y0, y1) = ((2 * y).min(h - 1), (2 * y + 1).min(h - 1));
+            let (top, bottom) = (y * h, (y + 1) * h);
             for x in 0..nw {
-                let (x0, x1) = ((2 * x).min(w - 1), (2 * x + 1).min(w - 1));
-                let px = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
+                let (left, right) = (x * w, (x + 1) * w);
                 for k in 0..4 {
-                    let sum: f32 = px
-                        .iter()
-                        .map(|&(sx, sy)| {
+                    let mut sum = 0.0;
+                    // Integer boundaries are in units of 1/nw and 1/nh. A source
+                    // texel contributes exactly the area overlapping this output texel.
+                    for sy in top / nh..bottom.div_ceil(nh) {
+                        let wy = bottom.min((sy + 1) * nh) - top.max(sy * nh);
+                        for sx in left / nw..right.div_ceil(nw) {
+                            let wx = right.min((sx + 1) * nw) - left.max(sx * nw);
                             let v = prev[(sy * w + sx) * 4 + k];
-                            if k == 3 {
+                            let value = if k == 3 {
                                 f32::from(v) / 255.0
                             } else {
                                 decode[usize::from(v)]
-                            }
-                        })
-                        .sum();
-                    let avg = sum / 4.0;
+                            };
+                            sum += value * (wx * wy) as f32;
+                        }
+                    }
+                    let avg = sum / (w * h) as f32;
                     next.push(if k == 3 {
                         (avg * 255.0).round() as u8
                     } else {
@@ -1017,6 +1021,28 @@ mod tests {
         );
         assert!(skinned.attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT).is_some());
         assert!(skinned.attribute(Mesh::ATTRIBUTE_UV_0).is_none());
+    }
+
+    #[test]
+    fn odd_mip_levels_keep_every_source_row_and_column() {
+        for (w, h) in [(3, 1), (1, 3), (3, 3)] {
+            let mut pixels = vec![0; w * h * 4];
+            pixels[(w * h - 1) * 4..].fill(255);
+            let mip = mip_chain(w as u32, h as u32, &pixels, false);
+            assert_eq!(mip[0], vec![(255.0 / (w * h) as f32).round() as u8; 4]);
+        }
+        let pixels = [0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255];
+        assert_eq!(mip_chain(3, 1, &pixels, true)[0], [156, 156, 156, 85]);
+        let mut pixels = vec![0; 5 * 4];
+        pixels[16..].fill(255);
+        let mip = mip_chain(5, 1, &pixels, false);
+        assert_eq!(mip[0], [0, 0, 0, 0, 102, 102, 102, 102]);
+        assert_eq!(mip[1], [51; 4]);
+        for (w, h) in [(7, 5), (5, 7), (1, 9)] {
+            assert!(mip_chain(w, h, &vec![255; (w * h * 4) as usize], true)
+                .iter()
+                .all(|level| level.iter().all(|&v| v == 255)));
+        }
     }
 
     #[test]
