@@ -10,7 +10,7 @@ name: release
 # checksums, uploaded as workflow artifacts, but no release is created.
 on:
   push:
-    tags: ['v*']
+    tags: ['v*', 'peers-v*']
   workflow_dispatch:
 
 permissions:
@@ -59,9 +59,11 @@ jobs:
       - name: Version
         run: |
           if [ "$GITHUB_REF_TYPE" = tag ]; then
-            echo "VERSION=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
+            # peers-v0.3.1: the peers of crate version 0.3.1, for a crate tag cut before this workflow existed
+            version="${GITHUB_REF_NAME#peers-}"
+            echo "VERSION=$version" >> "$GITHUB_ENV"
             crate="v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-            if [ "$crate" != "$GITHUB_REF_NAME" ]; then
+            if [ "$crate" != "$version" ]; then
               echo "::warning::tag $GITHUB_REF_NAME does not match the version in Cargo.toml ($crate)"
             fi
           else
@@ -139,7 +141,7 @@ jobs:
           against `SHA256SUMS`.
           NOTES
           flags=()
-          case "$GITHUB_REF_NAME" in *-*) flags+=(--prerelease) ;; esac
+          case "${GITHUB_REF_NAME#peers-}" in *-*) flags+=(--prerelease) ;; esac
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber
           else
