@@ -1,6 +1,6 @@
 # Pixel readers and presentation migration
 
-This branch proposes contract revision 7 without changing protocol version 1, datagrams,
+Contract revision 7 preserves protocol version 1, datagrams,
 file headers, slot offsets or depth layout. Writers retain their mapped publication path.
 
 ## Presenting frames
@@ -32,6 +32,10 @@ Normal cropped planes use up to eight rows per vectored read on macOS/Linux (pre
 Rust/C/C#, scatter read after positioning the private single-threaded FileChannel in Java).
 Data goes directly into owned output in Rust/C/C#; padding goes into reusable scratch and
 is discarded. Java reuses packed direct buffers before copying into its array results.
+Native Rust and C builds require macOS 11.0 or newer. C on Android uses scalar
+positional reads to avoid an API-24 preadv import. Rust on 32-bit Linux uses FileExt
+positional reads instead of casting offsets to a narrow off_t. C# pixel APIs require
+a 64-bit process and reject other pointer widths before native calls.
 This reduces syscall count without a full-plane scratch allocation. Grouping is limited to
 strides up to 16 KiB and spans up to four times the useful output. Wider or very sparse files
 keep per-row reads: measurements showed that reading their padding costs more than the
@@ -43,14 +47,18 @@ Java owned direct scratch is reclaimed by the JVM without invoking Unsafe on Uni
 close. The writer's existing cleaner path is unchanged. C# caches SafeFileHandle and uses
 native positional I/O when available; missing or unsupported bindings switch to safe
 FileStream copies with explicit positions and buffering disabled. I/O/provider exceptions
-inside CopyAt are contained as misses. The fallback is tested by fault injection, not by
-running Unity or IL2CPP.
+inside CopyAt are contained as misses. Both missing pread and missing preadv bindings are covered by fault injection; this
+does not establish validation on Unity or IL2CPP. A managed frame-allocation failure
+in C# returns null and increments SkippedAllocation without advancing order. This
+cannot prevent an operating system from terminating a process under memory pressure;
+other allocation policies remain those of each language and API.
 
 Windows keeps a read-only map and the existing atomic lock observations: an active section
 prevents ordinary truncation. Creation also checks that the actual mapping/file extent did
 not shrink before protection took effect. Rust and managed ports read the header using
 bounded I/O before mapping; C rechecks the extent with the section active before touching
-it. Windows was not run or benchmarked. Java mapped-reader cleanup may depend on GC if the
+it. Windows native tests run in the CI platform matrix; the benchmark tables below measure
+macOS only. Java mapped-reader cleanup may depend on GC if the
 runtime cannot release its section. Readers are not safe for concurrent close/read; Rust
 serializes scratch and presentation state but callers still own reader lifetime.
 
@@ -58,8 +66,8 @@ The revised protocol explicitly distinguishes observation checks from a formal a
 load: POSIX does not specify pread as an atomic acquire from the writer's memory. Tests
 reject detected overlapping writes, not every possible publication violation on every
 filesystem. ABA and hostile reuse of lock/frame remain outside that guarantee. I/O can
-block. Writers still assume nobody truncates their own mapping. Linux, Windows, WASI,
-Mono, Unity and IL2CPP have not been run in this task.
+block. Writers still assume nobody truncates their own mapping. CI covers native Linux, macOS and Windows; WASI checks cover the transport without
+pixel files. Mono, Unity and IL2CPP require separate runtime validation.
 
 ## Benchmark method
 
@@ -99,7 +107,7 @@ Measured on macOS arm64. All numbers are milliseconds per frame.
 
 ## Matched cropped-frame comparison
 
-The same final API was built with grouping disabled and enabled, one language at a time.
+The same API was built with grouping disabled and enabled, one language at a time.
 These sequential runs separate the optimization from other reader changes. Scheduling and
 memory pressure still vary. Whole-plane scratch and unrestricted grouping were rejected
 after measurements showed regressions on wide files. A one-column frame remains per-row.
