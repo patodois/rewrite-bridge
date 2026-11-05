@@ -446,7 +446,7 @@ Announces an entity of the sender's, to be drawn with a provider's asset. Its po
 `Pose` datagrams.
 
 ```json
-{"type":"spawn","entity":7,"provider":"Warframe","asset":"/Lotus/Characters/Excalibur","name":"Excalibur"}
+{"type":"spawn","entity":7,"provider":"Warframe","asset":"/Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx","name":"Excalibur"}
 ```
 
 | Field | Type | Meaning |

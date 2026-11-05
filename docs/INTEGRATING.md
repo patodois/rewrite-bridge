@@ -604,6 +604,9 @@ RESULT host spawns=1 poses=129 ... malformed=0 unknown_entity=0
 `fake_guest` stands a cube at the world origin, or with `--in-front` 4 m ahead of the first camera. It needs
 your host's `Collision` for the ground; send it, or the cube floats at eye height.
 
+`fake_guest --provider NAME --asset ID --name NAME` announces the cube as that provider's asset instead of
+`demo/cube`, to try how your host reacts to the ids of a real game (see "Warframe"); the cube is drawn the same.
+
 ### Token session and the endpoint file
 
 `fake_host` and `fake_guest` have no token option. Use your own two programs, or `interop_peer`. All four
@@ -735,6 +738,120 @@ where you looked and how to set it. How the existing readers do it:
 
 For a game that has no reader yet, write one: [`WRITING_A_PROVIDER.md`](WRITING_A_PROVIDER.md), section 3, is
 about finding the install.
+
+## Warframe: a rewrite, or a client of a private server
+
+For someone whose game is Warframe: a rewrite that loads the original's assets, or a tool around a private-server
+client (OpenWF's SpaceNinjaServer and its Bootstrapper are a third party's; they are not affiliated with these
+repositories, none of their code or data is used here, and nothing on this page was run against them). Everything
+below is labelled **verified** (run, with the command and the build given) or **not verified**.
+
+### What is verified
+
+Run on 2026-11-05, macOS arm64, against the Steam build of 2026-10-22 (Steam build id 25757057, `Warframe.x64.exe`
+file version `2026.10.06.11.44`), with [wf-unpack](https://github.com/patodois/wf-unpack) after 0.4.0 (its `resolve`
+and `version` commands) and the rewrite-bridge fake peers of this repository:
+
+- **The provider string is `Warframe`** (`Provider::game()` of wf-unpack's `Warframe`). `spawn.provider` carries it
+  exactly.
+- **An asset id is a path from the game's own packages**, in the forms of the table below. On that install
+  `wf-unpack resolve <id>` says the model and level paths of the table are listed assets (with their kind), and
+  `wf-unpack check-conformance --id <id>` loaded each of the first three rows with 0 errors and 0 warnings. The
+  `?collision` form is not an id `check-conformance` can load by `--id`; wf-unpack's own test
+  (`the_dojo_is_a_valid_scene_with_collision`) loads a level's collision scene with it.
+- **A uniqueName is not an asset id.** `Warframe::load("/Lotus/Powersuits/Excalibur/Excalibur")` fails
+  (`check-conformance` reports `provider.load_failed` and `provider.unlisted_id`).
+- **`wf-unpack resolve <uniqueName>` turns a name into ids, or says why not.** Of 27 names taken from public item,
+  enemy and level lists, 18 reach at least one model (13 reach one, 5 reach two), 3 are `.level` paths that are ids
+  already, 3 are entities with no `Mesh` or `PickUpMesh` anywhere in their lineage (a mod, a resource, a procedural
+  level that names `.level` files), and 3 are not entities at all (a language tag, a node id `SolNode12`, a server-side
+  name). Exit status 3 for the last two groups, with the reason printed.
+- **The link carries these ids as they are.** `tests/warframe_ids.rs` runs the real `fake_host` and `fake_guest`
+  programs against a `Link` of the test: spawns of the ids below arrive verbatim, poses of live entities are applied, a
+  pose of an entity that was never spawned or was despawned is ignored and counted in `Stats::unknown_entity`
+  (contract section on `spawn`), and a second `spawn` of a live entity replaces the first. It needs no game files and
+  runs in CI. `fake_guest --provider Warframe --asset <id>` announces any id, to try a host with.
+- **A Warframe model drawn into a host by a real guest**: `bridge-guest --provider wf` against `fake_host` (its
+  README has the command and the result).
+
+### The asset-id convention
+
+| Kind | Form | Example (listed on the build above) |
+|---|---|---|
+| Model (static or skinned) | the path of the `.fbx` in `H.Misc`; `list` gives its kind: `Character` (a whole character: skinned, a head, a spine, three limbs, feet on the ground), `Weapon` (under `/Lotus/Weapons/`), otherwise `Prop` | `/Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx` (Character), `/Lotus/Weapons/Tenno/Melee/Swords/PrimeGalatine/PrimeGalatine.fbx` (Weapon) |
+| Model with animation clips | the model's path, then `?animations=` and a filter: a substring of the clip paths, or a glob with `*`, `**` and `?`; `|` separates alternatives. Without it no clip is loaded (a skeleton fits about 25,000). More than 2000 clips is an error that asks for a narrower filter | `/Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx?animations=/Lotus/Animations/Tenno/Movement/MeleeWeapon/Sword/` |
+| Level | the path of the `.level`; `list` gives `Level`, `load_scene` builds the scene | `/Lotus/Levels/ClanDojo/ClanObstacleCourseA.level` |
+| Level collision | the level's path and `?collision`; a scene of its own | `/Lotus/Levels/ClanDojo/ClanObstacleCourseA.level?collision` |
+
+What is **not** an id: a uniqueName (`/Lotus/Powersuits/Excalibur/Excalibur`: it has no extension and names a
+`Packages.bin` entity, not a file), a texture path, an animation clip's path (it is in `H.Misc` but is not a model), a
+language tag, a node id. Paths are the game's own and start with `/Lotus/`. They come from the user's install, so a
+table of ids made on one build has to be made again on another: `wf-unpack version` says which build an install is.
+Do not copy the ids of this page into a mod; they are examples, and `list` (or `resolve`) is the source.
+
+### Mapping an item id of your game or server to an asset id
+
+The ids a private-server client or a rewrite uses for items are, in the data this was checked against, the
+`/Lotus/...` uniqueNames of the game's own entities (the Powersuit, weapon or enemy entity). That is how the
+`resolve` command reads them. For each item:
+
+1. Take its uniqueName.
+2. Resolve it against the user's install: `wf-unpack resolve --game <Cache.Windows> <uniqueName>`, or
+   `wf_unpack::resolve::resolve(&warframe, &packages_bin, name)` in Rust. The answer lists every model the entity's
+   lineage names, **nearest entity first**, each with the entity that set it and its kind, or the reason there is none.
+3. Pick one id. The first is not always the character (one enemy of the install sets a grate panel on itself and its
+   character on its parent), so compare the kinds and check the model. Add `?animations=` to animate a skinned model.
+4. Send the `spawn` with that id as the asset, for example (the link library builds the line from a `Spawn`):
+   `{"type":"spawn","entity":7,"provider":"Warframe","asset":"/Lotus/Characters/Tenno/Excalibur/Excalibur_skel.fbx"}`.
+
+What `resolve` does not do: assemble a Warframe from its body, helmet and weapons (those come from other entities and
+are not followed), read any property other than `Mesh` and `PickUpMesh` for models, or know the colours, skins and
+mods an item has in a player's loadout. An id that `resolve` cannot map is yours to handle: draw a placeholder, or do
+not spawn it.
+
+What the link does with an id it cannot use: nothing. The contract treats `asset` as a string and the library does
+not look at it, so a `spawn` with an id the receiver cannot load is accepted and its poses are kept (this is what the
+test shows with a uniqueName as the asset). Whether to draw a placeholder is the receiving game's decision, and it
+should be made when it tries to load the id.
+
+### Which role
+
+- **A Warframe rewrite** (its own engine, assets from the user's install through wf-unpack) takes any role like any
+  Rust rewrite: **guest** to show its characters inside another game, or **host** to let others appear in its world.
+  This is the supported path and everything above applies. It needs `rewrite-bridge` with the `link` feature and
+  wf-unpack with `bridge`, on the same minor of rewrite-bridge (see "One copy per build").
+- **Warframe's models inside another game** need no Warframe-side code at all: `bridge-guest --provider wf` is a guest
+  that draws a wf-unpack model into any host.
+- **The original client with a private server**: **not verified, and not designed here.** A host sends the camera
+  every frame and a guest sends poses every frame, so code with a per-frame loop must run in the game's process or
+  beside it and read the camera or player state. Whether the Bootstrapper offers that is **unknown**: the pages read
+  about it document a local HTTP and WebSocket control port, scripting and commands that move the camera or player,
+  but not what any script can open (a socket) or read (the camera, the player), and its scripting reference was not
+  readable. Nothing in these repositories loads code into the Warframe client or reads its memory, and the link
+  does not (see below). Until someone with the Bootstrapper's own reference answers those two questions, do not assume
+  either.
+- **The client's space**: where a running client's camera and player are (the space, the origin of a procedural level,
+  the sign of yaw and pitch) is **unknown**. The files give the conversion for what the provider outputs (the game's
+  left-handed space with +Y up and +Z front becomes the bridge's by negating x; metres already); a live camera needs
+  the check in "Map your game's space", with a real client.
+
+### Builds
+
+wf-unpack has been run on **one build** (the 2026-10-22 Steam build). The check numbers in its README are for that build.
+A private-server client is often an older build than the current Steam one, and whether wf-unpack reads an older
+install has not been tried: use an install you already own, and run `wf-unpack version`. It reports the `.toc` format
+(version 20 only), the `Packages.bin` version (46 and later; 46 is the only one seen), the executable's file version,
+the Steam build id when a manifest is beside the install, and one of `verified`, `readable, not verified` or
+`unsupported`. `--strict` on `version` and `resolve`, or `Warframe::open_with(path, Strictness::Strict)` in Rust,
+refuses an unsupported build with one error that names it, instead of failing on the first asset. These repositories do
+not fetch or ship a game build, and the tests use none.
+
+### Licence and scope
+
+SpaceNinjaServer is AGPL-3.0 with the Commons Clause: copy none of its code or data into a project that uses these
+libraries. The provider reads only the player's own install; do not commit game files, textures, models or extracted
+data (the public-tree gate rejects them). The link is `127.0.0.1` only. Whether running a modified client against a
+private server is allowed is for the game's terms and the server's rules, not for this guide.
 
 ## Not supported or not proven
 
