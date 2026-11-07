@@ -565,7 +565,7 @@ cargo build --release --features link --example fake_host --example fake_guest -
 # binaries: target/release/examples/{fake_host,fake_guest,interop_peer}
 ```
 
-**Prebuilt, no Rust toolchain.** The release [`peers-v0.3.1`](https://github.com/patodois/rewrite-bridge/releases/tag/peers-v0.3.1) has one archive per system (macOS arm64 and x86_64, Linux and Windows x86_64) with the three peers, and a
+**Prebuilt, no Rust toolchain.** The release [`peers-v0.4.0`](https://github.com/patodois/rewrite-bridge/releases/tag/peers-v0.4.0) has one archive per system (macOS arm64 and x86_64, Linux and Windows x86_64) with the three peers, and a
 `SHA256SUMS` and its signature: download yours, check it, and run `./fake_host` or `./fake_guest` from it. Later crate
 releases carry their own archives. The macOS arm64 archive was run here; the other three are built and packed by CI and were not run.
 
