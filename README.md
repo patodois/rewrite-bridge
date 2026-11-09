@@ -1,5 +1,7 @@
 # rewrite-bridge
 
+rewrite-bridge gives game-rewrite and passthrough-mod developers shared model, animation and scene types, a provider interface and a protocol for linking running games.
+
 Native macOS builds require macOS 11.0 or newer. Set `MACOSX_DEPLOYMENT_TARGET=11.0`
 when compiling native libraries or executables; positional vector I/O uses the system
 `preadv` introduced in macOS 11.0. Older macOS versions are unsupported.
