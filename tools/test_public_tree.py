@@ -1,6 +1,9 @@
 """Accepted text must be scanned completely, including above the small-blob cutoff."""
+import itertools
 import json
 import os
+import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -251,6 +254,95 @@ class RuleTests(unittest.TestCase):
         repo.write("a.txt", "key AKIA" + "ABCDEFGHIJKLMNOP\n")
         repo.git("add", "-A")
         self.assertEqual(repo.gate()[:2], (1, ["secret-content", "secret-file"]))
+
+
+# The pattern the game-package rule used until its time was found to be exponential in the number of adjacent
+# block comments (and quadratic in the number of blank lines). It is kept here only as the reference for what the
+# rule accepts: short texts cost it nothing.
+OLD_GAME_PACKAGE_RE = re.compile(r"^[\s\ufeff]*(?:/\*.*?\*/[\s\ufeff]*)*package\s+"
+                                 r"(?:net\.minecraft|com\.mojang|net\.minecraftforge|cpw\.mods)\b", re.M | re.S)
+OLD_FERNFLOWER_RE = re.compile(r"^\s*//\s*\$FF:", re.M)
+
+
+class ScanTimeTests(unittest.TestCase):
+    """Every text blob goes through the content rules, so their time has to grow with the text and no faster."""
+
+    def facts(self, text):
+        # In a child process with a time limit: a scan that does not end has to fail the test, not hang it.
+        code = ("import json, sys, time\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "import check_public_tree as gate\n"
+                "data = sys.stdin.buffer.read()\n"
+                "began = time.perf_counter()\n"
+                "facts = gate.blob_facts(gate.Rules(), data)\n"
+                "json.dump({'package': facts['package'], 'marker': facts['marker'],\n"
+                "           'seconds': time.perf_counter() - began}, sys.stdout)\n")
+        done = subprocess.run([sys.executable, "-c", code, str(GATE.parent)], input=text.encode(),
+                              capture_output=True, timeout=20)
+        self.assertEqual(done.returncode, 0, done.stderr.decode())
+        result = json.loads(done.stdout)
+        self.assertLess(result["seconds"], 1.0, "the content rules took too long")
+        return result
+
+    def test_200_adjacent_block_comments_are_scanned_at_once(self):
+        for comments in ("/* c */\n" * 200, "/* c */ " * 200, "/**/" * 200):
+            for tail, found in (("class A {}\n", False), ("package com.example;\n", False),
+                                ("package net.minecraft.world;\n", True), ("x package net.minecraft.world;\n", False)):
+                with self.subTest(comments=comments[:9], tail=tail):
+                    self.assertEqual(self.facts(comments + tail)["package"], found)
+
+    def test_many_blank_lines_are_scanned_at_once(self):
+        blank = "\n" * 200000
+        clean = self.facts(blank + "class A {}\n")
+        self.assertEqual((clean["package"], clean["marker"]), (False, None))
+        self.assertTrue(self.facts(blank + "package com.mojang.blaze3d;\n")["package"])
+        self.assertEqual(self.facts(blank + " \t// $FF: renamed from: a\n")["marker"], "// $FF:")
+        self.assertIsNone(self.facts(blank + "x // $FF: renamed from: a\n")["marker"])
+
+    def test_unclosed_comments_and_long_runs_of_white_space_are_scanned_at_once(self):
+        for text in ("/* x\n" * 100000, " " * 1000000 + "package", ("package" + " " * 50 + "\n") * 20000,
+                     "x /*\n" * 50000 + "y */ package net.minecraft.a;\n" * 50000):
+            with self.subTest(text=text[:12]):
+                self.assertFalse(self.facts(text)["package"])
+
+
+class SameAnswersTests(unittest.TestCase):
+    """The scans that replaced the two slow patterns accept and reject exactly what the patterns did."""
+
+    PIECES = ("/*", "*/", "/", "*", "\n", " ", "x", "\ufeff", "package net.minecraft")
+
+    def test_the_game_package_scan_agrees_with_the_pattern_on_every_short_text(self):
+        from check_public_tree import declares_game_package
+        count = 0
+        for length in range(6):
+            for pieces in itertools.product(self.PIECES, repeat=length):
+                text = "".join(pieces)
+                count += 1
+                if declares_game_package(text) != bool(OLD_GAME_PACKAGE_RE.search(text)):
+                    self.fail("the scan and the pattern disagree on %r" % text)
+        self.assertEqual(count, sum(len(self.PIECES) ** n for n in range(6)))
+
+    def test_the_game_package_scan_agrees_with_the_pattern_on_random_texts(self):
+        from check_public_tree import declares_game_package
+        pieces = self.PIECES + ("\t", "\r", "\x0b", "\u2028", "//", "package", " net.minecraft", "package com.mojang",
+                                "package net.minecraftx", "package\n cpw.mods.fml", "package net.minecraftforge;")
+        rng = random.Random(20261114)
+        for _ in range(20000):
+            text = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 14)))
+            if declares_game_package(text) != bool(OLD_GAME_PACKAGE_RE.search(text)):
+                self.fail("the scan and the pattern disagree on %r" % text)
+
+    def test_the_fernflower_marker_agrees_with_the_pattern(self):
+        from check_public_tree import MARKERS
+        new = [rx for rx in MARKERS if "FF:" in rx.pattern]
+        self.assertEqual(len(new), 1)
+        pieces = ("//", "/", " ", "\t", "\n", "\r", "$FF:", "$FF", "x", "\x0b")
+        for length in range(6):
+            for chosen in itertools.product(pieces, repeat=length):
+                text = "".join(chosen)
+                old, now = OLD_FERNFLOWER_RE.search(text), new[0].search(text)
+                if (old is None) != (now is None) or (old and old.group(0).strip() != now.group(0).strip()):
+                    self.fail("the patterns disagree on %r" % text)
 
 
 if __name__ == "__main__":

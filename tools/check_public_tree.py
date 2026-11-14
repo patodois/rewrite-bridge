@@ -100,16 +100,22 @@ SECRET_FILE_NAMES = {".env", ".env.*", "id_rsa", "id_dsa", "id_ecdsa", "id_ed255
 SECRET_FILE_OK = {".env.example", ".env.sample", ".env.template"}
 LICENSE_NAMES = ("license", "licence", "copying", "notice", "third_party", "third-party", "authors", "copyright")
 NOTICE_NAMES = ("notice", "third_party", "third-party", "thirdparty", "notices")
-# A byte-order mark, white space and block comments may come before the declaration on its line
-GAME_PACKAGE_RE = re.compile(r"^[\s\ufeff]*(?:/\*.*?\*/[\s\ufeff]*)*package\s+"
-                             r"(?:net\.minecraft|com\.mojang|net\.minecraftforge|cpw\.mods)\b", re.M | re.S)
+# A byte-order mark, white space and block comments may come before the declaration on its line. These two patterns
+# only find the candidates, each with the whole run of white space before it (the lookbehind keeps a search from
+# starting inside a run); declares_game_package() decides. One pattern for all of it, tried from every line start,
+# took time exponential in the number of adjacent comments and quadratic in the number of blank lines.
+PACKAGE_WORD_RE = re.compile(r"(?<![\s\ufeff])([\s\ufeff]*)package\s+"
+                             r"(?:net\.minecraft|com\.mojang|net\.minecraftforge|cpw\.mods)\b")
+COMMENT_OPEN_RE = re.compile(r"(?<![\s\ufeff])([\s\ufeff]*)/\*")
 GAME_PACKAGE_EXTS = (".java", ".kt", ".scala", ".groovy")
 
 MARKERS = [
     re.compile(r"Decompiled (?:with|by) (?:CFR|Fernflower|Procyon|Vineflower|JD-GUI|Jad|JADX|ILSpy|dnSpy|JetBrains)", re.I),
     re.compile(r"Source code recreated from a \.class file by IntelliJ IDEA"),
     re.compile(r"Powered by (?:Fernflower|Vineflower)"),
-    re.compile(r"^\s*//\s*\$FF:", re.M),                       # Fernflower synthetic comments
+    # Fernflower synthetic comments. The white space before one stays on its line: `\s*` there is tried again from
+    # every line of a run of blank lines and reads to the end of the run each time, the square of its length.
+    re.compile(r"^[^\S\n]*//\s*\$FF:", re.M),
     re.compile(r"/\*\s*(?:loaded from|renamed from):\s", re.I),  # JADX
     re.compile(r"Java compiler version:\s*\d"),                # JD-GUI
     re.compile(r"Decompiled by J[a]d|J[a]d home page"),
@@ -436,6 +442,29 @@ def text_views(data):
     return views
 
 
+def leads_its_line(match):
+    """Whether nothing but white space lies between a line start and what the pattern found after its group 1."""
+    return match.start() == 0 or "\n" in match.group(1)
+
+
+def declares_game_package(text):
+    """Whether `text` declares a package inside the game: on some line, after nothing but white space, byte-order
+    marks and block comments. Comments are not parsed: whatever lies between a `/*` that leads its line and a `*/`
+    right before the declaration counts as comments, as in the single pattern this replaces, and the answer is the
+    same for every text. The time is linear in the length of the text."""
+    opener = None   # where the first `/*` that leads its line is; looked for once, and only if it is needed
+    for match in PACKAGE_WORD_RE.finditer(text):
+        if leads_its_line(match):
+            return True
+        start = match.start()
+        if start >= 2 and text.startswith("*/", start - 2):
+            if opener is None:
+                opener = next((m.end() - 2 for m in COMMENT_OPEN_RE.finditer(text) if leads_its_line(m)), len(text))
+            if opener + 4 <= start:
+                return True
+    return False
+
+
 def blob_facts(rules, data):
     """What the content rules find in a blob, whatever its path: markers, secrets, copyright holders, a game package."""
     facts = {"marker": None, "secrets": [], "holders": [], "package": False}
@@ -453,7 +482,7 @@ def blob_facts(rules, data):
                 if entry not in facts["secrets"]:
                     facts["secrets"].append(entry)
         if full:
-            facts["package"] = facts["package"] or bool(GAME_PACKAGE_RE.search(text))
+            facts["package"] = facts["package"] or declares_game_package(text)
             facts["holders"].extend(h for h in copyright_holders(text) if h not in facts["holders"])
     return facts
 
