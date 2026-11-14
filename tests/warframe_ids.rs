@@ -45,29 +45,58 @@ impl Drop for KillOnDrop {
 
 /// The path of an example program of this package, built first: `cargo test` builds the examples, but
 /// running one test target alone does not, and a program left over from an older build would be tested
-/// instead. Building an up-to-date example takes a moment.
+/// instead. Building an up-to-date example takes a moment. Cargo is asked where it put the program: the
+/// layout of the target folder changes between Cargo versions and is not ours to guess.
 fn example(name: &str) -> PathBuf {
-    let mut dir = std::env::current_exe().unwrap();
-    dir.pop();
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut build = Command::new(cargo);
-    build.args(["build", "--features", "link", "--example", name]);
-    if dir.ends_with("release") {
+    build.args([
+        "build",
+        "--features",
+        "link",
+        "--example",
+        name,
+        "--message-format=json",
+    ]);
+    if !cfg!(debug_assertions) {
         build.arg("--release");
     }
-    let status = build
+    let output = build
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .status()
+        .stderr(std::process::Stdio::inherit())
+        .output()
         .unwrap();
-    assert!(status.success(), "could not build the {name} example");
-    let exe = dir
-        .join("examples")
-        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        output.status.success(),
+        "could not build the {name} example"
+    );
+    let messages = String::from_utf8_lossy(&output.stdout);
+    let exe = messages
+        .lines()
+        .filter(|line| {
+            line.contains("\"reason\":\"compiler-artifact\"")
+                && line.contains("\"kind\":[\"example\"]")
+                && line.contains(&format!("\"name\":\"{name}\""))
+        })
+        .filter_map(json_executable)
+        .next_back()
+        .unwrap_or_else(|| panic!("cargo did not say where the {name} example is"));
     assert!(exe.exists(), "{} is not there", exe.display());
     exe
+}
+
+/// The `executable` string of one of Cargo's JSON messages, with its two escapes undone.
+fn json_executable(line: &str) -> Option<PathBuf> {
+    let key = "\"executable\":\"";
+    let mut chars = line[line.find(key)? + key.len()..].chars();
+    let mut path = String::new();
+    loop {
+        match chars.next()? {
+            '"' => return Some(PathBuf::from(path)),
+            '\\' => path.push(chars.next()?),
+            c => path.push(c),
+        }
+    }
 }
 
 /// Starts an example with its output read line by line on a channel.
