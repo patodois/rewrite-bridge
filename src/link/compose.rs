@@ -157,7 +157,8 @@ impl Rig {
         let (a1, b1, r1) = eq(nx, &p[0]);
         let (a2, b2, r2) = eq(ny, &p[1]);
         let det = a1 * b2 - a2 * b1;
-        if det.is_nan() || det.abs() <= 1e-12 {
+        // Not finite: a projection with a NaN or an infinity in it (the shader's `!finite(det)`).
+        if !det.is_finite() || det.abs() <= 1e-12 {
             return None;
         }
         Some([(r1 * b2 - r2 * b1) / det, (a1 * r2 - a2 * r1) / det, z, 1.0])
@@ -182,18 +183,20 @@ impl Warp {
     }
 
     /// Window position in pixels and linear depth of a render-view-space point, `None` when it is
-    /// not in front of the present camera.
+    /// not in front of the present camera or has no position: a camera is delivered as its sender
+    /// wrote it (contract section 9.3), and one with a NaN or an infinity in the first two rows of
+    /// its projection gives a position that is not a number while depth and `w` are sound. The
+    /// caller clamps positions to the destination with `f64::max` and `min`, which ignore a NaN, so
+    /// such a position would become the whole row, column or image. The shader drops the pixel
+    /// (`!finite(wx) || !finite(wy) || !finite(t2)` in `warp.wgsl`), and so does this.
     fn project(&self, p: [f64; 4], w: f64, h: f64) -> Option<(f64, f64, f64)> {
         let t = -(0..4).map(|c| self.rel[2][c] * p[c]).sum::<f64>();
         let c = apply(&self.clip, p);
         if !(t > 1e-9 && c[3] > 1e-12) {
             return None;
         }
-        Some((
-            (c[0] / c[3] * 0.5 + 0.5) * w,
-            (0.5 - c[1] / c[3] * 0.5) * h,
-            t,
-        ))
+        let (x, y) = ((c[0] / c[3] * 0.5 + 0.5) * w, (0.5 - c[1] / c[3] * 0.5) * h);
+        (x.is_finite() && y.is_finite() && t.is_finite()).then_some((x, y, t))
     }
 }
 
@@ -218,6 +221,9 @@ const MAX_FOOTPRINT: f64 = 16.0;
 /// With the same camera for both and `dst` = `src` size the frame comes back unchanged. With a
 /// different size it is resampled, which is how a receiver can also scale a frame it could not
 /// match to a camera (render camera = present camera).
+///
+/// A pixel whose position in the destination is not a finite number is skipped, like one behind the
+/// present camera, so a camera with a NaN or an infinity in it gives holes, not an error.
 ///
 /// This is a reference for testing and small images: splats can still leave cracks where a surface
 /// is stretched a lot (very close to the camera, or seen almost edge-on), and shading that depends on the view (specular, reflections) is not
@@ -832,6 +838,105 @@ mod tests {
         weird.proj = [f32::NAN; 16];
         let _ = reproject(&[9; 4], &[1.0], 1, 1, &c, &weird, 1, 1);
         let _ = reproject(&[9; 4], &[f32::NAN], 1, 1, &c, &c, 1, 1);
+    }
+
+    /// Cameras a peer can send (the decoder delivers a `Camera` as sent, contract section 9.3) or that
+    /// `look_at` makes of a field of view or a viewport of 0, with something not finite in the rows of the
+    /// projection that give the window position while the `w` row is sound.
+    fn cameras_that_are_not_finite() -> Vec<(&'static str, Camera)> {
+        let (eye, target) = ([0.0; 3], [0.0, 0.0, -1.0]);
+        let good = cam(eye, target);
+        let no_fov = Camera::look_at(eye, target, 0.0, 0.1, 100.0, [100, 100]);
+        assert!(no_fov.proj[0].is_infinite() && no_fov.proj[5].is_infinite());
+        let no_width = Camera::look_at(
+            eye,
+            target,
+            std::f32::consts::FRAC_PI_2,
+            0.1,
+            100.0,
+            [0, 100],
+        );
+        assert!(no_width.proj[0].is_infinite() && no_width.proj[5].is_finite());
+        let with = |at: usize, v: f32| {
+            let mut c = good;
+            c.proj[at] = v;
+            c
+        };
+        vec![
+            ("a field of view of 0", no_fov),
+            ("a viewport 0 wide", no_width),
+            ("NaN x scale", with(0, f32::NAN)),
+            ("NaN y scale", with(5, f32::NAN)),
+            ("infinite y scale", with(5, f32::INFINITY)),
+            ("NaN x offset", with(8, f32::NAN)),
+            ("NaN y translation", with(13, f32::NAN)),
+        ]
+    }
+
+    #[test]
+    fn a_present_camera_that_is_not_finite_leaves_holes_as_the_shader_does() {
+        // The window position of every pixel is then not a number. The shader drops such a pixel
+        // (`!finite(wx) || !finite(wy)` in warp.wgsl); clamping it to the destination instead, with
+        // `f64::max` and `min`, which ignore a NaN, made it the whole row, column or image.
+        let good = cam([0.0; 3], [0.0, 0.0, -1.0]);
+        let (rgba, depth) = grid(8, 8, |x, _| 4.0 + 0.1 * x as f32);
+        for (name, bad) in cameras_that_are_not_finite() {
+            let (out, out_depth) = reproject(&rgba, &depth, 8, 8, &good, &bad, 16, 12).unwrap();
+            let painted = out.chunks(4).filter(|p| p[3] != 0).count();
+            assert_eq!(
+                painted,
+                0,
+                "{name}: {painted} of {} pixels painted",
+                16 * 12
+            );
+            assert!(out.iter().all(|&b| b == 0), "{name}");
+            assert!(out_depth.iter().all(|&d| d == f32::INFINITY), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_render_camera_that_is_not_finite_leaves_holes_as_the_shader_does() {
+        // Here the unprojection has no solution: the shader's `!finite(det)`.
+        let good = cam([0.0; 3], [0.0, 0.0, -1.0]);
+        let (rgba, depth) = grid(8, 8, |x, _| 4.0 + 0.1 * x as f32);
+        for (name, bad) in cameras_that_are_not_finite() {
+            let (out, out_depth) = reproject(&rgba, &depth, 8, 8, &bad, &good, 16, 12).unwrap();
+            assert!(out.iter().all(|&b| b == 0), "{name}");
+            assert!(out_depth.iter().all(|&d| d == f32::INFINITY), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_window_position_that_is_not_finite_is_no_position() {
+        let good = Rig::new(&cam([0.0; 3], [0.0, 0.0, -1.0])).unwrap();
+        let point = good.unproject(0.25, -0.5, 4.0).unwrap();
+        let fine = Warp::new(&good, &good).project(point, 16.0, 12.0).unwrap();
+        assert!((fine.0 - 10.0).abs() < 1e-9 && (fine.1 - 9.0).abs() < 1e-9 && fine.2 == 4.0);
+        for (name, bad) in cameras_that_are_not_finite() {
+            let bad = Rig::new(&bad).unwrap();
+            assert!(
+                Warp::new(&good, &bad).project(point, 16.0, 12.0).is_none(),
+                "to {name}"
+            );
+            // From it: either there is no point, or the point is not one and has no position.
+            let from = bad
+                .unproject(0.25, -0.5, 4.0)
+                .and_then(|p| Warp::new(&bad, &good).project(p, 16.0, 12.0));
+            assert!(from.is_none(), "from {name}");
+        }
+        // An infinite determinant alone is no solution either.
+        let no_width = Camera::look_at(
+            [0.0; 3],
+            [0.0, 0.0, -1.0],
+            std::f32::consts::FRAC_PI_2,
+            0.1,
+            100.0,
+            [0, 100],
+        );
+        assert!(Rig::new(&no_width)
+            .unwrap()
+            .unproject(0.25, -0.5, 4.0)
+            .is_none());
     }
 
     // ----- Compositing

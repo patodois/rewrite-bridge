@@ -962,6 +962,54 @@ fn reprojection_with_occlusion_matches_the_reference() {
 }
 
 #[test]
+fn a_present_camera_that_is_not_finite_shows_the_host_alone_like_the_reference() {
+    // With a NaN or an infinity in the rows of the present projection that give the window position, no
+    // guest pixel has a place in the host's image. The shader drops such a pixel (`!finite(wx) ||
+    // !finite(wy)`); the reference used to clamp the position, which made it a whole row, column or image.
+    let (device, queue) = gpu_or_skip!();
+    let render = camera([0.0, 1.5, 2.0], [0.0, 1.0, -4.0], SIZE, f32::INFINITY);
+    let (g_rgba, g_depth) = render_guest(&render, SIZE, true);
+    let guest = frame(g_rgba, Some(g_depth), SIZE);
+    let (h_rgba, h_t) = render_host(SIZE);
+    for (name, at, value) in [
+        ("NaN x scale", 0, f32::NAN),
+        ("NaN y scale", 5, f32::NAN),
+        ("infinite x scale", 0, f32::INFINITY),
+        ("infinite y scale", 5, f32::INFINITY),
+    ] {
+        let mut present = camera([0.35, 1.5, 2.0], [0.2, 1.0, -4.0], SIZE, f32::INFINITY);
+        present.proj[at] = value;
+        let d = to_buffer(&h_t, &present);
+        let t_from_buffer = linearize_buffer(&d, &present);
+        let cpu = cpu_result(
+            &h_rgba,
+            &t_from_buffer,
+            &guest,
+            &render,
+            &present,
+            SIZE,
+            true,
+        );
+        assert!(cpu == h_rgba, "{name}: the reference painted guest pixels");
+        let gpu_out = run_gpu(
+            device,
+            queue,
+            &Run {
+                host: Host {
+                    rgba: &h_rgba,
+                    d: &d,
+                    size: SIZE,
+                    format: TextureFormat::Rgba8Unorm,
+                },
+                guest: &guest,
+                params: params(&guest, SIZE, &present, Some(&render), false),
+            },
+        );
+        assert_exact(name, &diff(&cpu, &gpu_out, SIZE.0));
+    }
+}
+
+#[test]
 fn a_frame_of_another_size_is_resampled_like_the_reference() {
     let (device, queue) = gpu_or_skip!();
     let host_size = SIZE;
