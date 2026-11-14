@@ -68,10 +68,14 @@ Its targets are `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-l
 
 - `src/lib.rs`, `transform.rs`: model, mesh, material, image, skin and transform types.
 - `src/animated.rs`, `animation.rs`, `scene.rs`: animated assets, clips and scenes.
-- `src/conformance/`: provider semantic checks; `src/link/`, `link.rs`: protocol and pixel I/O.
+- `src/conformance/`: provider semantic checks.
+- `src/link.rs` (feature `link`): the whole link in one file. Datagram and control codecs, the `Link` session,
+  token and endpoint file, pixel-file writer and reader, in that order.
+- `src/link/`: only `compose.rs`, the CPU reference for depth conversion, reprojection and compositing.
 - `rewrite-bridge-bevy/`: renderer plugin, viewer and compositor.
 - `docs/CONTRACT.md`, `INTEGRATING.md`, `WRITING_A_PROVIDER.md`: protocol and integration guides.
-- `tests/`, `examples/`, `scripts/`: generated vectors, interop, reference peers and provider examples.
+- `tests/`, `examples/`, `scripts/`: tests, the shared link vectors (`tests/vectors/link/`, generated, see below),
+  interop, reference peers and provider examples.
 
 ## Project rules
 
@@ -79,7 +83,15 @@ Its targets are `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-l
 - Colour/emissive textures are sRGB; other textures are linear; roughness is G and metalness B.
 - Tangent-space normal maps use OpenGL's green-up convention; validate provider models and conformance.
 - Keep one rewrite-bridge minor-version line across consumers to avoid duplicate incompatible types.
-- Link implementations follow the contract and share generated vectors; update peer pins deliberately with dependent changes.
+- Link implementations follow the contract and share the vectors in `tests/vectors/link/`.
+- `tests/vectors/link/gen.py` generates those vectors: the five `*.json` files, `pixelfiles/*.bin` and `SHA256SUMS`.
+  Only `README.md` and `GAPS.md` there are written by hand, and `SHA256SUMS` covers them too. Never edit a generated
+  file: change `gen.py`, run `python3 tests/vectors/link/gen.py`, then run it with `--check`. CI runs that check on
+  Linux only, and the Rust tests compare the files with `SHA256SUMS` alone, so nothing else catches a vector and its
+  checksum edited by hand.
+- A changed vector changes `SHA256SUMS`. Each peer holds a copy made with `scripts/sync-link-vectors.sh` and pins the
+  digest of `SHA256SUMS` as `VECTORS_DIGEST`, and `tests/interop/pins.txt` names the peer revisions the interop job
+  checks out: move them together, deliberately, with the change that needs it.
 - Providers read the player's installation; no game data belongs in the bridge.
 
 ## Public files
