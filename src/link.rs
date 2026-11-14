@@ -1104,8 +1104,9 @@ pub struct LinkConfig {
     pub token: Option<String>,
     /// Revision 6 (contract section 6.2). Host: once the control port is bound, write an [`Endpoint`]
     /// file here with the bound port and the token (generated with [`generate_token`] when
-    /// [`LinkConfig::token`] is `None`), and remove it when the link is dropped. Guest: read the port and
-    /// the token from this file before every connection attempt, instead of
+    /// [`LinkConfig::token`] is `None`), and remove it when the link is dropped, unless another host has
+    /// put its own file there since. Guest: read the port and the token from this file before every
+    /// connection attempt, instead of
     /// [`LinkConfig::control_port`] and [`LinkConfig::token`]; while it cannot be read (the host is not
     /// running yet) the guest just tries again after [`LinkConfig::reconnect`].
     pub endpoint_file: Option<PathBuf>,
@@ -1478,7 +1479,7 @@ pub struct Link {
     assembly: Option<Assembly>,
     /// Host: the token a guest must show. Guest: the token sent with the current connection attempt.
     token: Option<String>,
-    /// Host: the endpoint file this link wrote, removed on drop.
+    /// Host: where this link wrote its endpoint file, removed on drop if it is still this link's.
     endpoint_written: Option<PathBuf>,
     /// Guest: why the last connection attempt failed, see [`Link::last_error`].
     last_error: Option<String>,
@@ -2552,15 +2553,35 @@ impl Link {
             self.events.pop(); // The caller knows; don't report its own disconnect back.
         }
     }
+
+    /// Whether the endpoint file at `path` is the one this host wrote: a file a guest would accept, with
+    /// this host's port and token. Another host's file has another token (each host makes its own) or, with
+    /// one token configured for both, another port. A file that is gone, cannot be read or is not an
+    /// endpoint file is not this host's either. The file can still be replaced between this look and what
+    /// the caller does next; that is a moment, where the file used to be removed whenever it was replaced.
+    fn wrote_endpoint_file(&self, path: &Path) -> bool {
+        let (Some(addr), Some(token)) = (self.control_addr(), self.token.as_deref()) else {
+            return false;
+        };
+        Endpoint::read(path).is_ok_and(|e| {
+            e.control_port == addr.port() && token_equal(e.token.as_bytes(), token.as_bytes())
+        })
+    }
 }
 
 impl Drop for Link {
-    /// Removes the endpoint file the host wrote, says `bye` and closes gracefully, which may block
+    /// Removes the endpoint file the host wrote, if the file there is still that one, says `bye` and closes
+    /// gracefully, which may block
     /// for up to [`LINGER`]. A connection whose peer has stopped reading is not waited for beyond that, even
     /// on `wasm32-wasip2`: it is set aside and closed later, as the runtime allows, or left to the runtime, which frees it with the component.
     fn drop(&mut self) {
         if let Some(path) = self.endpoint_written.take() {
-            let _ = Endpoint::remove(&path);
+            // Only its own file. A host that started later with the same path (the game started again while
+            // this process was still on its way out) has renamed its file over this one's, and removing that
+            // would leave its guests with no file for as long as it runs.
+            if self.wrote_endpoint_file(&path) {
+                let _ = Endpoint::remove(&path);
+            }
         }
         let now = Instant::now();
         if let Conn::Handshake { ctl, .. } | Conn::Live { ctl, .. } =

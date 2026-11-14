@@ -271,6 +271,80 @@ fn host_writes_the_endpoint_file_after_binding_and_removes_it() {
 }
 
 #[test]
+fn a_host_that_closes_leaves_the_endpoint_file_of_a_newer_host_alone() {
+    let d = Dir::new("newer");
+    let path = d.path("host.json");
+    let config = |game: &str| LinkConfig {
+        endpoint_file: Some(path.clone()),
+        ..cfg(game)
+    };
+    // The game is started again while its first process is still on its way out: both hosts have the same
+    // endpoint file, and the second one's has replaced the first one's by the time the first is dropped.
+    let old = Link::host(config("old host")).unwrap();
+    let first = Endpoint::read(&path).unwrap();
+    let mut new = Link::host(config("new host")).unwrap();
+    let second = Endpoint::read(&path).unwrap();
+    assert_ne!(first.control_port, second.control_port);
+    assert_ne!(first.token, second.token);
+    drop(old);
+    assert!(
+        path.exists(),
+        "the first host removed the second one's file"
+    );
+    assert_eq!(Endpoint::read(&path).unwrap(), second);
+    // A guest still finds the running host through it.
+    let mut guest = Link::guest(config("guest")).unwrap();
+    let (eh, eg) = run_until(&mut new, &mut guest, |a, b| connected(a) && connected(b));
+    assert!(
+        connected(&eh) && connected(&eg),
+        "host {eh:?}, guest {eg:?}"
+    );
+    assert_eq!(guest.peer().unwrap().game, "new host");
+    // And a host still removes its own.
+    drop(new);
+    assert!(!path.exists(), "removed when the host that wrote it closes");
+    drop(guest);
+    assert!(d.names().is_empty());
+}
+
+#[test]
+fn a_host_removes_the_endpoint_file_only_while_it_holds_its_own_port_and_token() {
+    let d = Dir::new("own");
+    let path = d.path("host.json");
+    for change in ["port", "token", "not an endpoint file"] {
+        let host = Link::host(LinkConfig {
+            endpoint_file: Some(path.clone()),
+            ..cfg("host")
+        })
+        .unwrap();
+        let ours = Endpoint::read(&path).unwrap();
+        let theirs = match change {
+            "port" => Endpoint {
+                control_port: ours.control_port ^ 1,
+                token: ours.token.clone(),
+            },
+            _ => Endpoint {
+                control_port: ours.control_port,
+                token: T.into(),
+            },
+        };
+        theirs.write(&path).unwrap();
+        if change == "not an endpoint file" {
+            fs::write(&path, "{}\n").unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+        drop(host);
+        assert_eq!(
+            fs::read(&path).ok(),
+            Some(before),
+            "another {change}: not the file this host wrote"
+        );
+        fs::remove_file(&path).unwrap();
+    }
+    assert!(d.names().is_empty());
+}
+
+#[test]
 fn guest_waits_for_the_file_and_follows_a_restarted_host() {
     let d = Dir::new("restart");
     let path = d.path("host.json");
